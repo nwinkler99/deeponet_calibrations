@@ -12,7 +12,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Dict
 from scipy.stats import norm
-
+import pandas as pd
 # -------------------------------------------------------------
 # Parameter structures
 # -------------------------------------------------------------
@@ -88,9 +88,9 @@ def simulate_price_paths(S0: float, t: np.ndarray, X: np.ndarray, dw: np.ndarray
     dw, dW_perp = dw[:, :n-1], dW_perp[:, :n-1]
     M = X.shape[0]
     dt = np.mean(np.diff(t))
-    t2H = np.power(t, 2.0*H)
-    exp_term = np.clip(eta * X - 0.5 * eta**2 * t2H, -1000, 1000)
-    v = xi0_t * np.exp(exp_term)
+    t2H = np.power(t, 2.0 * H)
+    exp_etaX = np.exp(eta * X - 0.5 * eta**2 *t2H)
+    v = xi0_t * exp_etaX
     dW_S = rho * dw + np.sqrt(max(1.0 - rho*rho, 0.0)) * dW_perp
     logS = np.zeros((M, n))
     logS[:, 0] = np.log(S0)
@@ -137,7 +137,7 @@ def implied_vol_from_price_otm(S0, K, T, price, tol=1e-7):
     if price < 1e-8:
         return np.nan
     price_func = bs_call_price if K >= S0 else bs_put_price
-    a, b = 1e-8, 5.0
+    a, b = 1e-8, 10
     fa = price_func(S0, K, T, a) - price
     fb = price_func(S0, K, T, b) - price
     if fa * fb > 0:
@@ -156,18 +156,52 @@ def implied_vol_from_price_otm(S0, K, T, price, tol=1e-7):
 
 def surface_implied_vols_otm(S0, Ks, T, prices):
     ivs = [implied_vol_from_price_otm(S0, float(K), float(T), float(p)) for K, p in zip(Ks, prices)]
-    return np.nan_to_num(np.array(ivs), nan=0.05)
+    return np.array(ivs)
 
+
+def fill_nans_edgewise(arr: np.ndarray) -> np.ndarray:
+    """
+    Fast edge-stable NaN fill for 2D surfaces.
+    1. Linear interpolation along each row.
+    2. Linear interpolation along each column.
+    3. Fill any remaining NaNs (usually corners) with nearest-edge values.
+    """
+    arr_filled = arr.copy()
+
+    # Step 1: interpolate along rows (axis=1)
+    for i in range(arr_filled.shape[0]):
+        s = pd.Series(arr_filled[i, :])
+        arr_filled[i, :] = s.interpolate(limit_direction="both").to_numpy()
+
+    # Step 2: interpolate along columns (axis=0)
+    for j in range(arr_filled.shape[1]):
+        s = pd.Series(arr_filled[:, j])
+        arr_filled[:, j] = s.interpolate(limit_direction="both").to_numpy()
+
+    # Step 3: any remaining NaNs (at corners) → nearest-edge fill
+    nan_mask = np.isnan(arr_filled)
+    if np.any(nan_mask):
+        # fill with nearest valid value using broadcasting
+        valid_mask = ~nan_mask
+        x, y = np.indices(arr_filled.shape)
+        valid_coords = np.column_stack(np.where(valid_mask))
+        valid_values = arr_filled[valid_mask]
+        from scipy.spatial import cKDTree
+        tree = cKDTree(valid_coords)
+        nan_coords = np.column_stack(np.where(nan_mask))
+        _, idx = tree.query(nan_coords)
+        arr_filled[nan_mask] = valid_values[idx]
+
+    return arr_filled
 # -------------------------------------------------------------
 # Parameter sampling
 # -------------------------------------------------------------
 
 def sample_param_set() -> RBergomiParams:
-    xi0_knots = np.array([0.05,  0.1 ,  0.1 ,  0.1   ,  0.1,
-        0.1,  0.1,  0.1])
-    eta = 3
-    rho = -0.5
-    H = 0.4
+    xi0_knots = np.random.uniform(0.01, 0.16, size=8)
+    eta = np.random.uniform(0.5, 4.0)
+    rho = np.random.uniform(-0.95, -0.1)
+    H = np.random.uniform(0.025, 0.5)
     return RBergomiParams(eta=eta, rho=rho, H=H, xi0_knots=xi0_knots)
 
 # -------------------------------------------------------------
@@ -187,12 +221,14 @@ def generate_surfaces(
     grid_jitter=0.5
 ) -> List[Dict]:
     """
-    Generate implied volatility surfaces from a Rough Bergomi toy simulator.
-    Optionally randomizes K and T grids for each surface (± grid_jitter × step).
+    Generate implied volatility surfaces from a Rough Bergomi simulator.
+    Simulation is done once on a fine time grid (defined by cfg.n),
+    and implied vol surfaces are extracted on coarser (possibly jittered) grids.
     """
 
     np.random.seed(seed)
     results = []
+
     n, T_max = cfg.n, cfg.T_max
     base_t = np.linspace(0.0, T_max, n)
     dt = base_t[1] - base_t[0]
@@ -201,50 +237,46 @@ def generate_surfaces(
         params = sample_param_set()
         np.random.seed(seed + s)
 
+        # --- Brownian increments (antithetic) ---
         M_half = cfg.M // 2
         dw_half = np.random.normal(0.0, np.sqrt(dt), size=(M_half, n - 1))
         dW_perp_half = np.random.normal(0.0, np.sqrt(dt), size=(M_half, n - 1))
         dw = np.vstack([dw_half, -dw_half])
         dW_perp = np.vstack([dW_perp_half, -dW_perp_half])
 
+        # --- fBm volatility driver & forward variance ---
         X = fBm_path_rDonsker(n, cfg.M, params.H, T_max)
-        grids = [base_t.copy()] * cfg.G
+        xi0_t = build_xi0_piecewise_constant(params.xi0_knots, base_t)
+
+        # --- Single fine-grid simulation ---
+        S = simulate_price_paths(cfg.S0, base_t, X, dw, dW_perp,
+                                 xi0_t, params.eta, params.rho, params.H)
+
+        strikes_base = cfg.strikes
+        maturities_base = cfg.maturities
 
         for j in range(forward_curves_per_set):
-            knots = params.xi0_knots
+            for g_id in range(cfg.G):
 
-            # --- Base grid definitions ---
-            strikes_base = cfg.strikes
-            maturities_base = cfg.maturities
+                # --- Optional randomized grids ---
+                if randomize_grid:
+                    ΔK = strikes_base[1] - strikes_base[0]
+                    ΔT = maturities_base[1] - maturities_base[0]
 
-            # --- Optional randomized grids ---
-            if randomize_grid:
-                # random jitter proportional to spacing
-                ΔK = strikes_base[1] - strikes_base[0]
-                ΔT = maturities_base[1] - maturities_base[0]
+                    strikes_shifted = np.clip(
+                        strikes_base + np.random.uniform(-grid_jitter * ΔK, grid_jitter * ΔK, len(strikes_base)),
+                        0.5, 1.5
+                    )
+                    maturities_shifted = np.clip(
+                        maturities_base + np.random.uniform(-grid_jitter * ΔT, grid_jitter * ΔT, len(maturities_base)),
+                        0.01, T_max
+                    )
+                else:
+                    strikes_shifted = strikes_base.copy()
+                    maturities_shifted = maturities_base.copy()
 
-                strikes_shifted = strikes_base + np.random.uniform(
-                    -grid_jitter * ΔK, grid_jitter * ΔK, size=len(strikes_base)
-                )
-                maturities_shifted = maturities_base + np.random.uniform(
-                    -grid_jitter * ΔT, grid_jitter * ΔT, size=len(maturities_base)
-                )
-
-                # clip to valid ranges
-                strikes_shifted = np.clip(strikes_shifted, 0.5, 1.5)
-                maturities_shifted = np.clip(maturities_shifted, 0.01, T_max)
-            else:
-                strikes_shifted = strikes_base.copy()
-                maturities_shifted = maturities_base.copy()
-
-            # --- Build xi₀ and simulate paths ---
-            for g_id, t in enumerate(grids):
-                xi0_t = build_xi0_piecewise_constant(knots, t)
-                S = simulate_price_paths(cfg.S0, t, X, dw, dW_perp,
-                                         xi0_t, params.eta, params.rho, params.H)
-
-                # --- Extract surfaces ---
-                mat_idx = [np.argmin(np.abs(t - Tm)) for Tm in maturities_shifted]
+                # --- Extract from fine grid ---
+                mat_idx = [np.argmin(np.abs(base_t - Tm)) for Tm in maturities_shifted]
                 price_surf = np.zeros((len(maturities_shifted), len(strikes_shifted)))
                 iv_surf = np.zeros_like(price_surf)
 
@@ -252,7 +284,8 @@ def generate_surfaces(
                     ST = S[:, idx]
                     prices = price_otm_plain(ST, cfg.S0, strikes_shifted)
                     price_surf[mi, :] = prices
-                    iv_surf[mi, :] = surface_implied_vols_otm(cfg.S0, strikes_shifted, t[idx], prices)
+                    iv_surf[mi, :] = surface_implied_vols_otm(cfg.S0, strikes_shifted, base_t[idx], prices)
+                    iv_surf = fill_nans_edgewise(iv_surf)
 
                 results.append({
                     "set_id": s,
@@ -268,3 +301,4 @@ def generate_surfaces(
                 })
 
     return results
+
