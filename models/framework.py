@@ -193,19 +193,5 @@ class Trainer:
                 print(f"Epoch {epoch+1:02d}: train_loss={train_loss:.6f}")
 
 
-from generation.surface_generation import generate_surfaces, SimulationConfig  # adjust imports
-
-cfg = SimulationConfig(M=5000, n=800, T_max=2.0, S0=1.0, G=1)
-surfaces = generate_surfaces(num_sets=20, forward_curves_per_set=1, cfg=cfg, seed=42)
-
-# Prepare data via DeepONet's own method
-train_loader, val_loader, branch_dim = DeepONet.prepare_data(surfaces)
-
-# Initialize and train model
-model = DeepONet(branch_in_dim=branch_dim, trunk_in_dim=2, latent_dim=64, hidden_dim=64)
-model._build_networks()
-
-trainer = Trainer(model, train_loader, val_loader, lr=1e-3)
-trainer.fit(epochs=10)
 
 

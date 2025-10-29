@@ -174,7 +174,23 @@ def sample_param_set() -> RBergomiParams:
 # Main workflow
 # -------------------------------------------------------------
 
-def generate_surfaces(num_sets=1, forward_curves_per_set=1, cfg=SimulationConfig(), seed=42) -> List[Dict]:
+# -------------------------------------------------------------
+# Main workflow with optional randomized grids
+# -------------------------------------------------------------
+
+def generate_surfaces(
+    num_sets=1,
+    forward_curves_per_set=1,
+    cfg=SimulationConfig(),
+    seed=42,
+    randomize_grid=False,
+    grid_jitter=0.5
+) -> List[Dict]:
+    """
+    Generate implied volatility surfaces from a Rough Bergomi toy simulator.
+    Optionally randomizes K and T grids for each surface (± grid_jitter × step).
+    """
+
     np.random.seed(seed)
     results = []
     n, T_max = cfg.n, cfg.T_max
@@ -196,13 +212,38 @@ def generate_surfaces(num_sets=1, forward_curves_per_set=1, cfg=SimulationConfig
 
         for j in range(forward_curves_per_set):
             knots = params.xi0_knots
-            for g_id, t in enumerate(grids):
-                T_shift = 0#np.random.uniform(-0.15, 0.15)
-                maturities_shifted = np.clip(cfg.maturities + T_shift, 0.05, T_max)
-                strikes_shifted = np.clip(cfg.strikes, 0.5, 1.5)
 
+            # --- Base grid definitions ---
+            strikes_base = cfg.strikes
+            maturities_base = cfg.maturities
+
+            # --- Optional randomized grids ---
+            if randomize_grid:
+                # random jitter proportional to spacing
+                ΔK = strikes_base[1] - strikes_base[0]
+                ΔT = maturities_base[1] - maturities_base[0]
+
+                strikes_shifted = strikes_base + np.random.uniform(
+                    -grid_jitter * ΔK, grid_jitter * ΔK, size=len(strikes_base)
+                )
+                maturities_shifted = maturities_base + np.random.uniform(
+                    -grid_jitter * ΔT, grid_jitter * ΔT, size=len(maturities_base)
+                )
+
+                # clip to valid ranges
+                strikes_shifted = np.clip(strikes_shifted, 0.5, 1.5)
+                maturities_shifted = np.clip(maturities_shifted, 0.01, T_max)
+            else:
+                strikes_shifted = strikes_base.copy()
+                maturities_shifted = maturities_base.copy()
+
+            # --- Build xi₀ and simulate paths ---
+            for g_id, t in enumerate(grids):
                 xi0_t = build_xi0_piecewise_constant(knots, t)
-                S = simulate_price_paths(cfg.S0, t, X, dw, dW_perp, xi0_t, params.eta, params.rho, params.H)
+                S = simulate_price_paths(cfg.S0, t, X, dw, dW_perp,
+                                         xi0_t, params.eta, params.rho, params.H)
+
+                # --- Extract surfaces ---
                 mat_idx = [np.argmin(np.abs(t - Tm)) for Tm in maturities_shifted]
                 price_surf = np.zeros((len(maturities_shifted), len(strikes_shifted)))
                 iv_surf = np.zeros_like(price_surf)
@@ -225,4 +266,5 @@ def generate_surfaces(num_sets=1, forward_curves_per_set=1, cfg=SimulationConfig
                     "price_surface": price_surf,
                     "iv_surface": iv_surf,
                 })
+
     return results
