@@ -82,7 +82,7 @@ class DeepONet(BaseModel):
     @staticmethod
     def prepare_data(
         surfaces,
-        batch_size=1024,
+        batch_size=256,
         val_split=0.2,
         shuffle=True,
         normalize=True

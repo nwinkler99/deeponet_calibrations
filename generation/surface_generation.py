@@ -212,18 +212,24 @@ def sample_param_set() -> RBergomiParams:
 # Main workflow with optional randomized grids
 # -------------------------------------------------------------
 
+import os, pickle, numpy as np
+from datetime import datetime
+from typing import List, Dict
+
 def generate_surfaces(
     num_sets=1,
     forward_curves_per_set=1,
     cfg=SimulationConfig(),
     seed=42,
     randomize_grid=False,
-    grid_jitter=0.5
+    grid_jitter=0.5,
+    save_every=200,
+    save_path="data/surfaces_progress.pkl"
 ) -> List[Dict]:
     """
     Generate implied volatility surfaces from a Rough Bergomi simulator.
-    Simulation is done once on a fine time grid (defined by cfg.n),
-    and implied vol surfaces are extracted on coarser (possibly jittered) grids.
+    Simulation runs on a fine time grid (cfg.n) and periodically saves progress
+    to a single pickle file every `save_every` surfaces.
     """
 
     np.random.seed(seed)
@@ -232,20 +238,25 @@ def generate_surfaces(
     n, T_max = cfg.n, cfg.T_max
     base_t = np.linspace(0.0, T_max, n)
     dt = base_t[1] - base_t[0]
+    M = cfg.M
+
+    # Ensure save directory exists
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     for s in range(num_sets):
         params = sample_param_set()
         np.random.seed(seed + s)
 
         # --- Brownian increments (antithetic) ---
-        M_half = cfg.M // 2
+        M = int(2 * round(M / 2))
+        M_half = M // 2
         dw_half = np.random.normal(0.0, np.sqrt(dt), size=(M_half, n - 1))
         dW_perp_half = np.random.normal(0.0, np.sqrt(dt), size=(M_half, n - 1))
         dw = np.vstack([dw_half, -dw_half])
         dW_perp = np.vstack([dW_perp_half, -dW_perp_half])
 
         # --- fBm volatility driver & forward variance ---
-        X = fBm_path_rDonsker(n, cfg.M, params.H, T_max)
+        X = fBm_path_rDonsker(n, M, params.H, T_max)
         xi0_t = build_xi0_piecewise_constant(params.xi0_knots, base_t)
 
         # --- Single fine-grid simulation ---
@@ -260,15 +271,14 @@ def generate_surfaces(
 
                 # --- Optional randomized grids ---
                 if randomize_grid:
-                    ΔK = strikes_base[1] - strikes_base[0]
-                    ΔT = maturities_base[1] - maturities_base[0]
-
+                    dK = strikes_base[1] - strikes_base[0]
+                    dT = maturities_base[1] - maturities_base[0]
                     strikes_shifted = np.clip(
-                        strikes_base + np.random.uniform(-grid_jitter * ΔK, grid_jitter * ΔK, len(strikes_base)),
+                        strikes_base + np.random.uniform(-grid_jitter * dK, grid_jitter * dK, len(strikes_base)),
                         0.5, 1.5
                     )
                     maturities_shifted = np.clip(
-                        maturities_base + np.random.uniform(-grid_jitter * ΔT, grid_jitter * ΔT, len(maturities_base)),
+                        maturities_base + np.random.uniform(-grid_jitter * dT, grid_jitter * dT, len(maturities_base)),
                         0.01, T_max
                     )
                 else:
@@ -285,7 +295,8 @@ def generate_surfaces(
                     prices = price_otm_plain(ST, cfg.S0, strikes_shifted)
                     price_surf[mi, :] = prices
                     iv_surf[mi, :] = surface_implied_vols_otm(cfg.S0, strikes_shifted, base_t[idx], prices)
-                    iv_surf = fill_nans_edgewise(iv_surf)
+
+                iv_surf = fill_nans_edgewise(iv_surf)
 
                 results.append({
                     "set_id": s,
@@ -300,5 +311,23 @@ def generate_surfaces(
                     "iv_surface": iv_surf,
                 })
 
+                # --- Periodic save to single file ---
+                if len(results) % save_every == 0:
+                    with open(save_path, "wb") as f:
+                        pickle.dump({
+                            "cfg": cfg.__dict__,
+                            "surfaces": results
+                        }, f)
+                    print(f"[Progress] Saved {len(results)} surfaces → {save_path}")
+
+    # --- Final save ---
+    with open(save_path, "wb") as f:
+        pickle.dump({
+            "cfg": cfg.__dict__,
+            "surfaces": results
+        }, f)
+    print(f"[Done] Saved final dataset with {len(results)} surfaces → {save_path}")
+
     return results
+
 
