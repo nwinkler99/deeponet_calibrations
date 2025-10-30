@@ -60,32 +60,46 @@ class SimulationConfig:
         if self.strikes is None:
             self.strikes = np.array([0.5,0.6,0.7,0.8,0.9, 0.95, 1.0, 1.05 ,1.1,1.2,1.3,1.4,1.5])
         if self.maturities is None:
-            self.maturities = np.array([0.01,0.025,0.05,0.1,0.2,0.4,0.6,0.8,1,1.2,1.4,1.7,2.0])
+            self.maturities = np.array([0.02,0.035,0.05,0.1,0.2,0.4,0.6,0.8,1,1.2,1.4,1.7,2.0])
 
 # -------------------------------------------------------------
 # rDonsker fractional Brownian motion simulator
 # -------------------------------------------------------------
 
-def fBm_path_rDonsker(grid_points: int, M: int, H: float, T: float) -> np.ndarray:
+def fBm_path_rDonsker_from_increments(dW_perp: np.ndarray, H: float, T: float) -> np.ndarray:
     """
-    rDonsker fractional Brownian motion paths with correct variance scaling.
-    Ensures Var[X_t] ≈ t^{2H}.
+    Construct fractional Brownian motion paths X_t = ∫_0^t K(t-s) dW_perp(s)
+    using the rDonsker approximation.
+
+    Parameters
+    ----------
+    dW_perp : np.ndarray
+        Increments of the Brownian motion driving volatility (M x (n-1)).
+        These already contain any correlation structure (via rho).
+    H : float
+        Hurst exponent.
+    T : float
+        Total time horizon.
+
+    Returns
+    -------
+    np.ndarray
+        Fractional Brownian motion paths X of shape (M, n).
     """
-    dt = 1 / (grid_points - 1)
-    dw = np.random.normal(0.0, (dt**H), size=(M, grid_points - 1))
-    i = np.arange(1, grid_points)
-    # "Optimal" Donsker kernel (from Bayer, Friz, Gatheral 2016)
+    M, n_minus_1 = dW_perp.shape
+    n = n_minus_1 + 1
+    i = np.arange(1, n)
     opt_k = ((i**(2*H) - (i-1)**(2*H)) / (2*H)) ** 0.5
 
-    Y = np.zeros((M, grid_points))
+    Y = np.zeros((M, n))
     for m in range(M):
-        conv = np.convolve(opt_k, dw[m, :])[:grid_points - 1]
+        conv = np.convolve(opt_k, dW_perp[m, :])[:n - 1]
         Y[m, 1:] = conv
 
-    # empirically normalize to Var[X_T] = T^{2H}
-    scale = T**H*np.sqrt(2*H)
+    scale = T**H * np.sqrt(2*H)
     Y *= scale
     return Y
+
 
 # -------------------------------------------------------------
 # Piecewise constant forward variance curve
@@ -102,21 +116,28 @@ def build_xi0_piecewise_constant(knots: np.ndarray, t_grid: np.ndarray) -> np.nd
 # Price simulation with correlated Brownian motions
 # -------------------------------------------------------------
 
-def simulate_price_paths(S0: float, t: np.ndarray, X: np.ndarray, dw: np.ndarray, dW_perp: np.ndarray,
+def simulate_price_paths(S0: float, t: np.ndarray, X: np.ndarray,
+                         dw: np.ndarray, dW_perp: np.ndarray,
                          xi0_t: np.ndarray, eta: float, rho: float, H: float) -> np.ndarray:
     n = min(X.shape[1], t.shape[0], dw.shape[1] + 1, xi0_t.shape[0])
     X, t, xi0_t = X[:, :n], t[:n], xi0_t[:n]
     dw, dW_perp = dw[:, :n-1], dW_perp[:, :n-1]
     M = X.shape[0]
     dt = np.mean(np.diff(t))
+
+    # Fractional volatility process
     t2H = np.power(t, 2.0 * H)
-    exp_etaX = np.exp(eta * X - 0.5 * eta**2 *t2H)
-    v = xi0_t * exp_etaX
-    dW_S = rho * dw + np.sqrt(max(1.0 - rho*rho, 0.0)) * dW_perp
+    v = xi0_t * np.exp(eta * X - 0.5 * eta**2 * t2H)
+
+    # Use dw directly (already correlated with dW_perp)
     logS = np.zeros((M, n))
     logS[:, 0] = np.log(S0)
-    logS[:, 1:] = logS[:, [0]] + np.cumsum(-0.5*v[:, :-1]*dt + np.sqrt(np.maximum(v[:, :-1], 0.0))*dW_S, axis=1)
+    logS[:, 1:] = logS[:, [0]] + np.cumsum(
+        -0.5 * v[:, :-1] * dt + np.sqrt(np.maximum(v[:, :-1], 0.0)) * dw,
+        axis=1
+    )
     return np.exp(logS)
+
 
 
 # -------------------------------------------------------------
@@ -394,9 +415,6 @@ def sample_param_sets_lhs(num_sets: int) -> list["RBergomiParams"]:
         ))
     return param_sets
 
-import numpy as np
-
-import numpy as np
 
 def jitter_grid(base_grid, grid_jitter=0.25, min_spacing=0.1):
     """
@@ -460,9 +478,9 @@ def generate_surfaces(
 ) -> List[Dict]:
     """
     Generate implied-volatility surfaces from Rough Bergomi simulations.
-    Each parameter set (η, ρ, H) defines one "model world".
+    Each parameter set (η, ρ, H) defines one 'model world'.
     Within that world, multiple forward-variance curves (xi₀_t) are simulated
-    using shared stochastic paths (dw, dW_perp, X).
+    using shared stochastic paths (dw, dW_perp, X), then reshuffled per curve.
     """
     # --- Setup save structure ---
     now = datetime.now()
@@ -475,8 +493,8 @@ def generate_surfaces(
     progress_path = "data/surfaces_progress.pkl"
     os.makedirs(os.path.dirname(progress_path), exist_ok=True)
 
-    np.random.seed(seed)
-    results = []
+    rng = np.random.RandomState(seed)
+    results: List[Dict] = []
 
     # --- Base time grid ---
     n, T_max = cfg.n, cfg.T_max
@@ -487,32 +505,44 @@ def generate_surfaces(
     param_sets = sample_param_sets_lhs(num_sets)
 
     for s, params in enumerate(param_sets):
-        np.random.seed(seed + 10_000 * s)
+        # deterministically advance seed per set
+        set_rng = np.random.RandomState(seed + 10_000 * s)
 
         # --------------------------------------------------------------
-        # Shared Brownian increments & fBm volatility driver per set
+        # Build correlated Brownian increments (with antithetics)
         # --------------------------------------------------------------
         M = int(2 * round(cfg.M / 2))
         M_half = M // 2
-        dw_half = np.random.normal(0.0, np.sqrt(dt), size=(M_half, n - 1))
-        dW_perp_half = np.random.normal(0.0, np.sqrt(dt), size=(M_half, n - 1))
-        dw = np.vstack([dw_half, -dw_half])
-        dW_perp = np.vstack([dW_perp_half, -dW_perp_half])
 
-        X = fBm_path_rDonsker(n, M, params.H, T_max)
+        z1_half = set_rng.normal(0.0, 1.0, size=(M_half, n - 1))
+        z2_half = set_rng.normal(0.0, 1.0, size=(M_half, n - 1))
+
+        # core Brownian for vol driver
+        dW_perp_half = np.sqrt(dt) * z1_half
+        # correlated spot Brownian: dw = ρ z1 + sqrt(1-ρ²) z2
+        rho = float(params.rho)
+        dw_half = np.sqrt(dt) * (rho * z1_half + np.sqrt(max(1.0 - rho * rho, 0.0)) * z2_half)
+
+        # antithetic pairing (keeps correlation structure intact)
+        dW_perp = np.vstack([dW_perp_half, -dW_perp_half])
+        dw = np.vstack([dw_half, -dw_half])
+
+        # fBm from the SAME dW_perp
+        X = fBm_path_rDonsker_from_increments(dW_perp, float(params.H), T_max)
 
         # --------------------------------------------------------------
-        # Generate multiple forward curves under same model & randomness
+        # Generate multiple forward curves under same model world
         # --------------------------------------------------------------
         for j in range(forward_curves_per_set):
-            # unique forward variance curve (market regime)
-            xi0_knots = np.random.uniform(0.01, 0.16, size=8)
+            # unique forward variance curve
+            xi0_knots = set_rng.uniform(0.01, 0.16, size=8)
             xi0_t = build_xi0_piecewise_constant(xi0_knots, base_t)
 
-            # simulate price paths under this forward curve
+
+            # simulate price paths
             S = simulate_price_paths(
                 cfg.S0, base_t, X, dw, dW_perp,
-                xi0_t, params.eta, params.rho, params.H
+                xi0_t, float(params.eta), rho, float(params.H)
             )
 
             strikes_base = cfg.strikes
@@ -520,24 +550,18 @@ def generate_surfaces(
 
             for g_id in range(cfg.G):
 
-                # Optional randomized grids
+                # Optional randomized grids (use your jitter helper)
                 if randomize_grid:
-                    dK = strikes_base[1] - strikes_base[0]
-                    dT = maturities_base[-1] - maturities_base[-2]
-                    # Multiplicative jitter: proportional to distance from ATM (=1.0)
-
-
                     strikes_shifted = jitter_grid(strikes_base, grid_jitter=0.25, min_spacing=0.05)
                     maturities_shifted = jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.02)
-
                 else:
                     strikes_shifted = strikes_base.copy()
                     maturities_shifted = maturities_base.copy()
 
                 # ------------------------------------------------------
-                # Extract from fine grid: prices and implied vols
+                # Extract: prices and implied vols on the (possibly jittered) grid
                 # ------------------------------------------------------
-                mat_idx = [np.argmin(np.abs(base_t - Tm)) for Tm in maturities_shifted]
+                mat_idx = [int(np.argmin(np.abs(base_t - Tm))) for Tm in maturities_shifted]
                 price_surf = np.zeros((len(maturities_shifted), len(strikes_shifted)))
                 iv_surf = np.zeros_like(price_surf)
 
@@ -547,11 +571,13 @@ def generate_surfaces(
                     price_surf[mi, :] = prices
                     iv_surf[mi, :] = surface_implied_vols_otm(cfg.S0, strikes_shifted, base_t[idx], prices)
 
-                # Fill missing vols across strikes/maturities
-                iv_surf = fill_nans_edgewise(iv_surf.T, strikes=strikes_shifted, maturities=maturities_shifted).T
+                # Fill/sanitize IV surface
+                iv_surf = fill_nans_edgewise(
+                    iv_surf.T, strikes=strikes_shifted, maturities=maturities_shifted
+                ).T
 
-            # ======================================================
-                # ✅ NaN and Inf check for every surface
+                # ======================================================
+                # NaN / Inf guard with debug dump
                 # ======================================================
                 if (
                     np.isnan(iv_surf).any()
@@ -561,7 +587,6 @@ def generate_surfaces(
                 ):
                     bad_dir = os.path.join("data", "debug_nans")
                     os.makedirs(bad_dir, exist_ok=True)
-
                     bad_path = os.path.join(bad_dir, f"bad_surface_set{s}_fwd{j}_grid{g_id}.npz")
                     np.savez_compressed(
                         bad_path,
@@ -569,26 +594,25 @@ def generate_surfaces(
                         iv_surface=iv_surf,
                         strikes=strikes_shifted,
                         maturities=maturities_shifted,
-                        params=vars(params)
+                        params=np.array([float(params.eta), rho, float(params.H)], dtype=float),
+                        xi0_knots=xi0_knots.astype(float),
                     )
-                    print(f"❌ NaN/Inf detected in surface (set={s}, fwd={j}, grid={g_id}) → saved to {bad_path}")
-                    continue  # skip appending this surface to results
+                    print(f"NaN/Inf detected in surface (set={s}, fwd={j}, grid={g_id}) → {bad_path}")
+                    continue
 
-                # ======================================================
-
-                # Build per-surface parameter record (model + this surface's forward curve)
+                # Record (note: params include THIS surface's xi0_knots)
                 params_record = {
                     "eta": float(params.eta),
-                    "rho": float(params.rho),
+                    "rho": rho,
                     "H": float(params.H),
-                    "xi0_knots": np.asarray(xi0_knots, dtype=float).tolist(),  # per-surface!
+                    "xi0_knots": xi0_knots.astype(float).tolist(),
                 }
 
                 results.append({
                     "set_id": s,
                     "fwd_id": j,
                     "grid_id": g_id,
-                    "params": params_record,               # <-- now correct
+                    "params": params_record,
                     "grid": {
                         "strikes": strikes_shifted.astype(float),
                         "maturities": maturities_shifted.astype(float),
@@ -597,25 +621,30 @@ def generate_surfaces(
                     "iv_surface": iv_surf,
                 })
 
-
-                # Periodic save
+                # Periodic safe save (atomic replace)
                 if len(results) % save_every == 0:
                     data = {"cfg": cfg.__dict__, "surfaces": results}
-                    with open(timestamped_path, "wb") as f:
-                        pickle.dump(data, f)
-                    with open(progress_path, "wb") as f:
-                        pickle.dump(data, f)
-                    print(f"[Progress] Saved {len(results)} surfaces → {timestamped_path}")
+                    tmp1 = timestamped_path + ".tmp"
+                    tmp2 = progress_path + ".tmp"
+                    with open(tmp1, "wb") as f:
+                        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    os.replace(tmp1, timestamped_path)
+                    with open(tmp2, "wb") as f:
+                        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    os.replace(tmp2, progress_path)
+                    print(f"[Progress] Saved {len(results)} surfaces  {timestamped_path}")
 
-    # --- Final save ---
+    # --- Final save (atomic) ---
     data = {"cfg": cfg.__dict__, "surfaces": results}
-    with open(timestamped_path, "wb") as f:
-        pickle.dump(data, f)
-    with open(progress_path, "wb") as f:
-        pickle.dump(data, f)
-    print(f"[Done] Saved {len(results)} surfaces → {timestamped_path}")
+    tmp1 = timestamped_path + ".tmp"
+    tmp2 = progress_path + ".tmp"
+    with open(tmp1, "wb") as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp1, timestamped_path)
+    with open(tmp2, "wb") as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp2, progress_path)
+    print(f"[Done] Saved {len(results)} surfaces  {timestamped_path}")
 
     return results
-
-
 

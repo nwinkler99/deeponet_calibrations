@@ -1,4 +1,5 @@
-import os
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), '..')))
 import gc
 import time
 import pickle
@@ -10,6 +11,7 @@ from generation.surface_generation import generate_surfaces, SimulationConfig
 # ==========================================
 # CONFIGURATION
 # ==========================================
+
 
 NUM_BATCHES = 100          # total number of batches to run
 BATCH_SIZE = 50            # number of parameter sets per batch
@@ -35,14 +37,14 @@ def save_checkpoint(batch_idx, data):
     with open(tmp_path, "wb") as f:
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp_path, out_path)
-    print(f"💾 Saved batch {batch_idx} → {out_path}")
+    print(f"Saved batch {batch_idx} {out_path}")
 
 # ==========================================
 # MAIN LOOP
 # ==========================================
-
+print("start")
 for batch_idx in range(NUM_BATCHES):
-    print(f"\n🚀 Starting batch {batch_idx+1}/{NUM_BATCHES} | mem={memory_usage_gb():.2f} GB")
+    print(f"\nStarting batch {batch_idx+1}/{NUM_BATCHES} | mem={memory_usage_gb():.2f} GB")
 
     try:
         # run generation for this batch
@@ -59,12 +61,13 @@ for batch_idx in range(NUM_BATCHES):
         save_checkpoint(batch_idx, surfaces)
         del surfaces
         gc.collect()
-        print(f"✅ Batch {batch_idx+1} complete | mem={memory_usage_gb():.2f} GB")
+        print(f"Batch {batch_idx+1} complete | mem={memory_usage_gb():.2f} GB")
 
     except Exception as e:
-        print(f"⚠️ Error in batch {batch_idx}: {type(e).__name__} — {e}")
-        print(f"🕒 Waiting {SLEEP_ON_ERROR}s before retry...")
+        print(f"Error in batch {batch_idx}: {type(e).__name__} — {e}")
+        print(f"Waiting {SLEEP_ON_ERROR}s before retry...")
         time.sleep(SLEEP_ON_ERROR)
         continue  # proceed to next batch
 
-print("\n🎉 All batches completed successfully!")
+print("\nAll batches completed successfully!")
+
