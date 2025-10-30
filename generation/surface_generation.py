@@ -10,9 +10,16 @@
 
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from scipy.stats import norm
 import pandas as pd
+from datetime import datetime
+import os
+import pickle
+
+import os, pickle, numpy as np
+from datetime import datetime
+from typing import List, Dict
 # -------------------------------------------------------------
 # Parameter structures
 # -------------------------------------------------------------
@@ -39,7 +46,7 @@ class SimulationConfig:
         if self.strikes is None:
             self.strikes = np.array([0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3,1.4,1.5])
         if self.maturities is None:
-            self.maturities = np.array([0.1,0.3,0.6,0.9,1.2,1.5,1.8,2.0])
+            self.maturities = np.array([0,0.2,0.4,0.6,0.8,1,1.2,1.4,1.6,1.8,2.0])
 
 # -------------------------------------------------------------
 # rDonsker fractional Brownian motion simulator
@@ -112,7 +119,7 @@ def price_otm_plain(ST: np.ndarray, S0: float, Ks: np.ndarray) -> np.ndarray:
     calls = price_calls_plain(ST, S0, Ks)
     puts = price_puts_plain(ST, S0, Ks)
     return np.where(Ks >= S0, calls, puts)
-
+    
 # -------------------------------------------------------------
 # Black–Scholes pricing + implied vol inversion (robust)
 # -------------------------------------------------------------
@@ -159,63 +166,204 @@ def surface_implied_vols_otm(S0, Ks, T, prices):
     return np.array(ivs)
 
 
-def fill_nans_edgewise(arr: np.ndarray) -> np.ndarray:
+import numpy as np
+
+import numpy as np
+
+def fill_nans_edgewise(
+    arr: np.ndarray,
+    strikes: np.ndarray = None,
+    maturities: np.ndarray = None
+) -> np.ndarray:
     """
-    Fast edge-stable NaN fill for 2D surfaces.
-    1. Linear interpolation along each row.
-    2. Linear interpolation along each column.
-    3. Fill any remaining NaNs (usually corners) with nearest-edge values.
+    Fill NaNs across maturities and strikes by log-linear interpolation + trend-based extrapolation.
+    Then lift artificial valleys at the edges for a smooth, realistic surface.
+
+    All interpolation/extrapolation is done in log-vol space.
+    The implementation is robust against duplicate coordinates and zero-length segments.
     """
-    arr_filled = arr.copy()
 
-    # Step 1: interpolate along rows (axis=1)
-    for i in range(arr_filled.shape[0]):
-        s = pd.Series(arr_filled[i, :])
-        arr_filled[i, :] = s.interpolate(limit_direction="both").to_numpy()
+    arr_out = arr.copy()
+    orig_nan = np.isnan(arr_out)
+    if not np.any(orig_nan):
+        return arr_out
 
-    # Step 2: interpolate along columns (axis=0)
-    for j in range(arr_filled.shape[1]):
-        s = pd.Series(arr_filled[:, j])
-        arr_filled[:, j] = s.interpolate(limit_direction="both").to_numpy()
+    n_strikes, n_mats = arr_out.shape
+    mat_coords = np.asarray(maturities, dtype=float) if maturities is not None else np.arange(n_mats, dtype=float)
+    strike_coords = np.asarray(strikes, dtype=float) if strikes is not None else np.arange(n_strikes, dtype=float)
 
-    # Step 3: any remaining NaNs (at corners) → nearest-edge fill
-    nan_mask = np.isnan(arr_filled)
-    if np.any(nan_mask):
-        # fill with nearest valid value using broadcasting
-        valid_mask = ~nan_mask
-        x, y = np.indices(arr_filled.shape)
-        valid_coords = np.column_stack(np.where(valid_mask))
-        valid_values = arr_filled[valid_mask]
-        from scipy.spatial import cKDTree
-        tree = cKDTree(valid_coords)
-        nan_coords = np.column_stack(np.where(nan_mask))
-        _, idx = tree.query(nan_coords)
-        arr_filled[nan_mask] = valid_values[idx]
+    # -------------------------------------------------------------------------
+    # 1D interpolation + safe extrapolation
+    # -------------------------------------------------------------------------
+    def _interp_extrap(x_all, x_known, y_known, eps=1e-12):
+        """Safe linear interpolation + slope-based extrapolation in log-space."""
+        interp = np.empty_like(x_all, dtype=float)
+        interp[:] = np.nan
 
-    return arr_filled
-# -------------------------------------------------------------
-# Parameter sampling
-# -------------------------------------------------------------
+        # remove NaNs and duplicates in x_known
+        mask = ~np.isnan(x_known)
+        x_known = np.asarray(x_known[mask], float)
+        y_known = np.asarray(y_known[mask], float)
+        if x_known.size == 0:
+            return np.full_like(x_all, np.nan)
+        # if duplicates exist, keep unique with mean y
+        uniq_x, idx = np.unique(x_known, return_inverse=True)
+        if uniq_x.size < x_known.size:
+            y_avg = np.zeros_like(uniq_x)
+            counts = np.zeros_like(uniq_x)
+            for i, xi in enumerate(idx):
+                y_avg[xi] += y_known[i]
+                counts[xi] += 1
+            y_known = y_avg / np.maximum(counts, 1)
+            x_known = uniq_x
 
-def sample_param_set() -> RBergomiParams:
-    xi0_knots = np.random.uniform(0.01, 0.16, size=8)
-    eta = np.random.uniform(0.5, 4.0)
-    rho = np.random.uniform(-0.95, -0.1)
-    H = np.random.uniform(0.025, 0.5)
-    return RBergomiParams(eta=eta, rho=rho, H=H, xi0_knots=xi0_knots)
+        if len(x_known) == 1:
+            interp[:] = y_known[0]
+            return interp
 
-# -------------------------------------------------------------
-# Main workflow
-# -------------------------------------------------------------
+        interp[:] = np.interp(x_all, x_known, y_known)
 
-# -------------------------------------------------------------
-# Main workflow with optional randomized grids
-# -------------------------------------------------------------
+        # safe slope helper
+        def safe_slope(y2, y1, x2, x1):
+            dx = x2 - x1
+            if abs(dx) < eps:
+                return 0.0
+            return (y2 - y1) / dx
 
-import os, pickle, numpy as np
+        # left extrapolation
+        slope_left = safe_slope(y_known[1], y_known[0], x_known[1], x_known[0])
+        left_mask = x_all < x_known[0]
+        interp[left_mask] = y_known[0] + slope_left * (x_all[left_mask] - x_known[0])
+
+        # right extrapolation
+        slope_right = safe_slope(y_known[-1], y_known[-2], x_known[-1], x_known[-2])
+        right_mask = x_all > x_known[-1]
+        interp[right_mask] = y_known[-1] + slope_right * (x_all[right_mask] - x_known[-1])
+
+        # optional numeric sanity clipping (avoid insane extrapolations)
+        interp = np.clip(interp, np.nanmin(y_known) - 5.0 * abs(np.nanstd(y_known)),
+                         np.nanmax(y_known) + 5.0 * abs(np.nanstd(y_known)))
+        return interp
+
+    # -------------------------------------------------------------------------
+    # Pass 1: across maturities (per strike)
+    # -------------------------------------------------------------------------
+    mat_fill = np.full_like(arr_out, np.nan)
+    for i in range(n_strikes):
+        row = arr_out[i, :]
+        known = ~np.isnan(row)
+        if np.count_nonzero(known) == 0:
+            continue
+        known_x = mat_coords[known]
+        known_y = np.log(np.maximum(row[known], 1e-12))
+        interp_log = _interp_extrap(mat_coords, known_x, known_y)
+        mat_fill[i, :] = np.exp(interp_log)
+
+    # -------------------------------------------------------------------------
+    # Pass 2: across strikes (per maturity)
+    # -------------------------------------------------------------------------
+    strike_fill = np.full_like(arr_out, np.nan)
+    for j in range(n_mats):
+        col = arr_out[:, j]
+        known = ~np.isnan(col)
+        if np.count_nonzero(known) == 0:
+            continue
+        known_x = strike_coords[known]
+        known_y = np.log(np.maximum(col[known], 1e-12))
+        interp_log = _interp_extrap(strike_coords, known_x, known_y)
+        strike_fill[:, j] = np.exp(interp_log)
+
+    # -------------------------------------------------------------------------
+    # Combine: choose larger estimate for originally missing entries
+    # -------------------------------------------------------------------------
+    combined = np.maximum(mat_fill, strike_fill)
+    arr_out[orig_nan] = combined[orig_nan]
+
+    # -------------------------------------------------------------------------
+    # Edge-valley lifting pass
+    # -------------------------------------------------------------------------
+    def _lift_edge_valleys(surface: np.ndarray, axis: int = 1) -> np.ndarray:
+        out = surface.copy()
+        if axis == 1:  # across maturities
+            for i in range(out.shape[0]):
+                row = out[i, :]
+                if len(row) < 3 or np.any(np.isnan(row)):
+                    continue
+                if row[0] < row[1] + (row[1] - row[2]):
+                    out[i, 0] = row[1] + (row[1] - row[2])
+                if row[1] < (row[0] + row[2]) / 2:
+                    out[i, 1] = (row[0] + row[2]) / 2
+                if row[-1] < row[-2] + (row[-2] - row[-3]):
+                    out[i, -1] = row[-2] + (row[-2] - row[-3])
+        else:  # across strikes
+            for j in range(out.shape[1]):
+                col = out[:, j]
+                if len(col) < 3 or np.any(np.isnan(col)):
+                    continue
+                if col[0] < col[1] + (col[1] - col[2]):
+                    out[0, j] = col[1] + (col[1] - col[2])
+                if col[1] < (col[0] + col[2]) / 2:
+                    out[1, j] = (col[0] + col[2]) / 2
+                if col[-1] < col[-2] + (col[-2] - col[-3]):
+                    out[-1, j] = col[-2] + (col[-2] - col[-3])
+        return out
+
+    arr_out = _lift_edge_valleys(arr_out, axis=1)
+    arr_out = _lift_edge_valleys(arr_out, axis=0)
+
+    return arr_out
+
+import numpy as np, os, pickle
 from datetime import datetime
 from typing import List, Dict
+from scipy.stats import qmc   # Latin Hypercube sampler
 
+import numpy as np
+import os
+import pickle
+from datetime import datetime
+from typing import List, Dict
+from scipy.stats import qmc
+
+from scipy.stats import qmc
+import numpy as np
+
+def sample_param_sets_lhs(num_sets: int) -> list["RBergomiParams"]:
+    """
+    Latin Hypercube sample of Rough Bergomi parameters.
+    - η   ∈ [0.5, 4.0]
+    - ρ   ∈ [-0.95, -0.1]
+    - H   ∈ [0.025, 0.5]
+    - xi₀_knots (8 values) ∈ [0.01, 0.16], random per set
+    """
+    sampler = qmc.LatinHypercube(d=3)
+    sample = sampler.random(num_sets)  # shape (num_sets, 3)
+
+    # scale entire matrix at once
+    lower = np.array([0.5, -0.95, 0.025])
+    upper = np.array([4.0, -0.1, 0.5])
+    scaled = qmc.scale(sample, lower, upper)  # shape (num_sets, 3)
+
+    eta_vals = scaled[:, 0]
+    rho_vals = scaled[:, 1]
+    H_vals   = scaled[:, 2]
+
+    param_sets = []
+    for i in range(num_sets):
+        xi0_knots = np.random.uniform(0.01, 0.16, size=8)
+        param_sets.append(RBergomiParams(
+            eta=float(eta_vals[i]),
+            rho=float(rho_vals[i]),
+            H=float(H_vals[i]),
+            xi0_knots=xi0_knots
+        ))
+    return param_sets
+
+
+
+# ---------------------------------------------------------------------
+# Main surface generation
+# ---------------------------------------------------------------------
 def generate_surfaces(
     num_sets=1,
     forward_curves_per_set=1,
@@ -223,56 +371,74 @@ def generate_surfaces(
     seed=42,
     randomize_grid=False,
     grid_jitter=0.5,
-    save_every=200,
-    save_path="data/surfaces_progress.pkl"
+    save_every=200
 ) -> List[Dict]:
     """
-    Generate implied volatility surfaces from a Rough Bergomi simulator.
-    Simulation runs on a fine time grid (cfg.n) and periodically saves progress
-    to a single pickle file every `save_every` surfaces.
+    Generate implied-volatility surfaces from Rough Bergomi simulations.
+    Each parameter set (η, ρ, H) defines one "model world".
+    Within that world, multiple forward-variance curves (xi₀_t) are simulated
+    using shared stochastic paths (dw, dW_perp, X).
     """
+    # --- Setup save structure ---
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H-%M-%S")
+    save_dir = os.path.join("data", date_str)
+    os.makedirs(save_dir, exist_ok=True)
+
+    timestamped_path = os.path.join(save_dir, f"surfaces_{time_str}.pkl")
+    progress_path = "data/surfaces_progress.pkl"
+    os.makedirs(os.path.dirname(progress_path), exist_ok=True)
 
     np.random.seed(seed)
     results = []
 
+    # --- Base time grid ---
     n, T_max = cfg.n, cfg.T_max
     base_t = np.linspace(0.0, T_max, n)
     dt = base_t[1] - base_t[0]
-    M = cfg.M
 
-    # Ensure save directory exists
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    # --- Sample parameters via Latin Hypercube ---
+    param_sets = sample_param_sets_lhs(num_sets)
 
-    for s in range(num_sets):
-        params = sample_param_set()
-        np.random.seed(seed + s)
+    for s, params in enumerate(param_sets):
+        np.random.seed(seed + 10_000 * s)
 
-        # --- Brownian increments (antithetic) ---
-        M = int(2 * round(M / 2))
+        # --------------------------------------------------------------
+        # Shared Brownian increments & fBm volatility driver per set
+        # --------------------------------------------------------------
+        M = int(2 * round(cfg.M / 2))
         M_half = M // 2
         dw_half = np.random.normal(0.0, np.sqrt(dt), size=(M_half, n - 1))
         dW_perp_half = np.random.normal(0.0, np.sqrt(dt), size=(M_half, n - 1))
         dw = np.vstack([dw_half, -dw_half])
         dW_perp = np.vstack([dW_perp_half, -dW_perp_half])
 
-        # --- fBm volatility driver & forward variance ---
         X = fBm_path_rDonsker(n, M, params.H, T_max)
-        xi0_t = build_xi0_piecewise_constant(params.xi0_knots, base_t)
 
-        # --- Single fine-grid simulation ---
-        S = simulate_price_paths(cfg.S0, base_t, X, dw, dW_perp,
-                                 xi0_t, params.eta, params.rho, params.H)
-
-        strikes_base = cfg.strikes
-        maturities_base = cfg.maturities
-
+        # --------------------------------------------------------------
+        # Generate multiple forward curves under same model & randomness
+        # --------------------------------------------------------------
         for j in range(forward_curves_per_set):
+            # unique forward variance curve (market regime)
+            xi0_knots = np.random.uniform(0.01, 0.16, size=8)
+            xi0_t = build_xi0_piecewise_constant(xi0_knots, base_t)
+
+            # simulate price paths under this forward curve
+            S = simulate_price_paths(
+                cfg.S0, base_t, X, dw, dW_perp,
+                xi0_t, params.eta, params.rho, params.H
+            )
+
+            strikes_base = cfg.strikes
+            maturities_base = cfg.maturities
+
             for g_id in range(cfg.G):
 
-                # --- Optional randomized grids ---
+                # Optional randomized grids
                 if randomize_grid:
                     dK = strikes_base[1] - strikes_base[0]
-                    dT = maturities_base[1] - maturities_base[0]
+                    dT = maturities_base[-1] - maturities_base[-2]
                     strikes_shifted = np.clip(
                         strikes_base + np.random.uniform(-grid_jitter * dK, grid_jitter * dK, len(strikes_base)),
                         0.5, 1.5
@@ -281,11 +447,14 @@ def generate_surfaces(
                         maturities_base + np.random.uniform(-grid_jitter * dT, grid_jitter * dT, len(maturities_base)),
                         0.01, T_max
                     )
+                    maturities_shifted = np.sort(maturities_shifted)
                 else:
                     strikes_shifted = strikes_base.copy()
                     maturities_shifted = maturities_base.copy()
 
-                # --- Extract from fine grid ---
+                # ------------------------------------------------------
+                # Extract from fine grid: prices and implied vols
+                # ------------------------------------------------------
                 mat_idx = [np.argmin(np.abs(base_t - Tm)) for Tm in maturities_shifted]
                 price_surf = np.zeros((len(maturities_shifted), len(strikes_shifted)))
                 iv_surf = np.zeros_like(price_surf)
@@ -296,7 +465,8 @@ def generate_surfaces(
                     price_surf[mi, :] = prices
                     iv_surf[mi, :] = surface_implied_vols_otm(cfg.S0, strikes_shifted, base_t[idx], prices)
 
-                iv_surf = fill_nans_edgewise(iv_surf)
+                # Fill missing vols across strikes/maturities
+                iv_surf = fill_nans_edgewise(iv_surf.T, strikes=strikes_shifted, maturities=maturities_shifted).T
 
                 results.append({
                     "set_id": s,
@@ -311,23 +481,24 @@ def generate_surfaces(
                     "iv_surface": iv_surf,
                 })
 
-                # --- Periodic save to single file ---
+                # Periodic save
                 if len(results) % save_every == 0:
-                    with open(save_path, "wb") as f:
-                        pickle.dump({
-                            "cfg": cfg.__dict__,
-                            "surfaces": results
-                        }, f)
-                    print(f"[Progress] Saved {len(results)} surfaces → {save_path}")
+                    data = {"cfg": cfg.__dict__, "surfaces": results}
+                    with open(timestamped_path, "wb") as f:
+                        pickle.dump(data, f)
+                    with open(progress_path, "wb") as f:
+                        pickle.dump(data, f)
+                    print(f"[Progress] Saved {len(results)} surfaces → {timestamped_path}")
 
     # --- Final save ---
-    with open(save_path, "wb") as f:
-        pickle.dump({
-            "cfg": cfg.__dict__,
-            "surfaces": results
-        }, f)
-    print(f"[Done] Saved final dataset with {len(results)} surfaces → {save_path}")
+    data = {"cfg": cfg.__dict__, "surfaces": results}
+    with open(timestamped_path, "wb") as f:
+        pickle.dump(data, f)
+    with open(progress_path, "wb") as f:
+        pickle.dump(data, f)
+    print(f"[Done] Saved {len(results)} surfaces → {timestamped_path}")
 
     return results
+
 
 
