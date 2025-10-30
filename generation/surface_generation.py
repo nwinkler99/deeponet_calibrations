@@ -490,15 +490,5 @@ def generate_surfaces(
                         pickle.dump(data, f)
                     print(f"[Progress] Saved {len(results)} surfaces → {timestamped_path}")
 
-    # --- Final save ---
-    data = {"cfg": cfg.__dict__, "surfaces": results}
-    with open(timestamped_path, "wb") as f:
-        pickle.dump(data, f)
-    with open(progress_path, "wb") as f:
-        pickle.dump(data, f)
-    print(f"[Done] Saved {len(results)} surfaces → {timestamped_path}")
-
-    return results
-
 
 
