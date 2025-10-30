@@ -87,18 +87,19 @@ class DeepONet(BaseModel):
         batch_size=256,
         val_split=0.2,
         shuffle=True,
-        normalize=False
+        normalize=False,
+        debug_dir="debug_nans"
     ):
-        """
-        Convert Rough Bergomi generator surfaces into train/test DataLoaders.
-        """
-        Xb_list, Xt_list, Y_list = [], [], []
+        import os
+        os.makedirs(debug_dir, exist_ok=True)
 
-        for surf in surfaces:
+        Xb_list, Xt_list, Y_list, origin_list = [], [], [], []
+
+        for surf_idx, surf in enumerate(surfaces):
             params = surf["params"]
-            iv_surface = surf["iv_surface"]
-            Ks = surf["grid"]["strikes"]
-            Ts = surf["grid"]["maturities"]
+            iv_surface = np.array(surf["iv_surface"], dtype=np.float32)
+            Ks = np.array(surf["grid"]["strikes"], dtype=np.float32)
+            Ts = np.array(surf["grid"]["maturities"], dtype=np.float32)
 
             xi0_knots = np.array(params["xi0_knots"]).flatten()
             branch_vec = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots]).astype(np.float32)
@@ -108,23 +109,64 @@ class DeepONet(BaseModel):
             branch_repeated = np.repeat(branch_vec[None, :], len(trunk_coords), axis=0)
             Y_flat = iv_surface.flatten()[:, None].astype(np.float32)
 
+            # ========== NaN / Inf sanity checks ==========
+            def check_and_save(name, arr):
+                if np.isnan(arr).any() or np.isinf(arr).any():
+                    np.savez_compressed(
+                        os.path.join(debug_dir, f"offending_surface_{surf_idx}.npz"),
+                        iv_surface=iv_surface,
+                        strikes=Ks,
+                        maturities=Ts,
+                        params=params
+                    )
+                    raise ValueError(
+                        f"❌ Detected NaN/Inf in {name} for surface index {surf_idx}. "
+                        f"Saved snapshot to '{debug_dir}/offending_surface_{surf_idx}.npz'"
+                    )
+
+            check_and_save("iv_surface", iv_surface)
+            check_and_save("strikes", Ks)
+            check_and_save("maturities", Ts)
+            check_and_save("xi0_knots", xi0_knots)
+            check_and_save("branch_vec", branch_vec)
+
+            # ============================================
+
             Xb_list.append(branch_repeated)
             Xt_list.append(trunk_coords)
             Y_list.append(Y_flat)
+            origin_list.append(np.full(len(Y_flat), surf_idx, dtype=np.int64))
 
         X_branch = np.concatenate(Xb_list, axis=0)
         X_trunk  = np.concatenate(Xt_list, axis=0)
         Y        = np.concatenate(Y_list, axis=0)
 
-        # Only normalize X_trunk based on training data
+        # ========== Check final concatenated arrays ==========
+        for name, arr in [
+            ("X_branch", X_branch),
+            ("X_trunk", X_trunk),
+            ("Y", Y),
+        ]:
+            if np.isnan(arr).any() or np.isinf(arr).any():
+                bad_idx = np.argwhere(np.isnan(arr) | np.isinf(arr))
+                np.savez_compressed(
+                    os.path.join(debug_dir, f"offending_global_{name}.npz"),
+                    array=arr, bad_idx=bad_idx
+                )
+                raise ValueError(
+                    f"❌ Detected NaN/Inf in {name} (global concatenation). "
+                    f"Saved details to '{debug_dir}/offending_global_{name}.npz'"
+                )
+        # =====================================================
+
+        # Normalization
         if normalize:
             X_trunk_mean, X_trunk_std = X_trunk.mean(0), X_trunk.std(0)
             X_trunk = (X_trunk - X_trunk_mean) / (X_trunk_std + 1e-8)
         else:
-            # no normalization of inputs either
             X_trunk_mean = X_trunk_std = None
 
-        # Split train/test
+        # Split train/val
         n_total = len(Y)
         n_train = int((1 - val_split) * n_total)
         idx = np.arange(n_total)
@@ -136,14 +178,13 @@ class DeepONet(BaseModel):
         val_ds   = IVSurfaceDataset(X_branch[val_idx], X_trunk[val_idx], Y[val_idx])
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        val_loader   = DataLoader(val_ds, batch_size=2*batch_size, shuffle=False)
+        val_loader   = DataLoader(val_ds, batch_size=2 * batch_size, shuffle=False)
 
         branch_dim = X_branch.shape[1]
 
-        print(f"Prepared data → {len(train_ds)} train / {len(val_ds)} val samples")
+        print(f"✅ Prepared data → {len(train_ds)} train / {len(val_ds)} val samples")
         print(f"Branch dim: {branch_dim}, Trunk dim: {X_trunk.shape[1]}")
 
-        # Return only loaders and branch dim (no normalization stats by default)
         return train_loader, val_loader, branch_dim
 
 

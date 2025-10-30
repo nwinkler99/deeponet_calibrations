@@ -17,6 +17,20 @@ from datetime import datetime
 import os
 import pickle
 
+import numpy as np, os, pickle
+from datetime import datetime
+from typing import List, Dict
+from scipy.stats import qmc   # Latin Hypercube sampler
+
+import numpy as np
+import os
+import pickle
+from datetime import datetime
+from typing import List, Dict
+from scipy.stats import qmc
+
+from scipy.stats import qmc
+import numpy as np
 import os, pickle, numpy as np
 from datetime import datetime
 from typing import List, Dict
@@ -44,9 +58,9 @@ class SimulationConfig:
 
     def __post_init__(self):
         if self.strikes is None:
-            self.strikes = np.array([0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3,1.4,1.5])
+            self.strikes = np.array([0.5,0.6,0.7,0.8,0.9, 0.95, 1.0, 1.05 ,1.1,1.2,1.3,1.4,1.5])
         if self.maturities is None:
-            self.maturities = np.array([0,0.2,0.4,0.6,0.8,1,1.2,1.4,1.6,1.8,2.0])
+            self.maturities = np.array([0.01,0.025,0.05,0.1,0.2,0.4,0.6,0.8,1,1.2,1.4,1.7,2.0])
 
 # -------------------------------------------------------------
 # rDonsker fractional Brownian motion simulator
@@ -168,16 +182,16 @@ def surface_implied_vols_otm(S0, Ks, T, prices):
 
 import numpy as np
 
-import numpy as np
-
 def fill_nans_edgewise(
     arr: np.ndarray,
     strikes: np.ndarray = None,
-    maturities: np.ndarray = None
+    maturities: np.ndarray = None,
+    apply_scar_removal: bool = True
 ) -> np.ndarray:
     """
     Fill NaNs across maturities and strikes by log-linear interpolation + trend-based extrapolation.
     Then lift artificial valleys at the edges for a smooth, realistic surface.
+    Optionally applies a post-processing step to remove local scars along the strike dimension.
 
     All interpolation/extrapolation is done in log-vol space.
     The implementation is robust against duplicate coordinates and zero-length segments.
@@ -206,7 +220,7 @@ def fill_nans_edgewise(
         y_known = np.asarray(y_known[mask], float)
         if x_known.size == 0:
             return np.full_like(x_all, np.nan)
-        # if duplicates exist, keep unique with mean y
+
         uniq_x, idx = np.unique(x_known, return_inverse=True)
         if uniq_x.size < x_known.size:
             y_avg = np.zeros_like(uniq_x)
@@ -223,12 +237,9 @@ def fill_nans_edgewise(
 
         interp[:] = np.interp(x_all, x_known, y_known)
 
-        # safe slope helper
         def safe_slope(y2, y1, x2, x1):
             dx = x2 - x1
-            if abs(dx) < eps:
-                return 0.0
-            return (y2 - y1) / dx
+            return (y2 - y1) / dx if abs(dx) > eps else 0.0
 
         # left extrapolation
         slope_left = safe_slope(y_known[1], y_known[0], x_known[1], x_known[0])
@@ -240,8 +251,8 @@ def fill_nans_edgewise(
         right_mask = x_all > x_known[-1]
         interp[right_mask] = y_known[-1] + slope_right * (x_all[right_mask] - x_known[-1])
 
-        # optional numeric sanity clipping (avoid insane extrapolations)
-        interp = np.clip(interp, np.nanmin(y_known) - 5.0 * abs(np.nanstd(y_known)),
+        interp = np.clip(interp,
+                         np.nanmin(y_known) - 5.0 * abs(np.nanstd(y_known)),
                          np.nanmax(y_known) + 5.0 * abs(np.nanstd(y_known)))
         return interp
 
@@ -273,9 +284,7 @@ def fill_nans_edgewise(
         interp_log = _interp_extrap(strike_coords, known_x, known_y)
         strike_fill[:, j] = np.exp(interp_log)
 
-    # -------------------------------------------------------------------------
-    # Combine: choose larger estimate for originally missing entries
-    # -------------------------------------------------------------------------
+    # Combine both directions
     combined = np.maximum(mat_fill, strike_fill)
     arr_out[orig_nan] = combined[orig_nan]
 
@@ -311,22 +320,48 @@ def fill_nans_edgewise(
     arr_out = _lift_edge_valleys(arr_out, axis=1)
     arr_out = _lift_edge_valleys(arr_out, axis=0)
 
+    # -------------------------------------------------------------------------
+    # Optional: apply scar removal (strike-wise smoothing)
+    # -------------------------------------------------------------------------
+    if apply_scar_removal:
+        arr_out = fix_strike_outliers(arr_out)
+
     return arr_out
 
-import numpy as np, os, pickle
-from datetime import datetime
-from typing import List, Dict
-from scipy.stats import qmc   # Latin Hypercube sampler
 
-import numpy as np
-import os
-import pickle
-from datetime import datetime
-from typing import List, Dict
-from scipy.stats import qmc
+# --- scar removal helper ---
+def fix_strike_outliers(surface, threshold_low=0.98, threshold_high=1.02, 
+                        lift_strength=0.9, damp_strength=0.6, window=2):
+    """
+    Entfernt unphysikalische Dellen (Narben) und Spikes entlang der Strike-Achse.
+    Arbeitet maturity-wise (Zeile für Zeile), respektiert lokale Smile-Struktur.
+    """
+    surface = np.array(surface, dtype=float)
+    out = surface.copy()
+    n_T, n_K = surface.shape
 
-from scipy.stats import qmc
-import numpy as np
+    for t in range(n_T):
+        row = surface[t, :]
+        corrected = row.copy()
+
+        for i in range(n_K):
+            left = max(0, i - window)
+            right = min(n_K, i + window + 1)
+            local = row[left:right]
+            local_med = np.median(local)
+
+            # Delle → anheben
+            if row[i] < threshold_low * local_med:
+                corrected[i] = row[i] + lift_strength * (local_med - row[i])
+            # Spike → absenken
+            elif row[i] > threshold_high * local_med:
+                corrected[i] = row[i] - damp_strength * (row[i] - local_med)
+
+        out[t, :] = corrected
+
+    return out
+
+
 
 def sample_param_sets_lhs(num_sets: int) -> list["RBergomiParams"]:
     """
@@ -359,6 +394,56 @@ def sample_param_sets_lhs(num_sets: int) -> list["RBergomiParams"]:
         ))
     return param_sets
 
+import numpy as np
+
+import numpy as np
+
+def jitter_grid(base_grid, grid_jitter=0.25, min_spacing=0.1):
+    """
+    Apply additive jitter to a monotonic grid (e.g. strikes or maturities),
+    randomly distributing a total jitter budget while preserving order and spacing.
+
+    Parameters
+    ----------
+    base_grid : np.ndarray
+        Sorted 1D base grid (e.g. strikes or maturities).
+    grid_jitter : float
+        Fraction of total jitter budget relative to total grid range.
+    min_spacing : float
+        Minimum allowed distance between adjacent grid points.
+
+    Returns
+    -------
+    np.ndarray
+        Jittered, sorted grid with the same length as the input.
+    """
+    base_grid = np.sort(np.array(base_grid, dtype=float))
+    n = len(base_grid)
+    lo, hi = base_grid[0], base_grid[-1]
+    total_range = hi - lo
+
+    # define total jitter budget
+    total_budget = grid_jitter * total_range
+
+    for _ in range(100):  # retry loop to ensure spacing
+        # randomly split the total budget into positive/negative perturbations
+        signs = np.random.choice([-1, 1], size=n)
+        weights = np.random.uniform(0, 1, size=n)
+        weights /= np.sum(weights) + 1e-12  # normalize weights to sum to 1
+
+        jitter = signs * weights * total_budget
+        grid_shifted = base_grid + jitter
+
+        # enforce boundaries
+        grid_shifted = np.clip(grid_shifted, lo, hi)
+        grid_shifted = np.sort(grid_shifted)
+
+        # ensure no overlaps / minimum spacing
+        if np.all(np.diff(grid_shifted) > min_spacing):
+            return np.round(grid_shifted, 6)
+    return np.round(grid_shifted, 6)
+
+
 
 
 # ---------------------------------------------------------------------
@@ -370,7 +455,7 @@ def generate_surfaces(
     cfg=SimulationConfig(),
     seed=42,
     randomize_grid=False,
-    grid_jitter=0.5,
+    grid_jitter=0.25,
     save_every=200
 ) -> List[Dict]:
     """
@@ -439,15 +524,12 @@ def generate_surfaces(
                 if randomize_grid:
                     dK = strikes_base[1] - strikes_base[0]
                     dT = maturities_base[-1] - maturities_base[-2]
-                    strikes_shifted = np.clip(
-                        strikes_base + np.random.uniform(-grid_jitter * dK, grid_jitter * dK, len(strikes_base)),
-                        0.5, 1.5
-                    )
-                    maturities_shifted = np.clip(
-                        maturities_base + np.random.uniform(-grid_jitter * dT, grid_jitter * dT, len(maturities_base)),
-                        0.01, T_max
-                    )
-                    maturities_shifted = np.sort(maturities_shifted)
+                    # Multiplicative jitter: proportional to distance from ATM (=1.0)
+
+
+                    strikes_shifted = jitter_grid(strikes_base, grid_jitter=0.25, min_spacing=0.05)
+                    maturities_shifted = jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.02)
+
                 else:
                     strikes_shifted = strikes_base.copy()
                     maturities_shifted = maturities_base.copy()
@@ -468,11 +550,45 @@ def generate_surfaces(
                 # Fill missing vols across strikes/maturities
                 iv_surf = fill_nans_edgewise(iv_surf.T, strikes=strikes_shifted, maturities=maturities_shifted).T
 
+            # ======================================================
+                # ✅ NaN and Inf check for every surface
+                # ======================================================
+                if (
+                    np.isnan(iv_surf).any()
+                    or np.isnan(price_surf).any()
+                    or np.isinf(iv_surf).any()
+                    or np.isinf(price_surf).any()
+                ):
+                    bad_dir = os.path.join("data", "debug_nans")
+                    os.makedirs(bad_dir, exist_ok=True)
+
+                    bad_path = os.path.join(bad_dir, f"bad_surface_set{s}_fwd{j}_grid{g_id}.npz")
+                    np.savez_compressed(
+                        bad_path,
+                        price_surface=price_surf,
+                        iv_surface=iv_surf,
+                        strikes=strikes_shifted,
+                        maturities=maturities_shifted,
+                        params=vars(params)
+                    )
+                    print(f"❌ NaN/Inf detected in surface (set={s}, fwd={j}, grid={g_id}) → saved to {bad_path}")
+                    continue  # skip appending this surface to results
+
+                # ======================================================
+
+                # Build per-surface parameter record (model + this surface's forward curve)
+                params_record = {
+                    "eta": float(params.eta),
+                    "rho": float(params.rho),
+                    "H": float(params.H),
+                    "xi0_knots": np.asarray(xi0_knots, dtype=float).tolist(),  # per-surface!
+                }
+
                 results.append({
                     "set_id": s,
                     "fwd_id": j,
                     "grid_id": g_id,
-                    "params": vars(params),
+                    "params": params_record,               # <-- now correct
                     "grid": {
                         "strikes": strikes_shifted.astype(float),
                         "maturities": maturities_shifted.astype(float),
@@ -480,6 +596,7 @@ def generate_surfaces(
                     "price_surface": price_surf,
                     "iv_surface": iv_surf,
                 })
+
 
                 # Periodic save
                 if len(results) % save_every == 0:
@@ -489,6 +606,16 @@ def generate_surfaces(
                     with open(progress_path, "wb") as f:
                         pickle.dump(data, f)
                     print(f"[Progress] Saved {len(results)} surfaces → {timestamped_path}")
+
+    # --- Final save ---
+    data = {"cfg": cfg.__dict__, "surfaces": results}
+    with open(timestamped_path, "wb") as f:
+        pickle.dump(data, f)
+    with open(progress_path, "wb") as f:
+        pickle.dump(data, f)
+    print(f"[Done] Saved {len(results)} surfaces → {timestamped_path}")
+
+    return results
 
 
 
