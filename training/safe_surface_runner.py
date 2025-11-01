@@ -42,8 +42,9 @@ def save_checkpoint(batch_idx, data):
 # ==========================================
 # MAIN LOOP
 # ==========================================
+START_BATCH = 0
 print("start")
-for batch_idx in range(NUM_BATCHES):
+for batch_idx in range(START_BATCH, NUM_BATCHES):
     print(f"\nStarting batch {batch_idx+1}/{NUM_BATCHES} | mem={memory_usage_gb():.2f} GB")
 
     try:
@@ -68,6 +69,7 @@ for batch_idx in range(NUM_BATCHES):
         print(f"Waiting {SLEEP_ON_ERROR}s before retry...")
         time.sleep(SLEEP_ON_ERROR)
         continue  # proceed to next batch
+
 
 print("\nAll batches completed successfully!")
 
