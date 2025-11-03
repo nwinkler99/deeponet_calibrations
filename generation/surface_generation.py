@@ -58,9 +58,9 @@ class SimulationConfig:
 
     def __post_init__(self):
         if self.strikes is None:
-            self.strikes = np.array([0.5,0.6,0.7,0.8,0.9, 0.95, 1.0, 1.05 ,1.1,1.2,1.3,1.4,1.5])
+            self.strikes = np.array([0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5])
         if self.maturities is None:
-            self.maturities = np.array([0.1,0.2,0.4,0.6,0.8,1,1.2,1.4,1.6,1.8,2.0])
+            self.maturities = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
 
 
 def sample_param_sets_lhs(num_sets: int) -> list["RBergomiParams"]:
@@ -140,44 +140,6 @@ def jitter_grid(base_grid, grid_jitter=0.25, min_spacing=0.1):
             return np.round(grid_shifted, 6)
     return np.round(grid_shifted, 6)
 
-def repair_short_maturity_artifacts(iv_surface, maturities, strikes,
-                                    t_threshold=0.3, sigma=0.5,
-                                    uplift_strength=0.2):
-    """
-    Smooths across short maturities and gently boosts OTM volatilities
-    only for the *lowest maturity* (first slice), avoiding overshoot at others.
-    """
-    import numpy as np
-    from scipy.ndimage import gaussian_filter
-
-    iv = np.nan_to_num(iv_surface.copy(), nan=np.nanmean(iv_surface))
-    iv = np.maximum(iv, 1e-4)
-
-    short_idx = np.where(maturities <= t_threshold)[0]
-    if len(short_idx) == 0:
-        return iv
-
-    # --- temporal smoothing / blending
-    for i in short_idx:
-        if i < iv.shape[0] - 1:
-            iv[i] = 0.55 * iv[i] + 0.45 * iv[i + 1]
-
-    # --- local smoothing for stability
-    iv_short = gaussian_filter(iv[short_idx], sigma=(sigma, sigma), mode="nearest")
-
-    # --- uplift only for the *lowest maturity* slice
-    atm_idx = len(strikes) // 2
-    rel_dist = np.abs(np.arange(len(strikes)) - atm_idx) / atm_idx  # 0 at ATM → 1 at edges
-    uplift = 1.0 + uplift_strength * rel_dist  # gradual uplift toward OTM
-    iv_short[0] *= uplift  # apply only to first maturity
-
-    # --- replace smoothed slices back
-    iv[short_idx] = iv_short
-    return iv
-
-import numpy as np
-
-import numpy as np
 
 def repair_edges_local_directional(iv_surface, maturities, strikes, t_threshold=0.51):
     """
@@ -226,17 +188,17 @@ def repair_edges_local_directional(iv_surface, maturities, strikes, t_threshold=
         if i >= nT - 1:
             continue  # skip last maturity
 
-        # Lift both edges up to 3 strikes inward
-        for offset in range(3):
-            # --- Left side ---
+        # --- Left side (in→out) ---
+        for offset in reversed(range(3)):  # 2,1,0
             j = offset
             if j + 1 < nK:
-                iv[i, j] = max(iv[i, j], iv[i + 1, j], iv[i, j + 1])
+                iv[i, j] = max(iv[i, j], iv[i, j + 1])
 
-            # --- Right side ---
+        # --- Right side (in→out) ---
+        for offset in reversed(range(3)):  # 2,1,0
             j = nK - 1 - offset
             if j - 1 >= 0:
-                iv[i, j] = max(iv[i, j], iv[i + 1, j], iv[i, j - 1])
+                iv[i, j] = max(iv[i, j], iv[i, j - 1])
 
     # ===============================================
     # Step 3: Replace near-zero values with local mean
@@ -315,27 +277,52 @@ def generate_surfaces(
         # Forward curves and grids
         # --------------------------------------------------------------
         for j in range(forward_curves_per_set):
-            xi0_knots = set_rng.uniform(0.01, 0.16, size=8)
-        # knots on [0, T_max] at equal spacing
-            K = len(xi0_knots)
-            bin_edges = np.linspace(0.0, T_max, K + 1)  # length K+1
+            
+            strikes_base = cfg.strikes
+            maturities_base = cfg.maturities
 
-            # for each t, find bin index i with bin_edges[i] <= t < bin_edges[i+1]
-            idx = np.searchsorted(bin_edges, rb.t.flatten(), side="right") - 1
+            xi0_knots = set_rng.uniform(0.01, 0.16, size=8)
+        # # knots on [0, T_max] at equal spacing
+        #     K = len(xi0_knots)
+        #     bin_edges = np.linspace(0.0, T_max, K + 1)  # length K+1
+
+        #     # for each t, find bin index i with bin_edges[i] <= t < bin_edges[i+1]
+        #     idx = np.searchsorted(bin_edges, rb.t.flatten(), side="right") - 1
+        #     idx = np.clip(idx, 0, K - 1)
+        #     xi_t = xi0_knots[idx]
+
+            #e0 according to maturities
+            T_max = maturities_base[-1]
+            K = len(xi0_knots)
+            # --- build bin edges that match the maturity grid ---
+            # First bin goes from 0 to first maturity, next between consecutive maturities, etc.
+            # If you have more knots than maturities, we interpolate extra bins proportionally.
+            if K <= len(maturities_base):
+                bin_edges = np.concatenate([[0.0], maturities_base])
+            else:
+                # interpolate to get K+1 edges over maturities range
+                base_edges = np.concatenate([[0.0], maturities_base])
+                target_u = np.linspace(0, 1, K + 1)
+                bin_edges = np.interp(target_u, np.linspace(0, 1, len(base_edges)), base_edges)
+
+            # --- map each simulation time t to its corresponding bin ---
+            t_flat = rb.t.flatten()
+            idx = np.searchsorted(bin_edges, t_flat, side="right") - 1
             idx = np.clip(idx, 0, K - 1)
+
+            # --- assign forward variance ---
             xi_t = xi0_knots[idx]
+
+        
 
             V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=eta)
             S = rb.S(V, dB, S0=cfg.S0)
 
-            strikes_base = cfg.strikes
-            maturities_base = cfg.maturities
-
             for g_id in range(cfg.G):
 
                 if randomize_grid:
-                    strikes_shifted = jitter_grid(strikes_base, grid_jitter=0.3, min_spacing=0.05)
-                    maturities_shifted = jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.02)
+                    strikes_shifted = jitter_grid(strikes_base, grid_jitter=grid_jitter, min_spacing=0.05)
+                    maturities_shifted = jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.05)
                 else:
                     strikes_shifted = strikes_base.copy()
                     maturities_shifted = maturities_base.copy()
@@ -357,7 +344,7 @@ def generate_surfaces(
                             iv_surf[mi, ki] = np.nan
 
                     iv_surf[mi, :] = np.clip(iv_surf[mi, :], 1e-4, 5.0)
-                iv_surf = repair_short_maturity_artifacts(iv_surf, maturities_shifted, strikes_shifted, uplift_strength=0.2)
+                iv_surf = repair_edges_local_directional(iv_surf, maturities_shifted, strikes_shifted, t_threshold=0.35)
 
                 # Sanity check
                 if np.isnan(iv_surf).any() or np.isinf(iv_surf).any():
@@ -462,15 +449,37 @@ def generate_fixed_surface(
     Y = rb.Y(dW1)
 
     # Piecewise-constant forward variance interpolation
-# knots on [0, T_max] at equal spacing
-    K = len(xi0_knots)
-    bin_edges = np.linspace(0.0, T_max, K + 1)  # length K+1
+    #e0 equally spaced
+    # K = len(xi0_knots)
+    # bin_edges = np.linspace(0.0, T_max, K + 1)  # length K+1
+    # # for each t, find bin index i with bin_edges[i] <= t < bin_edges[i+1]
+    # idx = np.searchsorted(bin_edges, rb.t.flatten(), side="right") - 1
+    # idx = np.clip(idx, 0, K - 1)
+    # xi_t = xi0_knots[idx]
 
-    # for each t, find bin index i with bin_edges[i] <= t < bin_edges[i+1]
-    idx = np.searchsorted(bin_edges, rb.t.flatten(), side="right") - 1
+    #e0 according to maturities
+    T_max = maturities[-1]
+    K = len(xi0_knots)
+    # --- build bin edges that match the maturity grid ---
+    # First bin goes from 0 to first maturity, next between consecutive maturities, etc.
+    # If you have more knots than maturities, we interpolate extra bins proportionally.
+    if K <= len(maturities):
+        bin_edges = np.concatenate([[0.0], maturities])
+    else:
+        # interpolate to get K+1 edges over maturities range
+        base_edges = np.concatenate([[0.0], maturities])
+        target_u = np.linspace(0, 1, K + 1)
+        bin_edges = np.interp(target_u, np.linspace(0, 1, len(base_edges)), base_edges)
+
+    # --- map each simulation time t to its corresponding bin ---
+    t_flat = rb.t.flatten()
+    idx = np.searchsorted(bin_edges, t_flat, side="right") - 1
     idx = np.clip(idx, 0, K - 1)
 
+    # --- assign forward variance ---
     xi_t = xi0_knots[idx]
+
+
     V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=eta)
 
     # Simulate price paths
@@ -498,7 +507,6 @@ def generate_fixed_surface(
 
         # numerical clipping
         iv_surface[iT, :] = np.clip(iv_surface[iT, :], 1e-4, 5.0)
-    #iv_surface = repair_short_maturity_artifacts(iv_surface, maturities, strikes, uplift_strength=0)
     iv_surface = repair_edges_local_directional(iv_surface, maturities, strikes, t_threshold=0.35)
 
     return {
