@@ -17,11 +17,11 @@ NUM_BATCHES = 100          # total number of batches to run
 BATCH_SIZE = 50            # number of parameter sets per batch
 SAVE_ROOT = "data/longrun" # root directory for all runs
 SLEEP_ON_ERROR = 30        # seconds to wait after failure before retry
-SEED_BASE = 4235           # deterministic seed offset per batch
+SEED_BASE = 42351          # deterministic seed offset per batch
 
 os.makedirs(SAVE_ROOT, exist_ok=True)
 
-cfg = SimulationConfig(M=50000, n=500, T_max=2.0, S0=1.0, G=2)
+cfg = SimulationConfig(M=50000, n=500, T_max=2.0, S0=1.0, G=1)
 
 # ==========================================
 # HELPER FUNCTIONS
@@ -55,7 +55,7 @@ for batch_idx in range(START_BATCH, NUM_BATCHES):
             forward_curves_per_set=10,
             cfg=cfg,
             seed=batch_seed,
-            randomize_grid=True,
+            randomize_grid=False,
         )
 
         # save and clean up

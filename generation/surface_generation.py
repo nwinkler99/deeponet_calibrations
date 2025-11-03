@@ -60,7 +60,7 @@ class SimulationConfig:
         if self.strikes is None:
             self.strikes = np.array([0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5])
         if self.maturities is None:
-            self.maturities = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.0])
+            self.maturities = np.array([0.1, 0.3, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1])
 
 
 def sample_param_sets_lhs(num_sets: int) -> list["RBergomiParams"]:
@@ -239,17 +239,28 @@ def generate_surfaces(
     Retains the original batching and saving logic.
     """
 
-    # --- Setup save structure ---
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H-%M-%S")
-    save_dir = os.path.join("data", date_str)
-    os.makedirs(save_dir, exist_ok=True)
 
-    timestamped_path = os.path.join(save_dir, f"surfaces_{time_str}.pkl")
+    if randomize_grid:
+        # regular randomized runs -> data/<date>/surfaces_<time>.pkl
+        save_dir = os.path.join("data", date_str)
+        os.makedirs(save_dir, exist_ok=True)
+        timestamped_path = os.path.join(save_dir, f"surfaces_{time_str}.pkl")
+    else:
+        # deterministic fixed-grid runs -> data/fixed_longrun/fixed_batch_<timestamp>.pkl
+        save_dir = os.path.join("data", "fixed_longrun")
+        os.makedirs(save_dir, exist_ok=True)
+        timestamped_path = os.path.join(save_dir, f"fixed_batch_{time_str}.pkl")
+
+    # progress checkpoint (shared across modes)
     progress_path = "data/surfaces_progress.pkl"
     os.makedirs(os.path.dirname(progress_path), exist_ok=True)
 
+    # ==========================================================
+    # Initialization
+    # ==========================================================
     rng = np.random.RandomState(seed)
     results: List[Dict] = []
 

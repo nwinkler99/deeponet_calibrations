@@ -63,3 +63,78 @@ def bsinv(P, F, K, t, o = 'call'):
         return bs(F, K, s**2 * t, o) - P
     s = brentq(error, 1e-9, 1e+9)
     return s
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def plot_iv_surface(
+    iv_surface: np.ndarray,
+    strikes: np.ndarray,
+    maturities: np.ndarray,
+    xi0_knots: np.ndarray | None = None,        # length K
+    xi0_bin_edges: np.ndarray | None = None,    # length K+1  (e.g., [0, 0.1, 0.2, 0.4, ... , T_max])
+    kind: str = "contour",
+    cmap: str = "plasma",
+    figsize=(10, 6),
+    title: str = "Implied Volatility Surface",
+    log_maturity: bool = True,
+):
+    maturities = np.asarray(maturities, float)
+    strikes = np.asarray(strikes, float)
+    Kgrid, Tgrid = np.meshgrid(strikes, maturities)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    if kind == "heatmap":
+        im = ax.imshow(
+            iv_surface,
+            extent=[strikes.min(), strikes.max(), maturities.min(), maturities.max()],
+            origin="lower", aspect="auto", cmap=cmap,
+        )
+        fig.colorbar(im, ax=ax, label="Implied Volatility")
+    elif kind == "contour":
+        cs = ax.contourf(Kgrid, Tgrid, iv_surface, levels=20, cmap=cmap)
+        fig.colorbar(cs, ax=ax, label="Implied Volatility")
+    else:
+        raise ValueError(f"Unknown kind '{kind}'")
+
+    ax.set_xlabel("Strike")
+    ax.set_ylabel("Maturity (Years)")
+    ax.set_title(title)
+    if log_maturity:
+        ax.set_yscale("log")
+
+    # ---------- ξ0 overlay as TRUE piecewise-constant steps ----------
+    if xi0_knots is not None and xi0_bin_edges is not None:
+        xi0_knots = np.asarray(xi0_knots, float)         # length K
+        edges = np.asarray(xi0_bin_edges, float)         # length K+1
+
+        assert len(edges) == len(xi0_knots) + 1, "xi0_bin_edges must have length K+1."
+
+        # Skip the first bin [0, maturities[0]) → not visible on plot
+        first_vis_i = np.searchsorted(edges, maturities[0], side="left")
+        first_vis_i = max(1, min(first_vis_i, len(xi0_knots)-1))
+
+        # Build explicit step polyline: for each i, draw (edge[i], edge[i+1]) at value xi0_knots[i]
+        T_step = []
+        X_step = []
+        for i in range(first_vis_i, len(xi0_knots)):     # i = 1..K-1 visible
+            t0, t1 = edges[i], edges[i+1]
+            v = xi0_knots[i]
+            T_step += [t0, t1]
+            X_step += [v,  v]
+
+        T_step = np.asarray(T_step)
+        X_step = np.asarray(X_step)
+
+        # Normalize overlay to live near strike ≈ 1
+        xnorm = (X_step - X_step.min()) / (X_step.max() - X_step.min() + 1e-12)
+        xnorm = xnorm * (strikes.max() - strikes.min()) * 0.2
+        xplot = 1.0 + xnorm
+
+        ax.plot(xplot, T_step, color="white", lw=2.0, label=r"$\xi_0(t)$ (forward variance)")
+        ax.legend(loc="upper right", frameon=False)
+
+    plt.tight_layout()
+    plt.show()
+
