@@ -1,50 +1,70 @@
+# --------------------------------------------------------------------------------------------------------
+# Utility functions for Rough Bergomi model simulation and visualization
+# --------------------------------------------------------------------------------------------------------
+# Includes:
+# - TBSS kernel and discretization helpers
+# - Black–Scholes pricing and implied volatility inversion
+# - Vectorized pathwise pricing for Monte Carlo
+# - Latin Hypercube parameter sampling and randomized grids
+# - Plotting helper for IV surfaces
+# --------------------------------------------------------------------------------------------------------
+
 import numpy as np
-from scipy.stats import norm
+from scipy.stats import norm, qmc
 from scipy.optimize import brentq
+from dataclasses import dataclass
+from typing import List, Tuple
+import matplotlib.pyplot as plt
 
-def g(x, a):
-    """
-    TBSS kernel applicable to the rBergomi variance process.
-    """
-    return x**a
 
-def b(k, a):
-    """
-    Optimal discretisation of TBSS process for minimising hybrid scheme error.
-    """
-    return ((k**(a+1)-(k-1)**(a+1))/(a+1))**(1/a)
+# --------------------------------------------------------------------------------------------------------
+# TBSS / rBergomi helper functions
+# --------------------------------------------------------------------------------------------------------
 
-def cov(a, n):
-    """
-    Covariance matrix for given alpha and n, assuming kappa = 1 for
-    tractability.
-    """
-    cov = np.array([[0.,0.],[0.,0.]])
-    cov[0,0] = 1./n
-    cov[0,1] = 1./((1.*a+1) * n**(1.*a+1))
-    cov[1,1] = 1./((2.*a+1) * n**(2.*a+1))
-    cov[1,0] = cov[0,1]
-    return cov
+def g(x: float, a: float) -> float:
+    """TBSS kernel applicable to the rBergomi variance process."""
+    return x ** a
 
-def bs(F, K, V, o = 'call'):
+
+def b(k: int, a: float) -> float:
+    """Optimal discretisation of TBSS process for minimising hybrid scheme error."""
+    return ((k ** (a + 1) - (k - 1) ** (a + 1)) / (a + 1)) ** (1 / a)
+
+
+def cov(a: float, n: int) -> np.ndarray:
     """
-    Returns the Black call price for given forward, strike and integrated
-    variance.
+    Covariance matrix for given alpha and n, assuming kappa = 1 for tractability.
+    """
+    C = np.zeros((2, 2))
+    C[0, 0] = 1.0 / n
+    C[0, 1] = 1.0 / ((a + 1.0) * n ** (a + 1))
+    C[1, 1] = 1.0 / ((2.0 * a + 1) * n ** (2 * a + 1))
+    C[1, 0] = C[0, 1]
+    return C
+
+
+# --------------------------------------------------------------------------------------------------------
+# Black–Scholes formulas
+# --------------------------------------------------------------------------------------------------------
+
+def bs(F: float, K: float, V: float, o: str = "call") -> float:
+    """
+    Returns the Black call/put/otm price for given forward F, strike K, and integrated variance V.
     """
     # Set appropriate weight for option token o
     w = 1
-    if o == 'put':
+    if o == "put":
         w = -1
-    elif o == 'otm':
+    elif o == "otm":
         w = 2 * (K > 1.0) - 1
 
     sv = np.sqrt(V)
-    d1 = np.log(F/K) / sv + 0.5 * sv
+    d1 = np.log(F / K) / sv + 0.5 * sv
     d2 = d1 - sv
-    P = w * F * norm.cdf(w * d1) - w * K * norm.cdf(w * d2)
-    return P
+    return w * F * norm.cdf(w * d1) - w * K * norm.cdf(w * d2)
 
-def bsinv(P, F, K, t, o='call'):
+
+def bsinv(P: float, F: float, K: float, t: float, o: str = "call") -> float:
     """
     Robust implied Black volatility from price P, forward F, strike K, maturity t.
     Handles call/put/otm options; safe for MC-generated prices.
@@ -53,16 +73,16 @@ def bsinv(P, F, K, t, o='call'):
         return 1e-8  # degenerate maturity
 
     w = 1.0
-    if o == 'put':
+    if o == "put":
         w = -1.0
-    elif o == 'otm':
-        w = 2.0 * (K > F) - 1.0  # more consistent OTM switch
+    elif o == "otm":
+        w = 2.0 * (K > F) - 1.0  # consistent OTM switch
 
     intrinsic = max(w * (F - K), 0.0)
     P = max(P, intrinsic + 1e-12)
 
     def error(sigma):
-        return bs(F, K, sigma**2 * t, o) - P
+        return bs(F, K, sigma ** 2 * t, o) - P
 
     try:
         return brentq(error, 1e-8, 5.0, xtol=1e-10, maxiter=100)
@@ -71,21 +91,117 @@ def bsinv(P, F, K, t, o='call'):
         return np.nan
 
 
-import numpy as np
-import matplotlib.pyplot as plt
+def bs_vega(F: float, K: float, T: float, sigma: float) -> float:
+    """Black–Scholes vega (∂Price/∂Vol) with forward F, strike K, maturity T."""
+    if sigma <= 0 or T <= 0 or not np.isfinite(sigma) or F <= 0 or K <= 0:
+        return np.nan
+    d1 = (np.log(F / K) + 0.5 * sigma * sigma * T) / (sigma * np.sqrt(T))
+    return F * norm.pdf(d1) * np.sqrt(T)
+
+
+# --------------------------------------------------------------------------------------------------------
+# Pathwise Black–Scholes pricing for Monte Carlo
+# --------------------------------------------------------------------------------------------------------
+
+def bs_call_vec_pathwise(F_path: np.ndarray, K_abs: float, T: float, sigma_path: np.ndarray) -> np.ndarray:
+    """
+    Pathwise Black–Scholes call price with forward F_path (M,), strike K_abs (scalar),
+    maturity T, and per-path vol sigma_path (M,). Returns (M,).
+    """
+    eps = 1e-12
+    Fp = np.maximum(F_path, eps)
+    sig = np.maximum(sigma_path, eps)
+    d1 = (np.log(Fp / K_abs) + 0.5 * sig * sig * T) / (sig * np.sqrt(T))
+    d2 = d1 - sig * np.sqrt(T)
+    return Fp * norm.cdf(d1) - K_abs * norm.cdf(d2)
+
+
+def bs_put_vec_pathwise(F_path: np.ndarray, K_abs: float, T: float, sigma_path: np.ndarray) -> np.ndarray:
+    """Pathwise Black–Scholes put price under the forward measure."""
+    eps = 1e-12
+    Fp = np.maximum(F_path, eps)
+    sig = np.maximum(sigma_path, eps)
+    d1 = (np.log(Fp / K_abs) + 0.5 * sig * sig * T) / (sig * np.sqrt(T))
+    d2 = d1 - sig * np.sqrt(T)
+    return K_abs * norm.cdf(-d2) - Fp * norm.cdf(-d1)
+
+
+# --------------------------------------------------------------------------------------------------------
+# Sampling utilities
+# --------------------------------------------------------------------------------------------------------
+
+@dataclass
+class RBergomiParams:
+    eta: float
+    rho: float
+    H: float
+
+
+def sample_param_sets_lhs(num_sets: int, rng: np.random.RandomState) -> List[RBergomiParams]:
+    """Sample (eta, rho, H) via Latin Hypercube, fully tied to rng."""
+    sampler = qmc.LatinHypercube(d=3, seed=rng)
+    sample = sampler.random(num_sets)
+
+    lower = np.array([0.5, -0.95, 0.025])
+    upper = np.array([4.0, -0.1, 0.5])
+    scaled = qmc.scale(sample, lower, upper)
+
+    param_sets: List[RBergomiParams] = []
+    for i in range(num_sets):
+        param_sets.append(
+            RBergomiParams(
+                eta=float(scaled[i, 0]),
+                rho=float(scaled[i, 1]),
+                H=float(scaled[i, 2]),
+            )
+        )
+    return param_sets
+
+
+def jitter_grid(base_grid: np.ndarray, grid_jitter: float = 0.25, min_spacing: float = 0.1) -> np.ndarray:
+    """
+    Randomly perturb a base grid while keeping minimum spacing.
+    Returns float64; caller can cast to cfg.dtype.
+    """
+    base_grid = np.sort(np.array(base_grid, dtype=float))
+    n = len(base_grid)
+    lo, hi = base_grid[0], base_grid[-1]
+    total_range = hi - lo
+    total_budget = grid_jitter * total_range
+
+    grid_shifted = base_grid.copy()
+    for _ in range(100):
+        signs = np.random.choice([-1, 1], size=n)
+        weights = np.random.uniform(0, 1, size=n)
+        weights /= np.sum(weights) + 1e-12
+        jitter = signs * weights * total_budget
+        grid_shifted = np.clip(np.sort(base_grid + jitter), lo, hi)
+        if np.all(np.diff(grid_shifted) > min_spacing):
+            return np.round(grid_shifted, 6)
+
+    return np.round(grid_shifted, 6)
+
+
+# --------------------------------------------------------------------------------------------------------
+# Plotting utilities
+# --------------------------------------------------------------------------------------------------------
 
 def plot_iv_surface(
     iv_surface: np.ndarray,
     strikes: np.ndarray,
     maturities: np.ndarray,
-    xi0_knots: np.ndarray | None = None,        # length K
-    xi0_bin_edges: np.ndarray | None = None,    # length K+1  (e.g., [0, 0.1, 0.2, 0.4, ... , T_max])
+    xi0_knots: np.ndarray | None = None,
+    xi0_bin_edges: np.ndarray | None = None,
     kind: str = "contour",
     cmap: str = "plasma",
-    figsize=(10, 6),
+    figsize: Tuple[int, int] = (10, 6),
     title: str = "Implied Volatility Surface",
     log_maturity: bool = True,
 ):
+    """
+    Plot an implied volatility surface (contour or heatmap),
+    optionally overlaying the piecewise-constant forward variance ξ₀(t).
+    """
     maturities = np.asarray(maturities, float)
     strikes = np.asarray(strikes, float)
     Kgrid, Tgrid = np.meshgrid(strikes, maturities)
@@ -95,7 +211,9 @@ def plot_iv_surface(
         im = ax.imshow(
             iv_surface,
             extent=[strikes.min(), strikes.max(), maturities.min(), maturities.max()],
-            origin="lower", aspect="auto", cmap=cmap,
+            origin="lower",
+            aspect="auto",
+            cmap=cmap,
         )
         fig.colorbar(im, ax=ax, label="Implied Volatility")
     elif kind == "contour":
@@ -110,37 +228,39 @@ def plot_iv_surface(
     if log_maturity:
         ax.set_yscale("log")
 
-    # ---------- ξ0 overlay as TRUE piecewise-constant steps ----------
+    # Overlay ξ₀(t)
     if xi0_knots is not None and xi0_bin_edges is not None:
-        xi0_knots = np.asarray(xi0_knots, float)         # length K
-        edges = np.asarray(xi0_bin_edges, float)         # length K+1
-
+        xi0_knots = np.asarray(xi0_knots, float)
+        edges = np.asarray(xi0_bin_edges, float)
         assert len(edges) == len(xi0_knots) + 1, "xi0_bin_edges must have length K+1."
 
-        # Skip the first bin [0, maturities[0]) → not visible on plot
+        # Skip first bin [0, maturities[0]) → not visible
         first_vis_i = np.searchsorted(edges, maturities[0], side="left")
-        first_vis_i = max(1, min(first_vis_i, len(xi0_knots)-1))
+        first_vis_i = max(1, min(first_vis_i, len(xi0_knots) - 1))
 
-        # Build explicit step polyline: for each i, draw (edge[i], edge[i+1]) at value xi0_knots[i]
-        T_step = []
-        X_step = []
-        for i in range(first_vis_i, len(xi0_knots)):     # i = 1..K-1 visible
-            t0, t1 = edges[i], edges[i+1]
+        T_step, X_step = [], []
+        for i in range(first_vis_i, len(xi0_knots)):
+            t0, t1 = edges[i], edges[i + 1]
             v = xi0_knots[i]
             T_step += [t0, t1]
-            X_step += [v,  v]
+            X_step += [v, v]
 
         T_step = np.asarray(T_step)
         X_step = np.asarray(X_step)
 
-        # Normalize overlay to live near strike ≈ 1
+        # Normalize overlay to appear near strike ≈ 1
         xnorm = (X_step - X_step.min()) / (X_step.max() - X_step.min() + 1e-12)
         xnorm = xnorm * (strikes.max() - strikes.min()) * 0.2
         xplot = 1.0 + xnorm
 
-        ax.plot(xplot, T_step, color="white", lw=2.0, label=r"$\xi_0(t)$ (forward variance)")
+        ax.plot(
+            xplot,
+            T_step,
+            color="white",
+            lw=2.0,
+            label=r"$\xi_0(t)$ (forward variance)",
+        )
         ax.legend(loc="upper right", frameon=False)
 
     plt.tight_layout()
     plt.show()
-
