@@ -43,7 +43,6 @@ class RBergomiParams:
     eta: float
     rho: float
     H: float
-    xi0_knots: np.ndarray
 
 @dataclass
 class SimulationConfig:
@@ -55,6 +54,7 @@ class SimulationConfig:
     maturities: np.ndarray = None
     batch_size: int = 5000
     G: int = 10
+    dtype: np.dtype = np.float32  # <--- global dtype control
 
     def __post_init__(self):
         if self.strikes is None:
@@ -63,98 +63,65 @@ class SimulationConfig:
             self.maturities = np.array([0.1, 0.3, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1])
 
 
-def sample_param_sets_lhs(num_sets: int) -> list["RBergomiParams"]:
-    """
-    Latin Hypercube sample of Rough Bergomi parameters.
-    - η   ∈ [0.5, 4.0]
-    - ρ   ∈ [-0.95, -0.1]
-    - H   ∈ [0.025, 0.5]
-    - xi₀_knots (8 values) ∈ [0.01, 0.16], random per set
-    """
-    sampler = qmc.LatinHypercube(d=3)
-    sample = sampler.random(num_sets)  # shape (num_sets, 3)
+def sample_param_sets_lhs(num_sets: int, rng: np.random.RandomState) -> List[RBergomiParams]:
+    """Sample (eta, rho, H) + random xi0_knots via Latin Hypercube, fully tied to rng."""
+    sampler = qmc.LatinHypercube(d=3, seed=rng)
+    sample = sampler.random(num_sets)
 
-    # scale entire matrix at once
     lower = np.array([0.5, -0.95, 0.025])
     upper = np.array([4.0, -0.1, 0.5])
-    scaled = qmc.scale(sample, lower, upper)  # shape (num_sets, 3)
+    scaled = qmc.scale(sample, lower, upper)
 
-    eta_vals = scaled[:, 0]
-    rho_vals = scaled[:, 1]
-    H_vals   = scaled[:, 2]
-
-    param_sets = []
+    param_sets: List[RBergomiParams] = []
     for i in range(num_sets):
-        xi0_knots = np.random.uniform(0.01, 0.16, size=8)
-        param_sets.append(RBergomiParams(
-            eta=float(eta_vals[i]),
-            rho=float(rho_vals[i]),
-            H=float(H_vals[i]),
-            xi0_knots=xi0_knots
-        ))
+        param_sets.append(
+            RBergomiParams(
+                eta=float(scaled[i, 0]),
+                rho=float(scaled[i, 1]),
+                H=float(scaled[i, 2]),
+            )
+        )
     return param_sets
 
 
 def jitter_grid(base_grid, grid_jitter=0.25, min_spacing=0.1):
-    """
-    Apply additive jitter to a monotonic grid (e.g. strikes or maturities),
-    randomly distributing a total jitter budget while preserving order and spacing.
-
-    Parameters
-    ----------
-    base_grid : np.ndarray
-        Sorted 1D base grid (e.g. strikes or maturities).
-    grid_jitter : float
-        Fraction of total jitter budget relative to total grid range.
-    min_spacing : float
-        Minimum allowed distance between adjacent grid points.
-
-    Returns
-    -------
-    np.ndarray
-        Jittered, sorted grid with the same length as the input.
-    """
+    """Randomly perturb a base grid while keeping minimum spacing; returns float64, cast by caller."""
     base_grid = np.sort(np.array(base_grid, dtype=float))
     n = len(base_grid)
     lo, hi = base_grid[0], base_grid[-1]
     total_range = hi - lo
-
-    # define total jitter budget
     total_budget = grid_jitter * total_range
 
-    for _ in range(100):  # retry loop to ensure spacing
-        # randomly split the total budget into positive/negative perturbations
+    grid_shifted = base_grid.copy()
+    for _ in range(100):
         signs = np.random.choice([-1, 1], size=n)
         weights = np.random.uniform(0, 1, size=n)
-        weights /= np.sum(weights) + 1e-12  # normalize weights to sum to 1
-
+        weights /= np.sum(weights) + 1e-12
         jitter = signs * weights * total_budget
-        grid_shifted = base_grid + jitter
-
-        # enforce boundaries
-        grid_shifted = np.clip(grid_shifted, lo, hi)
-        grid_shifted = np.sort(grid_shifted)
-
-        # ensure no overlaps / minimum spacing
+        grid_shifted = np.clip(np.sort(base_grid + jitter), lo, hi)
         if np.all(np.diff(grid_shifted) > min_spacing):
             return np.round(grid_shifted, 6)
     return np.round(grid_shifted, 6)
 
+import numpy as np
+from scipy.ndimage import convolve
 
-def repair_edges_local_directional(iv_surface, maturities, strikes, t_threshold=0.51):
+def repair_edges_local_directional(iv_surface: np.ndarray,
+                                   maturities: np.ndarray,
+                                   strikes: np.ndarray,
+                                   t_threshold: float = 0.35,
+                                   dtype: np.dtype = np.float32,
+                                   min_floor: float = 0.05) -> np.ndarray:
     """
-    Repairs implied-vol surfaces at short maturities by:
-    1️⃣ Filling NaNs via 2D extrapolation.
-    2️⃣ Applying directional edge correction (left/right up to 3 strikes inward).
-    3️⃣ Replacing near-zero (<0.05) points with local neighbor mean.
+    Lightweight, local edge stabilization for short maturities.
+    - Fills NaNs row/col-wise.
+    - Lifts left/right edges of short-maturity rows toward neighbors.
+    - Smoothly replaces values < min_floor with weighted 3×3 Gaussian-style local mean.
     """
-
-    iv = iv_surface.copy()
+    iv = np.array(iv_surface, dtype=dtype, copy=True)
     nT, nK = iv.shape
 
-    # ===============================================
-    # Step 1: Fill NaNs via simple 2D extrapolation
-    # ===============================================
+    # --- Row-wise NaN fill
     for i in range(nT):
         row = iv[i]
         if np.any(np.isnan(row)):
@@ -168,53 +135,52 @@ def repair_edges_local_directional(iv_surface, maturities, strikes, t_threshold=
                     right=row[valid][-1],
                 )
             else:
-                iv[i] = np.nanmean(iv)
+                iv[i] = np.nan
 
+    # --- Column-wise fill
     if np.isnan(iv).any():
         col_means = np.nanmean(iv, axis=0)
         for j in range(nK):
-            col = iv[:, j]
-            nan_idx = np.isnan(col)
+            nan_idx = np.isnan(iv[:, j])
             if np.any(nan_idx):
                 iv[nan_idx, j] = col_means[j]
+    iv = np.nan_to_num(iv, nan=np.nanmean(iv)).astype(dtype)
 
-    iv = np.nan_to_num(iv, nan=np.nanmean(iv))
-
-    # ===============================================
-    # Step 2: Apply directional edge correction (extended inward)
-    # ===============================================
+    #--- Directional edge correction for short maturities
     short_idx = np.where(maturities <= t_threshold)[0]
     for i in reversed(short_idx):
-        if i >= nT - 1:
-            continue  # skip last maturity
+        row = iv[i]
 
-        # --- Left side (in→out) ---
-        for offset in reversed(range(3)):  # 2,1,0
-            j = offset
-            if j + 1 < nK:
-                iv[i, j] = max(iv[i, j], iv[i, j + 1])
+        # ---- Left side: start from 3rd inner strike and move outward
+        for j in range(2, -1, -1):  # indices [2, 1, 0]
+            row[j] = max(row[j], row[j+1])
 
-        # --- Right side (in→out) ---
-        for offset in reversed(range(3)):  # 2,1,0
-            j = nK - 1 - offset
-            if j - 1 >= 0:
-                iv[i, j] = max(iv[i, j], iv[i, j - 1])
+        # ---- Right side: start from 3rd inner strike from right and move outward
+        for j in range(nK-3, nK):  # indices [nK-3, nK-2, nK-1]
+            if j < nK-1:  # skip the last since j+1 would be out of bounds
+                row[j+1] = max(row[j+1], row[j])
 
-    # ===============================================
-    # Step 3: Replace near-zero values with local mean
-    # ===============================================
-    threshold = 0.05
-    low_mask = iv < threshold
-    if np.any(low_mask):
-        iv_padded = np.pad(iv, 1, mode='edge')
-        for i in range(nT):
-            for j in range(nK):
-                if low_mask[i, j]:
-                    # extract 3x3 neighborhood
-                    neighborhood = iv_padded[i:i+3, j:j+3]
-                    iv[i, j] = np.mean(neighborhood)
+        iv[i] = row
 
-    return iv
+    # --- Weighted local-mean correction for values < min_floor
+    mask_rows = maturities <= 1000
+    if np.any(mask_rows):
+        iv_short = iv[mask_rows]
+
+        # Gaussian-like kernel (center-heavy)
+        kernel = np.array([[1, 2, 1],
+                           [2, 4, 2],
+                           [1, 2, 1]], dtype=np.float32)
+        kernel /= kernel.sum()
+
+        local_mean = convolve(iv_short, kernel, mode="reflect")
+
+        mask_low = iv_short < min_floor
+        iv_short[mask_low] = local_mean[mask_low]
+        iv[mask_rows] = iv_short
+
+    return iv.astype(dtype)
+
 
 
 
@@ -224,313 +190,386 @@ import numpy as np, os, pickle
 from datetime import datetime
 from typing import List, Dict
 
+import os
+import numpy as np
+from datetime import datetime
+from typing import List, Dict
+from scipy.stats import norm
+
+# ---- Helpers (forward-form Black–Scholes) ------------------------------------
+def bs_vega(F: float, K: float, T: float, sigma: float) -> float:
+    """Black–Scholes vega (∂Price/∂Vol) with forward F, strike K, maturity T."""
+    if sigma <= 0 or T <= 0 or not np.isfinite(sigma) or F <= 0 or K <= 0:
+        return np.nan
+    d1 = (np.log(F / K) + 0.5 * sigma * sigma * T) / (sigma * np.sqrt(T))
+    return F * norm.pdf(d1) * np.sqrt(T)
+
+def bs_call_vec_pathwise(F_path: np.ndarray, K_abs: float, T: float, sigma_path: np.ndarray) -> np.ndarray:
+    """
+    Pathwise Black–Scholes call price with forward F_path (M,), strike K_abs (scalar),
+    maturity T, and per-path vol sigma_path (M,). Returns (M,).
+    """
+    eps = 1e-12
+    Fp = np.maximum(F_path, eps)
+    sig = np.maximum(sigma_path, eps)
+    d1 = (np.log(Fp / K_abs) + 0.5 * sig * sig * T) / (sig * np.sqrt(T))
+    d2 = d1 - sig * np.sqrt(T)
+    return Fp * norm.cdf(d1) - K_abs * norm.cdf(d2)
+
+def bs_put_vec_pathwise(F_path, K_abs, T, sigma_path):
+    eps = 1e-12
+    Fp  = np.maximum(F_path, eps)
+    sig = np.maximum(sigma_path, eps)
+    d1  = (np.log(Fp / K_abs) + 0.5 * sig*sig * T) / (sig * np.sqrt(T))
+    d2  = d1 - sig * np.sqrt(T)
+    # forward-measure (undiscounted) BS put
+    return K_abs * norm.cdf(-d2) - Fp * norm.cdf(-d1)
+
+# ==============================
+# Main generator with CMC / martingale CV
+# ==============================
+def bs_call_vec_pathwise(F_path, K_abs, T, sigma_path):
+    # forward-measure BS call, vectorized over paths
+    eps = 1e-12
+    Fp  = np.maximum(F_path, eps)
+    sig = np.maximum(sigma_path, eps)
+    rt  = np.sqrt(T)
+    d1  = (np.log(Fp / K_abs) + 0.5 * sig*sig * T) / (sig * rt)
+    d2  = d1 - sig * rt
+    return Fp * norm.cdf(d1) - K_abs * norm.cdf(d2)
+
 def generate_surfaces(
     num_sets=1,
     forward_curves_per_set=1,
-    cfg=SimulationConfig(),
+    cfg=None,
     seed=42,
     randomize_grid=False,
     grid_jitter=0.25,
-    save_every=200
+    save_every=200,
 ) -> List[Dict]:
     """
-    Generate implied-volatility surfaces from the true rBergomi model
-    using the hybrid-scheme path generator and exact BS inversion.
-    Retains the original batching and saving logic.
+    Generate implied-volatility surfaces from the rBergomi model using Monte Carlo simulation.
+    Uses rho-aware conditional Monte Carlo (martingale control variate):
+      per path and maturity, use BS with F_path = S0*exp(rho*∫sqrt(V)dW - 0.5*rho^2∫Vds)
+      and sigma_path^2 = (1-rho^2)*∫Vds / T.
+    Computes iv_rel_error as 1.96 * SE_iv / iv.
     """
-
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d")
-    time_str = now.strftime("%H-%M-%S")
 
-    if randomize_grid:
-        # regular randomized runs -> data/<date>/surfaces_<time>.pkl
-        save_dir = os.path.join("data", date_str)
-        os.makedirs(save_dir, exist_ok=True)
-        timestamped_path = os.path.join(save_dir, f"surfaces_{time_str}.pkl")
-    else:
-        # deterministic fixed-grid runs -> data/fixed_longrun/fixed_batch_<timestamp>.pkl
-        save_dir = os.path.join("data", "fixed_longrun")
-        os.makedirs(save_dir, exist_ok=True)
-        timestamped_path = os.path.join(save_dir, f"fixed_batch_{time_str}.pkl")
+    save_dir = os.path.join("data", date_str if randomize_grid else "fixed_longrun")
+    os.makedirs(save_dir, exist_ok=True)
 
-    # progress checkpoint (shared across modes)
-    progress_path = "data/surfaces_progress.pkl"
-    os.makedirs(os.path.dirname(progress_path), exist_ok=True)
-
-    # ==========================================================
-    # Initialization
-    # ==========================================================
-    rng = np.random.RandomState(seed)
     results: List[Dict] = []
-
-    # --- Base time grid ---
+    rng = np.random.RandomState(seed)
     n, T_max = cfg.n, cfg.T_max
 
-    # --- Sample parameter sets ---
-    param_sets = sample_param_sets_lhs(num_sets)
+    param_sets = sample_param_sets_lhs(num_sets, rng)
 
     for s, params in enumerate(param_sets):
-        set_rng = np.random.RandomState(seed + 10_000 * s)
+        set_seed = rng.randint(0, 2**31 - 1)
+        set_rng = np.random.RandomState(set_seed)
+
         eta, rho, H = float(params.eta), float(params.rho), float(params.H)
         a = H - 0.5
 
-        # --- Initialise rBergomi simulator for this parameter world ---
+        # --- Simulator
         rb = rBergomi(n=n, N=cfg.M, T=T_max, a=a)
+        t_grid = rb.t.flatten().astype(cfg.dtype)                # (n,)
+        dt = np.diff(t_grid, prepend=cfg.dtype(0.0)).astype(cfg.dtype)  # (n,)
+        dW1, dW2 = rb.dW1(), rb.dW2()
+        dB, Y = rb.dB(dW1, dW2, rho=rho), rb.Y(dW1)
 
-        # --- Generate Brownian increments once per world ---
-        dW1 = rb.dW1()
-        dW2 = rb.dW2()
-        dB  = rb.dB(dW1, dW2, rho=rho)
-        Y   = rb.Y(dW1)
+        # volatility driver increments W^(1): take correct component
+        dW_vol = dW1[..., 0] if dW1.ndim == 3 else dW1          # (M, n-1)
+        dW_vol = dW_vol.astype(cfg.dtype, copy=False)
 
-        # --------------------------------------------------------------
-        # Forward curves and grids
-        # --------------------------------------------------------------
         for j in range(forward_curves_per_set):
-            
-            strikes_base = cfg.strikes
-            maturities_base = cfg.maturities
+            strikes_base = cfg.strikes.astype(cfg.dtype)
+            maturities_base = cfg.maturities.astype(cfg.dtype)
+            xi0_knots = set_rng.uniform(0.01, 0.16, size=len(maturities_base)).astype(cfg.dtype)
 
-            xi0_knots = set_rng.uniform(0.01, 0.16, size=8)
-        # # knots on [0, T_max] at equal spacing
-        #     K = len(xi0_knots)
-        #     bin_edges = np.linspace(0.0, T_max, K + 1)  # length K+1
-
-        #     # for each t, find bin index i with bin_edges[i] <= t < bin_edges[i+1]
-        #     idx = np.searchsorted(bin_edges, rb.t.flatten(), side="right") - 1
-        #     idx = np.clip(idx, 0, K - 1)
-        #     xi_t = xi0_knots[idx]
-
-            #e0 according to maturities
-            T_max = maturities_base[-1]
-            K = len(xi0_knots)
-            # --- build bin edges that match the maturity grid ---
-            # First bin goes from 0 to first maturity, next between consecutive maturities, etc.
-            # If you have more knots than maturities, we interpolate extra bins proportionally.
-            if K <= len(maturities_base):
-                bin_edges = np.concatenate([[0.0], maturities_base])
-            else:
-                # interpolate to get K+1 edges over maturities range
-                base_edges = np.concatenate([[0.0], maturities_base])
-                target_u = np.linspace(0, 1, K + 1)
-                bin_edges = np.interp(target_u, np.linspace(0, 1, len(base_edges)), base_edges)
-
-            # --- map each simulation time t to its corresponding bin ---
-            t_flat = rb.t.flatten()
-            idx = np.searchsorted(bin_edges, t_flat, side="right") - 1
-            idx = np.clip(idx, 0, K - 1)
-
-            # --- assign forward variance ---
+            # --- map xi0_knots to sim grid
+            base_edges = np.concatenate([[0.0], maturities_base.astype(float)])
+            target_u = np.linspace(0, 1, len(xi0_knots) + 1)
+            bin_edges = np.interp(target_u, np.linspace(0, 1, len(base_edges)), base_edges)
+            idx = np.searchsorted(bin_edges, t_grid.astype(float), side="right") - 1
+            idx = np.clip(idx, 0, len(xi0_knots) - 1)
             xi_t = xi0_knots[idx]
 
-        
+            V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=eta).astype(cfg.dtype)   # (M, n)
+            S = rb.S(V, dB, S0=cfg.S0).astype(cfg.dtype)                      # (M, n)
 
-            V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=eta)
-            S = rb.S(V, dB, S0=cfg.S0)
+            # Precompute cumulative integrals for CMC (left-point rules)
+            V_left = V[:, :-1].astype(cfg.dtype, copy=False)                  # (M, n-1)
+            dt_incr = dt[1:]                                                  # (n-1,)
+            sqrtV_left = np.sqrt(np.maximum(V_left, cfg.dtype(0.0)))          # (M, n-1)
+
+            # I1 = ∫ sqrt(V) dW^(1), I2 = ∫ V ds
+            I1_cum = np.cumsum(sqrtV_left * dW_vol, axis=1, dtype=cfg.dtype)  # (M, n-1)
+            I2_cum = np.cumsum(V_left * dt_incr[None, :], axis=1, dtype=cfg.dtype)  # (M, n-1)
 
             for g_id in range(cfg.G):
-
                 if randomize_grid:
-                    strikes_shifted = jitter_grid(strikes_base, grid_jitter=grid_jitter, min_spacing=0.05)
-                    maturities_shifted = jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.05)
+                    strikes_shifted = np.array(
+                        jitter_grid(strikes_base, grid_jitter=grid_jitter, min_spacing=0.05),
+                        dtype=cfg.dtype,
+                    )
+                    maturities_shifted = np.array(
+                        jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.05),
+                        dtype=cfg.dtype,
+                    )
                 else:
                     strikes_shifted = strikes_base.copy()
                     maturities_shifted = maturities_base.copy()
 
-                price_surf = np.zeros((len(maturities_shifted), len(strikes_shifted)))
-                iv_surf = np.zeros_like(price_surf)
+                nT, nK = len(maturities_shifted), len(strikes_shifted)
+                iv_surf    = np.zeros((nT, nK), dtype=cfg.dtype)
+                iv_relerr  = np.zeros_like(iv_surf)
+
+                S0 = cfg.dtype(cfg.S0)
 
                 for mi, Tm in enumerate(maturities_shifted):
-                    t_idx = np.searchsorted(rb.t.flatten(), Tm, side="right") - 1
-                    ST = S[:, t_idx]
-                    F = np.mean(ST)
-                    prices = np.mean(np.maximum(ST[:, None] - strikes_shifted[None, :] * cfg.S0, 0), axis=0)
-                    price_surf[mi, :] = prices
+                    # maturity index on sim grid
+                    t_idx = np.searchsorted(t_grid.astype(float), float(Tm), side="right") - 1
+                    t_idx = int(np.clip(t_idx, 0, S.shape[1] - 1))
+                    T_float = float(Tm)
+                    if T_float <= 0:
+                        iv_surf[mi, :], iv_relerr[mi, :] = np.nan, np.nan
+                        continue
 
-                    for ki, K in enumerate(strikes_shifted):
+                    # pull integrals up to t_idx
+                    if t_idx == 0:
+                        I1 = np.zeros((V.shape[0],), dtype=cfg.dtype)
+                        I2 = np.zeros((V.shape[0],), dtype=cfg.dtype)
+                    else:
+                        I1 = I1_cum[:, t_idx - 1]
+                        I2 = I2_cum[:, t_idx - 1]
+
+                    # Conditional forward and vol per path (rho-aware)
+                    F_path = S0 * np.exp(cfg.dtype(rho) * I1 - cfg.dtype(0.5) * (cfg.dtype(rho) * cfg.dtype(rho)) * I2)
+                    sigma_path = np.sqrt(np.maximum((cfg.dtype(1.0) - cfg.dtype(rho) * cfg.dtype(rho)) * I2 / Tm,
+                                                    cfg.dtype(1e-16)))
+
+                    for ki, K_ in enumerate(strikes_shifted):
+                        K_abs = K_ * S0
+
+                        # Choose OTM side: right wing (K > S0) -> call, left wing -> put (via parity)
+                        use_call = bool(float(K_abs) > float(S0))
+
+                        call_vals = bs_call_vec_pathwise(F_path, float(K_abs), T_float, sigma_path).astype(cfg.dtype)
+
+                        if use_call:
+                            cond_vals = call_vals
+                            o_flag = 'call'
+                        else:
+                            # put via pathwise parity: P = C - (F_path - K)
+                            cond_vals = (call_vals - (F_path - K_abs)).astype(cfg.dtype)
+                            o_flag = 'put'
+
+                        # Mean and SE across paths (of conditional expectations)
+                        price_cmc = cfg.dtype(np.mean(cond_vals))
+                        se_price  = cfg.dtype(np.std(cond_vals, ddof=1)) / cfg.dtype(np.sqrt(cfg.M))
+
+                        # guard tiny prices (ill-posed inversion)
+                        if not np.isfinite(price_cmc) or price_cmc < cfg.dtype(1e-8):
+                            iv_surf[mi, ki] = np.nan
+                            iv_relerr[mi, ki] = np.nan
+                            continue
+
+                        # Invert with correct option flag; propagate SE via vega
                         try:
-                            iv_surf[mi, ki] = bsinv(prices[ki], F, K, Tm)
+                            iv_val = bsinv(float(price_cmc), float(S0), float(K_abs), T_float, o=o_flag)
+                            iv_surf[mi, ki] = cfg.dtype(iv_val)
+                            vega = bs_vega(float(S0), float(K_abs), T_float, float(iv_val))
+                            if np.isfinite(vega) and vega > 1e-12 and iv_val > 1e-12:
+                                se_iv = se_price / cfg.dtype(vega)
+                                iv_relerr[mi, ki] = cfg.dtype(1.96) * se_iv / cfg.dtype(iv_val)
+                            else:
+                                iv_relerr[mi, ki] = np.nan
                         except Exception:
                             iv_surf[mi, ki] = np.nan
+                            iv_relerr[mi, ki] = np.nan
 
-                    iv_surf[mi, :] = np.clip(iv_surf[mi, :], 1e-4, 5.0)
-                iv_surf = repair_edges_local_directional(iv_surf, maturities_shifted, strikes_shifted, t_threshold=0.35)
+                    iv_surf[mi, :] = np.clip(iv_surf[mi, :], cfg.dtype(1e-4), cfg.dtype(5.0))
 
-                # Sanity check
-                if np.isnan(iv_surf).any() or np.isinf(iv_surf).any():
-                    bad_dir = os.path.join("data", "debug_nans")
-                    os.makedirs(bad_dir, exist_ok=True)
-                    bad_path = os.path.join(bad_dir, f"bad_surface_set{s}_fwd{j}_grid{g_id}.npz")
-                    np.savez_compressed(
-                        bad_path,
-                        price_surface=price_surf,
-                        iv_surface=iv_surf,
-                        strikes=strikes_shifted,
-                        maturities=maturities_shifted,
-                        params=np.array([eta, rho, H], dtype=float),
-                        xi0_knots=xi0_knots.astype(float),
-                    )
-                    print(f"NaN/Inf detected in surface (set={s}, fwd={j}, grid={g_id}) {bad_path}")
-                    continue
+                # optional smoothing/repair (after computing errors
 
-                # Record metadata
-                params_record = {
-                    "eta": eta,
-                    "rho": rho,
-                    "H": H,
-                    "xi0_knots": xi0_knots.astype(float).tolist(),
-                }
-
-                results.append({
-                    "set_id": s,
-                    "fwd_id": j,
-                    "grid_id": g_id,
-                    "params": params_record,
-                    "grid": {
-                        "strikes": strikes_shifted.astype(float),
-                        "maturities": maturities_shifted.astype(float),
-                    },
-                    "price_surface": price_surf,
-                    "iv_surface": iv_surf,
-                })
-
-                # --- Periodic checkpoint save ---
-                if len(results) % save_every == 0:
-                    data = {"cfg": cfg.__dict__, "surfaces": results}
-                    tmp1 = timestamped_path + ".tmp"
-                    tmp2 = progress_path + ".tmp"
-                    with open(tmp1, "wb") as f:
-                        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-                    os.replace(tmp1, timestamped_path)
-                    with open(tmp2, "wb") as f:
-                        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-                    os.replace(tmp2, progress_path)
-                    print(f"[Progress] Saved {len(results)} surfaces  {timestamped_path}")
-
-    # --- Final save ---
-    data = {"cfg": cfg.__dict__, "surfaces": results}
-    tmp1 = timestamped_path + ".tmp"
-    tmp2 = progress_path + ".tmp"
-    with open(tmp1, "wb") as f:
-        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp1, timestamped_path)
-    with open(tmp2, "wb") as f:
-        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp2, progress_path)
-    print(f"[Done] Saved {len(results)} surfaces  {timestamped_path}")
+                results.append(
+                    {
+                        "set_id": s,
+                        "fwd_id": j,
+                        "grid_id": g_id,
+                        "params": {
+                            "eta": float(eta),
+                            "rho": float(rho),
+                            "H": float(H),
+                            "xi0_knots": xi0_knots.astype(cfg.dtype).tolist(),
+                        },
+                        "grid": {
+                            "strikes": strikes_shifted.astype(cfg.dtype),
+                            "maturities": maturities_shifted.astype(cfg.dtype),
+                        },
+                        "iv_surface": iv_surf,
+                        "iv_rel_error": iv_relerr,
+                    }
+                )
 
     return results
 
 
-def generate_fixed_surface(
-    params_fixed: Dict[str, float],
-    xi0_knots: np.ndarray,
-    strikes: np.ndarray,
-    maturities: np.ndarray,
-    cfg,
-    seed: int = 42
-) -> Dict:
+
+
+
+
+
+
+# ---- Main --------------------------------------------------------------------
+# ---- Main --------------------------------------------------------------------
+def generate_fixed_surface(param_set: Dict,
+                           xi0_knots: np.ndarray,
+                           strikes: np.ndarray,
+                           maturities: np.ndarray,
+                           cfg: SimulationConfig,
+                           seed: int = 123) -> Dict:
     """
-    Generate an implied-volatility surface using the original rBergomi class and utils.py.
-    This replaces the rDonsker approximation with the exact hybrid-scheme implementation.
+    Generate one IV surface for fixed parameters and a fixed (K, T) grid.
+    Uses conditional Monte Carlo (martingale CV with rho) and returns
+    iv_surface and iv_rel_error (95% relative CI half-width).
+    Fully dtype-consistent with cfg.dtype.
     """
+    dtype = cfg.dtype
+    eta = dtype(param_set["eta"])
+    rho = dtype(param_set["rho"])
+    H   = dtype(param_set["H"])
+    a   = H - dtype(0.5)
 
-    np.random.seed(seed)
-    eta = float(params_fixed["eta"])
-    rho = float(params_fixed["rho"])
-    H   = float(params_fixed["H"])
-    S0  = cfg.S0
-    M   = cfg.M
-    n   = cfg.n
-    T_max = cfg.T_max
+    strikes   = np.array(strikes, dtype=dtype)
+    maturities = np.array(maturities, dtype=dtype)
+    xi0_knots = np.array(xi0_knots, dtype=dtype)
 
-    # Convert H to alpha = H - 0.5
-    a = H - 0.5
+    # Simulator
+    rb = rBergomi(n=cfg.n, N=cfg.M, T=float(maturities[-1]), a=float(a))
+    t_grid = rb.t.flatten().astype(dtype)             # (n,)
+    dt = np.diff(t_grid, prepend=dtype(0.0))          # (n,)
+    dW1, dW2 = rb.dW1(), rb.dW2()                     # increments for volatility BM W and orthogonal BM
+    dB, Y = rb.dB(dW1, dW2, rho=float(rho)), rb.Y(dW1)
 
-    # Initialise rBergomi simulator
-    rb = rBergomi(n=n, N=M, T=T_max, a=a)
-
-    # Simulate correlated Brownian motions
-    dW1 = rb.dW1()                       # variance driver
-    dW2 = rb.dW2()                       # orthogonal driver
-    dB  = rb.dB(dW1, dW2, rho=rho)       # correlated price driver
-
-    # Construct Volterra process and variance paths
-    Y = rb.Y(dW1)
-
-    # Piecewise-constant forward variance interpolation
-    #e0 equally spaced
-    # K = len(xi0_knots)
-    # bin_edges = np.linspace(0.0, T_max, K + 1)  # length K+1
-    # # for each t, find bin index i with bin_edges[i] <= t < bin_edges[i+1]
-    # idx = np.searchsorted(bin_edges, rb.t.flatten(), side="right") - 1
-    # idx = np.clip(idx, 0, K - 1)
-    # xi_t = xi0_knots[idx]
-
-    #e0 according to maturities
-    T_max = maturities[-1]
-    K = len(xi0_knots)
-    # --- build bin edges that match the maturity grid ---
-    # First bin goes from 0 to first maturity, next between consecutive maturities, etc.
-    # If you have more knots than maturities, we interpolate extra bins proportionally.
-    if K <= len(maturities):
-        bin_edges = np.concatenate([[0.0], maturities])
+    # Map xi0_knots to time grid using maturity bins
+    Kk = len(xi0_knots)
+    if Kk <= len(maturities):
+        bin_edges = np.concatenate([[0.0], maturities.astype(float)])
     else:
-        # interpolate to get K+1 edges over maturities range
-        base_edges = np.concatenate([[0.0], maturities])
-        target_u = np.linspace(0, 1, K + 1)
+        base_edges = np.concatenate([[0.0], maturities.astype(float)])
+        target_u = np.linspace(0, 1, Kk + 1)
         bin_edges = np.interp(target_u, np.linspace(0, 1, len(base_edges)), base_edges)
 
-    # --- map each simulation time t to its corresponding bin ---
-    t_flat = rb.t.flatten()
-    idx = np.searchsorted(bin_edges, t_flat, side="right") - 1
-    idx = np.clip(idx, 0, K - 1)
-
-    # --- assign forward variance ---
+    idx = np.searchsorted(bin_edges, t_grid.astype(float), side="right") - 1
+    idx = np.clip(idx, 0, Kk - 1)
     xi_t = xi0_knots[idx]
 
+    V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=float(eta)).astype(dtype)   # (M, n)
+    S = rb.S(V, dB, S0=dtype(cfg.S0)).astype(dtype)                     # (M, n)
 
-    V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=eta)
+    # ----- Conditional MC ingredients with rho --------------------------------
+    # Left-point Ito sum for I1 = ∫ sqrt(V) dW  and rectangle rule for I2 = ∫ V ds
+    dW_vol = dW1[..., 0] if dW1.ndim == 3 else dW1
+    dW_vol = dW_vol.astype(dtype, copy=False)        # (M, n-1)
+    V_left = V[:, :-1].astype(dtype, copy=False)     # (M, n-1)
+    dt_incr = dt[1:].astype(dtype)                   # (n-1,)
 
-    # Simulate price paths
-    S = rb.S(V, dB, S0=S0)
+    sqrtV_left = np.sqrt(np.maximum(V_left, dtype(0.0)))       # (M, n-1)
+    I1_cum = np.cumsum(sqrtV_left * dW_vol, axis=1, dtype=dtype)  # (M, n-1)
+    I2_cum = np.cumsum(V_left * dt_incr[None, :], axis=1, dtype=dtype)  # (M, n-1)
 
-    # Build IV surface on provided strike/maturity grid
-    iv_surface = np.zeros((len(maturities), len(strikes)))
-    price_surface = np.zeros_like(iv_surface)
+    # Build surfaces
+    nT, nK = len(maturities), len(strikes)
+    price_surf = np.zeros((nT, nK), dtype=dtype)
+    iv_surf    = np.zeros_like(price_surf)
+    iv_relerr  = np.zeros_like(price_surf)
 
-    for iT, T in enumerate(maturities):
-        t_idx = min(int(T * n), rb.s)
-        ST = S[:, t_idx]
-        F = np.mean(ST)
+    S0 = dtype(cfg.S0)
 
-        # Price calls for all strikes
-        prices = np.mean(np.maximum(ST[:, None] - strikes[None, :] * S0, 0), axis=0)
-        price_surface[iT, :] = prices
+    for mi, Tm in enumerate(maturities):
+        # maturity index
+        t_idx = np.searchsorted(t_grid, float(Tm), side="right") - 1
+        t_idx = int(np.clip(t_idx, 0, S.shape[1] - 1))
+        T_float = float(Tm)
 
-        # Implied vols via Brent root-finder (from utils.py)
-        for iK, K in enumerate(strikes):
+        if T_float <= 0:
+            price_surf[mi, :], iv_surf[mi, :], iv_relerr[mi, :] = np.nan, np.nan, np.nan
+            continue
+
+        if t_idx == 0:
+            I1 = np.zeros((V.shape[0],), dtype=dtype)
+            I2 = np.zeros((V.shape[0],), dtype=dtype)
+        else:
+            I1 = I1_cum[:, t_idx - 1]
+            I2 = I2_cum[:, t_idx - 1]
+
+        # Conditional forward and conditional vol per path (preserves skew via rho-term)
+        F_path = S0 * np.exp(rho * I1 - dtype(0.5) * (rho * rho) * I2)
+        sigma_path = np.sqrt(np.maximum((dtype(1.0) - rho * rho) * I2 / Tm, dtype(1e-16)))
+
+        for ki, K_ in enumerate(strikes):
+            K_abs = K_ * S0
+
+            # Pathwise conditional BS prices; average gives CMC estimator
+            is_call = (K_abs >= float(S0))   # OTM call region
+            if is_call:
+                cond_vals = bs_call_vec_pathwise(F_path, K_abs, T_float, sigma_path).astype(dtype)
+                o_flag = 'call'
+            else:
+                # either direct put helper:
+                cond_vals = bs_put_vec_pathwise(F_path, K_abs, T_float, sigma_path).astype(dtype)
+                # or via parity:
+                # cond_vals = (bs_call_vec_pathwise(F_path, K_abs, T_float, sigma_path) - (F_path - K_abs)).astype(dtype)
+                o_flag = 'put'
+
+            price_cmc = dtype(np.mean(cond_vals))
+            se_price  = dtype(np.std(cond_vals, ddof=1)) / dtype(np.sqrt(cfg.M))
+            price_surf[mi, ki] = price_cmc
+
             try:
-                iv_surface[iT, iK] = bsinv(prices[iK], F, K, T)
+                iv_val = bsinv(float(price_cmc), float(S0), float(K_abs), float(Tm), o=o_flag)
+                iv_surf[mi, ki] = dtype(iv_val)
+                vega = bs_vega(float(S0), float(K_abs), float(Tm), float(iv_val))
+                if np.isfinite(vega) and vega > 1e-12 and iv_val > 1e-12:
+                    se_iv = se_price / dtype(vega)
+                    iv_relerr[mi, ki] = dtype(1.96) * se_iv / dtype(iv_val)
+                else:
+                    iv_relerr[mi, ki] = np.nan
             except Exception:
-                iv_surface[iT, iK] = np.nan
+                iv_surf[mi, ki] = np.nan
+                iv_relerr[mi, ki] = np.nan
 
-        # numerical clipping
-        iv_surface[iT, :] = np.clip(iv_surface[iT, :], 1e-4, 5.0)
-    iv_surface = repair_edges_local_directional(iv_surface, maturities, strikes, t_threshold=0.35)
+        iv_surf[mi, :] = np.clip(iv_surf[mi, :], dtype(1e-4), dtype(5.0))
+
+    # Optional repairs (after computing errors)
+    #iv_surf = repair_edges_local_directional(iv_surf, maturities, strikes,
+                                             #t_threshold=0.35, dtype=dtype)
+
+    # Final sanity
+    if np.isnan(iv_surf).any() or np.isinf(iv_surf).any():
+        bad_dir = os.path.join("data", "debug_nans")
+        os.makedirs(bad_dir, exist_ok=True)
+        np.savez_compressed(
+            os.path.join(bad_dir, f"bad_fixed_surface_seed{seed}.npz"),
+            price_surface=price_surf,
+            iv_surface=iv_surf,
+            iv_rel_error=iv_relerr,
+            strikes=strikes,
+            maturities=maturities,
+            params=np.array([eta, rho, H], dtype=dtype),
+            xi0_knots=xi0_knots,
+        )
+        print("NaN/Inf detected in fixed surface; saved debug npz.")
 
     return {
-        "params": {
-            "eta": eta,
-            "rho": rho,
-            "H": H,
-            "xi0_knots": xi0_knots.tolist(),
-        },
-        "grid": {
-            "strikes": strikes.astype(float),
-            "maturities": maturities.astype(float),
-        },
-        "price_surface": price_surface,
-        "iv_surface": iv_surface,
+        "params": {"eta": float(eta), "rho": float(rho), "H": float(H),
+                   "xi0_knots": xi0_knots.astype(dtype).tolist()},
+        "grid": {"strikes": strikes.astype(dtype), "maturities": maturities.astype(dtype)},
+        "price_surface": price_surf,
+        "iv_surface": iv_surf,
+        "iv_rel_error": iv_relerr,
     }

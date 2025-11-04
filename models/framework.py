@@ -114,10 +114,11 @@ class BaseModel(nn.Module):
         }
         return mse_grid, stats
 
-    def plot_evaluation(self, surface_data, figsize=(16, 10)):
+    def plot_evaluation(self, surface_data, figsize=(15, 5), levels=30):
         """
-        Plot true surface, predicted surface, MSE heatmap and absolute error heatmap.
-        Uses model's own grid + predict_surface.
+        Compare true vs. predicted IV surfaces using contour plots.
+        Shows:
+            [True Surface] [Predicted Surface] [Difference (Pred - True)]
         """
         assert self.strikes is not None and self.maturities is not None, \
             "Model grid (strikes/maturities) not set; call set_grid or train/prepare first."
@@ -126,58 +127,47 @@ class BaseModel(nn.Module):
         params = surface_data["params"]
         strikes, maturities = self.strikes, self.maturities
 
+        # Predict surface
         pred_surface = self.predict_surface(params, store_last=True)
-        self._last_true = true_surface
-        self._last_params = params
+        diff = pred_surface - true_surface
+        mae = np.mean(np.abs(diff))
+        rmse = np.sqrt(np.mean(diff ** 2))
 
-        mse_grid, stats = self.compute_grid_mse(surface_data)
+        # Compute symmetric color scale for difference
+        vmax = np.max(np.abs(diff))
 
-        # Print stats
-        print("MSE stats:")
-        for k, v in stats.items():
-            print(f"  {k}: {v}")
+        # Make figure
+        fig, axs = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
+        K, T = np.meshgrid(strikes, maturities)
 
-        # Create plots
-        fig = plt.figure(figsize=figsize)
-        K_mesh, T_mesh = np.meshgrid(strikes, maturities)
+        # --- True Surface ---
+        c0 = axs[0].contourf(K, T, true_surface, levels=levels, cmap="viridis")
+        axs[0].set_title("True Surface")
+        axs[0].set_xlabel("Strike")
+        axs[0].set_ylabel("Maturity")
+        plt.colorbar(c0, ax=axs[0])
 
-        # True surface
-        ax1 = fig.add_subplot(221, projection='3d')
-        surf1 = ax1.plot_surface(K_mesh, T_mesh, true_surface, cmap=cm.viridis)
-        ax1.set_title('True Surface'); ax1.set_xlabel('Strike'); ax1.set_ylabel('Maturity'); ax1.set_zlabel('IV')
-        plt.colorbar(surf1, ax=ax1, shrink=0.5, aspect=8)
+        # --- Predicted Surface ---
+        c1 = axs[1].contourf(K, T, pred_surface, levels=levels, cmap="plasma")
+        eta, rho, H = params["eta"], params["rho"], params["H"]
+        axs[1].set_title(f"Predicted Surface (η={eta:.2f}, ρ={rho:.2f}, H={H:.2f})")
+        axs[1].set_xlabel("Strike")
+        axs[1].set_ylabel("Maturity")
+        plt.colorbar(c1, ax=axs[1])
 
-        # Predicted surface
-        ax2 = fig.add_subplot(222, projection='3d')
-        surf2 = ax2.plot_surface(K_mesh, T_mesh, pred_surface, cmap=cm.viridis)
-        ax2.set_title('Predicted Surface'); ax2.set_xlabel('Strike'); ax2.set_ylabel('Maturity'); ax2.set_zlabel('IV')
-        plt.colorbar(surf2, ax=ax2, shrink=0.5, aspect=8)
+        # --- Difference ---
+        c2 = axs[2].contourf(K, T, diff, levels=levels, cmap="coolwarm",
+                            vmin=-vmax, vmax=vmax)
+        axs[2].set_title(f"Difference (Pred - True)\nMAE={mae:.3e}, RMSE={rmse:.3e}")
+        axs[2].set_xlabel("Strike")
+        axs[2].set_ylabel("Maturity")
+        plt.colorbar(c2, ax=axs[2])
 
-        # MSE heatmap
-        ax3 = fig.add_subplot(223)
-        im = ax3.imshow(
-            mse_grid, cmap='hot',
-            extent=[strikes[0], strikes[-1], maturities[0], maturities[-1]],
-            aspect='auto', origin='lower'
-        )
-        ax3.set_title('MSE Heatmap'); ax3.set_xlabel('Strike'); ax3.set_ylabel('Maturity')
-        plt.colorbar(im, ax=ax3)
-
-        # Absolute error heatmap
-        ax4 = fig.add_subplot(224)
-        abs_err = np.abs(true_surface - pred_surface)
-        im2 = ax4.imshow(
-            abs_err, cmap='inferno',
-            extent=[strikes[0], strikes[-1], maturities[0], maturities[-1]],
-            aspect='auto', origin='lower'
-        )
-        ax4.set_title('Absolute Error'); ax4.set_xlabel('Strike'); ax4.set_ylabel('Maturity')
-        plt.colorbar(im2, ax=ax4)
-
-        plt.tight_layout()
+        print(f"MAE = {mae:.6f}, RMSE = {rmse:.6f}")
         return fig
 
-    def evaluate_and_save(self, surface_samples, out_dir):
+
+    def evaluate(self, surface_samples, out_dir):
         """
         Evaluates multiple samples and saves per-sample artifacts:
           - params (JSON)
@@ -191,32 +181,16 @@ class BaseModel(nn.Module):
         os.makedirs(out_dir, exist_ok=True)
 
         index = []
+        abs_grid = 0
         for i, sample in enumerate(surface_samples):
             params = sample["params"]
             true_surface = np.array(sample["iv_surface"], dtype=np.float32)
 
             pred_surface = self.predict_surface(params, store_last=False)
             abs_err = np.abs(true_surface - pred_surface)
-            mse_grid = abs_err**2
-
-            fname = f"surface_eval_{i:05d}.npz"
-            path = os.path.join(out_dir, fname)
-            np.savez_compressed(
-                path,
-                params_json=np.string_(json.dumps(params)),
-                strikes=self.strikes,
-                maturities=self.maturities,
-                true_surface=true_surface,
-                pred_surface=pred_surface,
-                abs_error=abs_err,
-                mse_grid=mse_grid
-            )
-            index.append(fname)
-
-        with open(os.path.join(out_dir, "index.json"), "w") as f:
-            json.dump(index, f, indent=2)
-        print(f"✅ Saved {len(index)} evaluation files to: {out_dir}")
-
+            abs_grid += abs_err
+        
+        return abs_grid/len(surface_samples)
 # ============================================================
 # DeepONet (self-contained)
 # ============================================================

@@ -44,25 +44,31 @@ def bs(F, K, V, o = 'call'):
     P = w * F * norm.cdf(w * d1) - w * K * norm.cdf(w * d2)
     return P
 
-def bsinv(P, F, K, t, o = 'call'):
+def bsinv(P, F, K, t, o='call'):
     """
-    Returns implied Black vol from given call price, forward, strike and time
-    to maturity.
+    Robust implied Black volatility from price P, forward F, strike K, maturity t.
+    Handles call/put/otm options; safe for MC-generated prices.
     """
-    # Set appropriate weight for option token o
-    w = 1
+    if t <= 1e-10:
+        return 1e-8  # degenerate maturity
+
+    w = 1.0
     if o == 'put':
-        w = -1
+        w = -1.0
     elif o == 'otm':
-        w = 2 * (K > 1.0) - 1
+        w = 2.0 * (K > F) - 1.0  # more consistent OTM switch
 
-    # Ensure at least instrinsic value
-    P = np.maximum(P, np.maximum(w * (F - K), 0))
+    intrinsic = max(w * (F - K), 0.0)
+    P = max(P, intrinsic + 1e-12)
 
-    def error(s):
-        return bs(F, K, s**2 * t, o) - P
-    s = brentq(error, 1e-9, 1e+9)
-    return s
+    def error(sigma):
+        return bs(F, K, sigma**2 * t, o) - P
+
+    try:
+        return brentq(error, 1e-8, 5.0, xtol=1e-10, maxiter=100)
+    except ValueError:
+        # Root not bracketed (e.g. price outside BS range)
+        return np.nan
 
 
 import numpy as np
