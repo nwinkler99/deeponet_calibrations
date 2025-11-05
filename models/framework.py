@@ -37,7 +37,7 @@ class IVSurfaceDataset(Dataset):
 
 
 # ============================================================
-# Base Model with shared eval + persistence utilities
+# Base Model with shared eval + persistence + scaling utilities
 # ============================================================
 
 class BaseModel(nn.Module):
@@ -50,9 +50,15 @@ class BaseModel(nn.Module):
         self.maturities = None       # np.ndarray (nT,)
         self.input_dim = None        # int for param vector (MLP) / branch dim (DeepONet)
         self.output_shape = None     # (nT, nK) for MLP (helps reshape/check)
-        self._last_pred = None       # cache last predicted surface
-        self._last_true = None       # cache last true surface
-        self._last_params = None     # cache last params dict
+
+        # Scaling state
+        self.param_bounds = None     # (lb, ub) arrays for param vector scaling to [-1, 1]
+        self.output_scaler = None    # StandardScaler for IV outputs (fit on train only)
+
+        # caches
+        self._last_pred = None
+        self._last_true = None
+        self._last_params = None
 
     # -------------------- Shared helpers --------------------
 
@@ -69,6 +75,89 @@ class BaseModel(nn.Module):
 
     def compute_loss(self, y_pred, y_true):
         return nn.MSELoss()(y_pred, y_true)
+
+    # -------------------- Param scaling: bounds → [-1, 1] --------------------
+    @staticmethod
+    def _make_param_bounds(num_knots, eta=(0.5, 4.0), rho=(0.0, 1.0), H=(0.025, 0.5), knot=(0.01, 0.16)):
+        """
+        Build (lb, ub) arrays for a parameter vector shaped as:
+          [eta, rho, H, xi0_knots...]
+        Using user-specified borders.
+        """
+        lb = [eta[0], rho[0], H[0]] + [knot[0]] * num_knots
+        ub = [eta[1], rho[1], H[1]] + [knot[1]] * num_knots
+        return np.asarray(lb, dtype=np.float32), np.asarray(ub, dtype=np.float32)
+
+    @staticmethod
+    def _scale_to_m1_p1(x, lb, ub):
+        # (x - mid) * 2 / (ub - lb), where mid = (ub+lb)/2
+        mid = (ub + lb) * 0.5
+        return (x - mid) * (2.0 / (ub - lb))
+
+    @staticmethod
+    def _inverse_from_m1_p1(x_scaled, lb, ub):
+        # x_scaled*(ub - lb)/2 + mid
+        mid = (ub + lb) * 0.5
+        return x_scaled * (0.5 * (ub - lb)) + mid
+
+    def set_param_bounds(self, lb, ub):
+        """Attach explicit (lb, ub) arrays to the model for param scaling."""
+        lb = np.asarray(lb, dtype=np.float32)
+        ub = np.asarray(ub, dtype=np.float32)
+        assert lb.shape == ub.shape, "lb and ub must have the same shape"
+        self.param_bounds = (lb, ub)
+
+    def scale_params(self, param_vec):
+        """Scale [eta, rho, H, xi0_knots...] to [-1, 1] using self.param_bounds."""
+        assert self.param_bounds is not None, "param_bounds not set"
+        lb, ub = self.param_bounds
+        x = np.asarray(param_vec, dtype=np.float32)
+        return BaseModel._scale_to_m1_p1(x, lb, ub)
+
+    def inverse_scale_params(self, x_scaled):
+        """Inverse of scale_params."""
+        assert self.param_bounds is not None, "param_bounds not set"
+        lb, ub = self.param_bounds
+        x_scaled = np.asarray(x_scaled, dtype=np.float32)
+        return BaseModel._inverse_from_m1_p1(x_scaled, lb, ub)
+
+    # -------------------- Output (IV) scaling: StandardScaler --------------------
+    def fit_output_scaler(self, Y_train):
+        """
+        Fit StandardScaler on IV outputs (train only, leakage-safe).
+        Y_train: (N, nT, nK) or (N, 1) or (N, nPts, 1) for DeepONet flattened
+        """
+        from sklearn.preprocessing import StandardScaler
+        self.output_scaler = StandardScaler()
+        flat = Y_train.reshape(len(Y_train), -1)
+        self.output_scaler.fit(flat)
+
+    def transform_output(self, Y):
+        """Transform IV outputs using fitted StandardScaler."""
+        assert self.output_scaler is not None, "output_scaler not fitted"
+        shp = Y.shape
+        Y_scaled = self.output_scaler.transform(Y.reshape(len(Y), -1))
+        return Y_scaled.reshape(shp)
+
+    def inverse_transform_output_single(self, y_vec):
+        """
+        Inverse-transform a single vector of IV predictions.
+        y_vec: shape (nPts,) or (nPts,1)
+        Returns flattened numpy vector (nPts,)
+        """
+        assert self.output_scaler is not None, "output_scaler not fitted"
+        y = np.asarray(y_vec, dtype=np.float32).reshape(1, -1)
+        inv = self.output_scaler.inverse_transform(y)
+        return inv.reshape(-1)
+
+    def inverse_transform_surface(self, Y2d):
+        """
+        Inverse-transform a single (nT, nK) surface predicted in scaled space.
+        """
+        assert self.output_scaler is not None, "output_scaler not fitted"
+        nT, nK = Y2d.shape
+        inv = self.inverse_transform_output_single(Y2d.reshape(-1))
+        return inv.reshape(nT, nK)
 
     # -------------------- Abstract API ----------------------
     # Each child model must implement:
@@ -90,7 +179,7 @@ class BaseModel(nn.Module):
         true_surface = np.array(surface_data["iv_surface"], dtype=np.float32)
         params = surface_data["params"]
 
-        pred_surface = self.predict_surface(params, store_last=False)
+        pred_surface = self.predict_surface(params)
         abs_err = np.abs(true_surface - pred_surface)
         mse_grid = abs_err ** 2
 
@@ -128,7 +217,7 @@ class BaseModel(nn.Module):
         strikes, maturities = self.strikes, self.maturities
 
         # Predict surface
-        pred_surface = self.predict_surface(params, store_last=True)
+        pred_surface = self.predict_surface(params)
         diff = pred_surface - true_surface
         mae = np.mean(np.abs(diff))
         rmse = np.sqrt(np.mean(diff ** 2))
@@ -166,31 +255,117 @@ class BaseModel(nn.Module):
         print(f"MAE = {mae:.6f}, RMSE = {rmse:.6f}")
         return fig
 
-
     def evaluate(self, surface_samples, out_dir):
         """
-        Evaluates multiple samples and saves per-sample artifacts:
-          - params (JSON)
-          - strikes, maturities
-          - true_surface, pred_surface
-          - mse_grid, abs_error
-        Saves each as NPZ; also emits a small index.json with filenames.
+        Evaluates model-predicted vs. precomputed relative IV errors across samples.
+
+        For each (K,T) grid point:
+        - Aggregates errors across all samples (mean, median, max)
+        - Replaces NaNs by the mean of that (K,T) location across samples
+        - Expresses results in percent
+
+        Produces up to 6 heatmaps:
+        Row 1 -> Predicted relative errors (computed on the fly)
+        Row 2 -> Precomputed relative errors (sample["iv_rel_error"], if available)
+        Maturity axis (T) is inverted: shorter maturities at the top.
         """
         assert self.strikes is not None and self.maturities is not None, \
             "Model grid (strikes/maturities) not set; call set_grid or train/prepare first."
         os.makedirs(out_dir, exist_ok=True)
 
-        index = []
-        abs_grid = 0
-        for i, sample in enumerate(surface_samples):
+        pred_rel_errs, precomp_rel_errs = [], []
+
+        # Collect both predicted and stored errors
+        for sample in surface_samples:
             params = sample["params"]
             true_surface = np.array(sample["iv_surface"], dtype=np.float32)
+            pred_surface = self.predict_surface(params)
 
-            pred_surface = self.predict_surface(params, store_last=False)
-            abs_err = np.abs(true_surface - pred_surface)
-            abs_grid += abs_err
-        
-        return abs_grid/len(surface_samples)
+            # Compute predicted relative errors (%)
+            rel_err_pred = (
+                np.abs(true_surface - pred_surface) / np.clip(true_surface, 1e-6, None)
+            ) * 100.0
+            pred_rel_errs.append(rel_err_pred)
+
+            # Only collect precomputed if available
+            if "iv_rel_error" in sample and sample["iv_rel_error"] is not None:
+                rel_err_pre = np.array(sample["iv_rel_error"], dtype=np.float32) * 100.0
+                precomp_rel_errs.append(rel_err_pre)
+
+        # Stack predictions
+        pred_rel_errs = np.stack(pred_rel_errs, axis=0)
+
+        # Fill NaNs by mean at that (T,K) position
+        def fill_nans_by_mean(arr):
+            mean_over_samples = np.nanmean(arr, axis=0)
+            return np.where(np.isnan(arr), np.expand_dims(mean_over_samples, 0), arr)
+
+        pred_rel_errs = fill_nans_by_mean(pred_rel_errs)
+
+        # Aggregate predicted errors
+        mean_pred, median_pred, max_pred = (
+            np.mean(pred_rel_errs, axis=0),
+            np.median(pred_rel_errs, axis=0),
+            np.max(pred_rel_errs, axis=0),
+        )
+
+        # Precomputed branch only if available
+        has_precomp = len(precomp_rel_errs) > 0
+        if has_precomp:
+            precomp_rel_errs = np.stack(precomp_rel_errs, axis=0)
+            precomp_rel_errs = fill_nans_by_mean(precomp_rel_errs)
+            mean_pre, median_pre, max_pre = (
+                np.mean(precomp_rel_errs, axis=0),
+                np.median(precomp_rel_errs, axis=0),
+                np.max(precomp_rel_errs, axis=0),
+            )
+        else:
+            mean_pre = median_pre = max_pre = None
+
+        # Plot
+        rows = 2 if has_precomp else 1
+        fig, axes = plt.subplots(rows, 3, figsize=(15, 4 * rows))
+        Ks, Ts = np.meshgrid(self.strikes, self.maturities, indexing="xy")
+
+        # Row 1 — predicted relative errors
+        for ax, data, title in zip(
+            axes[0] if has_precomp else axes,
+            [mean_pred, median_pred, max_pred],
+            ["Mean Rel Error (Pred)", "Median Rel Error (Pred)", "Max Rel Error (Pred)"]
+        ):
+            im = ax.pcolormesh(Ks, Ts, data, cmap="magma", shading="auto")
+            ax.set_xlabel("Strike (K)")
+            ax.set_ylabel("Maturity (T)")
+            ax.set_title(f"{title} [%]")
+            ax.invert_yaxis()
+            fig.colorbar(im, ax=ax, label="%")
+
+        # Row 2 — precomputed relative errors (only if available)
+        if has_precomp:
+            for ax, data, title in zip(
+                axes[1],
+                [mean_pre, median_pre, max_pre],
+                ["Mean Rel Error (Precomp)", "Median Rel Error (Precomp)", "Max Rel Error (Precomp)"]
+            ):
+                im = ax.pcolormesh(Ks, Ts, data, cmap="viridis", shading="auto")
+                ax.set_xlabel("Strike (K)")
+                ax.set_ylabel("Maturity (T)")
+                ax.set_title(f"{title} [%]")
+                ax.invert_yaxis()
+                fig.colorbar(im, ax=ax, label="%")
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "iv_error_heatmaps.png"), dpi=200)
+
+        return {
+            "pred_rel": {"mean": mean_pred, "median": median_pred, "max": max_pred},
+            "precomp_rel": (
+                {"mean": mean_pre, "median": median_pre, "max": max_pre} if has_precomp else None
+            ),
+        }
+
+
+
 # ============================================================
 # DeepONet (self-contained)
 # ============================================================
@@ -232,11 +407,7 @@ class DeepONet(BaseModel):
 
     # --------------------------------------------------------
     @staticmethod
-    def prepare_data(surfaces, batch_size=256, val_split=0.2, shuffle=True):
-        """
-        Flattens surfaces into per-point supervision for DeepONet.
-        Returns: train_loader, val_loader, branch_dim, strikes, maturities
-        """
+    def _flatten_surfaces_for_deeponet(surfaces, sanity_check_grids=True):
         Xb_list, Xt_list, Y_list = [], [], []
         Ks_ref, Ts_ref = None, None
 
@@ -246,7 +417,14 @@ class DeepONet(BaseModel):
             Ks = np.array(surf["grid"]["strikes"], dtype=np.float32)
             Ts = np.array(surf["grid"]["maturities"], dtype=np.float32)
 
-            xi0_knots = np.array(params["xi0_knots"]).flatten()
+            if sanity_check_grids:
+                if Ks_ref is None:
+                    Ks_ref, Ts_ref = Ks, Ts
+                else:
+                    if not (np.allclose(Ks_ref, Ks) and np.allclose(Ts_ref, Ts)):
+                        raise ValueError("All surfaces must share the same (K, T) grid.")
+
+            xi0_knots = np.array(params["xi0_knots"]).flatten().astype(np.float32)
             branch_vec = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots]).astype(np.float32)
 
             K_mesh, T_mesh = np.meshgrid(Ks, Ts)
@@ -262,43 +440,129 @@ class DeepONet(BaseModel):
         X_trunk  = np.concatenate(Xt_list, axis=0)
         Y        = np.concatenate(Y_list, axis=0)
 
+        strikes = Ks_ref
+        maturities = Ts_ref
+        return X_branch, X_trunk, Y, strikes, maturities
+
+    @classmethod
+    def from_surfaces(cls, surfaces, batch_size=256, val_split=0.2, shuffle=True,
+                      eta=(0.5, 4.0), rho=(0.0, 1.0), H=(0.025, 0.5), knot=(0.01, 0.16)):
+        """
+        Build a DeepONet model + loaders with internal, leakage-safe scaling:
+          - Branch inputs scaled to [-1, 1] using provided bounds
+          - Output (IV) scaled via StandardScaler fit on train only
+        Returns: model, train_loader, val_loader, strikes, maturities
+        """
+        # Flatten to per-point supervision
+        X_branch, X_trunk, Y, strikes, maturities = cls._flatten_surfaces_for_deeponet(surfaces)
+
+        # Build param bounds from branch vector length
+        num_knots = X_branch.shape[1] - 3
+        lb, ub = BaseModel._make_param_bounds(num_knots, eta=eta, rho=rho, H=H, knot=knot)
+
+        # Scale branch inputs by bounds to [-1,1]
+        Xb_scaled = BaseModel._scale_to_m1_p1(X_branch, lb, ub)
+
         # Split
         n_total = len(Y)
         n_train = int((1 - val_split) * n_total)
         idx = np.arange(n_total)
         if shuffle:
             np.random.shuffle(idx)
-        train_idx, val_idx = idx[:n_train], idx[n_train:]
+        tr, va = idx[:n_train], idx[n_train:]
 
-        train_ds = IVSurfaceDataset(X_branch[train_idx], X_trunk[train_idx], Y[train_idx])
-        val_ds   = IVSurfaceDataset(X_branch[val_idx], X_trunk[val_idx], Y[val_idx])
+        # Fit output scaler on train only
+        model = cls(branch_in_dim=Xb_scaled.shape[1])
+        model.set_grid(strikes, maturities)
+        model.set_io_dims(input_dim=Xb_scaled.shape[1])
+        model.set_param_bounds(lb, ub)
+        model.fit_output_scaler(Y[tr])
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        # Transform outputs
+        Y_tr_scaled = model.transform_output(Y[tr])
+        Y_va_scaled = model.transform_output(Y[va])
+
+        # Build datasets
+        train_ds = IVSurfaceDataset(Xb_scaled[tr], X_trunk[tr], Y_tr_scaled)
+        val_ds   = IVSurfaceDataset(Xb_scaled[va], X_trunk[va], Y_va_scaled)
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
         val_loader   = DataLoader(val_ds, batch_size=2*batch_size, shuffle=False)
 
-        branch_dim = X_branch.shape[1]
-        strikes = Ks_ref if Ks_ref is not None else np.array(surfaces[0]["grid"]["strikes"], dtype=np.float32)
-        maturities = Ts_ref if Ts_ref is not None else np.array(surfaces[0]["grid"]["maturities"], dtype=np.float32)
-
-        return train_loader, val_loader, branch_dim, strikes, maturities
+        # Build networks now that dims are known
+        model._build_networks()
+        return model, train_loader, val_loader, strikes, maturities
 
     # --------------------------------------------------------
-    def train_model(self, train_loader, val_loader=None, epochs=10):
+    def train_model(
+        self,
+        train_loader,
+        val_loader=None,
+        epochs=10,
+        lr_schedule=[(0, 1e-3), (5, 5e-4), (8, 1e-4)],
+    ):
+        """
+        Train the DeepONet model with optional learning-rate schedule.
+
+        Parameters
+        ----------
+        train_loader : DataLoader
+            Training data loader (xb, xt, y) batches.
+        val_loader : DataLoader, optional
+            Validation data loader.
+        epochs : int, default=10
+            Total number of training epochs.
+        lr_schedule : list of (int, float), optional
+            List of (epoch, lr) tuples defining the learning-rate schedule.
+            Example: [(0, 1e-3), (30, 5e-4), (60, 1e-4)]
+            Learning rate changes at each specified epoch threshold.
+        """
+        # Sort and initialize LR
+        lr_schedule = sorted(lr_schedule, key=lambda x: x[0])
+        schedule_index = 0
+        base_lr = lr_schedule[0][1]
+        for g in self.optimizer.param_groups:
+            g["lr"] = base_lr
+
         for epoch in range(epochs):
-            self.train(); total_loss = 0.0
+            # Update LR if we reached next threshold
+            if (
+                schedule_index + 1 < len(lr_schedule)
+                and epoch >= lr_schedule[schedule_index + 1][0]
+            ):
+                schedule_index += 1
+                new_lr = lr_schedule[schedule_index][1]
+                for g in self.optimizer.param_groups:
+                    g["lr"] = new_lr
+                print(f"→ Adjusted learning rate to {new_lr:.2e} at epoch {epoch}")
+
+            self.train()
+            total_loss = 0.0
             for xb, xt, y in tqdm(train_loader, desc=f"Train {epoch+1}", leave=False):
                 xb, xt, y = xb.to(self.device), xt.to(self.device), y.to(self.device)
                 pred = self.forward(xb, xt)
                 loss = self.compute_loss(pred, y)
-                self.optimizer.zero_grad(); loss.backward(); self.optimizer.step()
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
                 total_loss += loss.item() * len(y)
+
             train_rmse = float(np.sqrt(total_loss / len(train_loader.dataset)))
 
             if val_loader is not None:
                 val_rmse = float(np.sqrt(self.validate(val_loader)))
-                print(f"Epoch {epoch+1:03d} | train_rmse={train_rmse:.6f}, val_rmse={val_rmse:.6f}")
+                print(
+                    f"Epoch {epoch+1:03d} | "
+                    f"train_rmse={train_rmse:.6f}, val_rmse={val_rmse:.6f}, "
+                    f"lr={self.optimizer.param_groups[0]['lr']:.1e}"
+                )
             else:
-                print(f"Epoch {epoch+1:03d} | train_rmse={train_rmse:.6f}")
+                print(
+                    f"Epoch {epoch+1:03d} | "
+                    f"train_rmse={train_rmse:.6f}, "
+                    f"lr={self.optimizer.param_groups[0]['lr']:.1e}"
+                )
+
 
     def validate(self, val_loader):
         self.eval(); total = 0.0
@@ -314,30 +578,34 @@ class DeepONet(BaseModel):
         """
         params: dict with keys ("eta", "rho", "H", "xi0_knots")
         Uses self.strikes / self.maturities to build trunk coords.
-        Returns (nT, nK) numpy array.
+        Returns (nT, nK) numpy array in ORIGINAL IV scale (inverse-transformed).
         """
         assert self.strikes is not None and self.maturities is not None, \
             "DeepONet needs self.strikes/self.maturities set; call set_grid or train/prepare first."
+        assert self.param_bounds is not None, "param_bounds must be set for scaling"
+        assert self.output_scaler is not None, "output_scaler must be fitted"
 
-        xi0_knots = np.array(params["xi0_knots"]).flatten()
-        branch_vec = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots]).astype(np.float32)
+        xi0_knots = np.array(params["xi0_knots"]).flatten().astype(np.float32)
+        param_vec = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots]).astype(np.float32)
+        xb_np = self.scale_params(param_vec)  # [-1,1]
 
         K_mesh, T_mesh = np.meshgrid(self.strikes, self.maturities)
         trunk_coords = np.stack([K_mesh.flatten(), T_mesh.flatten()], axis=1).astype(np.float32)
 
         with torch.no_grad():
-            xb = torch.tensor(branch_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+            xb = torch.tensor(xb_np, dtype=torch.float32, device=self.device).unsqueeze(0)
             xb = xb.repeat(len(trunk_coords), 1)
             xt = torch.tensor(trunk_coords, dtype=torch.float32, device=self.device)
-            pred = self.forward(xb, xt)  # (nPts, 1)
+            pred_scaled = self.forward(xb, xt)  # (nPts, 1) in scaled IV space
 
-        surface = pred.detach().cpu().numpy().reshape(len(self.maturities), len(self.strikes))
-
+        pred_scaled_np = pred_scaled.detach().cpu().numpy().reshape(-1)  # (nPts,)
+        pred_iv = self.inverse_transform_output_single(pred_scaled_np)   # back to original IV
+        surface = pred_iv.reshape(len(self.maturities), len(self.strikes))
         return surface
 
 
 # ============================================================
-# MLP_IVSurface (self-contained)
+# MLP (self-contained)
 # ============================================================
 
 class MLP(BaseModel):
@@ -346,7 +614,7 @@ class MLP(BaseModel):
     Output is the full (nT, nK) surface predicted in one shot.
     """
     def __init__(self, input_dim=None, output_shape=None, hidden_dims=(256, 256, 256),
-                 activation="gelu", lr=1e-3):
+                 activation="elu", lr=1e-3):
         super().__init__()
         self.input_dim = input_dim
         self.output_shape = output_shape  # (nT, nK)
@@ -377,11 +645,7 @@ class MLP(BaseModel):
 
     # --------------------------------------------------------
     @staticmethod
-    def prepare_data(surfaces, batch_size=64, val_split=0.2, shuffle=True, sanity_check_grids=True):
-        """
-        Converts list of surfaces into param vectors + full surfaces.
-        Returns: train_loader, val_loader, input_dim, output_shape, strikes, maturities
-        """
+    def _stack_XY(surfaces, sanity_check_grids=True):
         X_list, Y_list = [], []
         Ks_ref, Ts_ref = None, None
 
@@ -400,15 +664,34 @@ class MLP(BaseModel):
 
             xi0_knots = np.array(params["xi0_knots"]).flatten()
             param_vec = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots]).astype(np.float32)
-
             X_list.append(param_vec)
             Y_list.append(iv_surface)
 
         X = np.stack(X_list, axis=0)   # (N, d)
         Y = np.stack(Y_list, axis=0)   # (N, nT, nK)
+        strikes = Ks_ref if Ks_ref is not None else np.array(surfaces[0]["grid"]["strikes"], dtype=np.float32)
+        maturities = Ts_ref if Ts_ref is not None else np.array(surfaces[0]["grid"]["maturities"], dtype=np.float32)
+        return X, Y, strikes, maturities
+
+    @classmethod
+    def from_surfaces(cls, surfaces, batch_size=32, val_split=0.2, shuffle=True,
+                      hidden_dims=(256, 256, 256), activation="gelu", lr=1e-3,
+                      eta=(0.5, 4.0), rho=(0.0, 1.0), H=(0.025, 0.5), knot=(0.01, 0.16)):
+        """
+        Build an MLP model + loaders with internal, leakage-safe scaling:
+          - Param vector scaled to [-1, 1] using provided bounds
+          - Output (IV) scaled via StandardScaler fit on train only
+        Returns: model, train_loader, val_loader, strikes, maturities
+        """
+        X, Y, strikes, maturities = cls._stack_XY(surfaces)
         nT, nK = Y.shape[1:]
         input_dim = X.shape[1]
         output_shape = (nT, nK)
+
+        # Build param bounds for the vector [eta, rho, H, knots...]
+        num_knots = input_dim - 3
+        lb, ub = BaseModel._make_param_bounds(num_knots, eta=eta, rho=rho, H=H, knot=knot)
+        X_scaled = BaseModel._scale_to_m1_p1(X, lb, ub)
 
         # Split
         n_total = len(Y)
@@ -418,36 +701,101 @@ class MLP(BaseModel):
             np.random.shuffle(idx)
         tr, va = idx[:n_train], idx[n_train:]
 
-        Xtr = torch.tensor(X[tr], dtype=torch.float32)
-        Ytr = torch.tensor(Y[tr], dtype=torch.float32)
-        Xva = torch.tensor(X[va], dtype=torch.float32)
-        Yva = torch.tensor(Y[va], dtype=torch.float32)
+        # Fit output scaler on train only
+        model = cls(input_dim=input_dim, output_shape=output_shape, hidden_dims=hidden_dims,
+                    activation=activation, lr=lr)
+        model.set_grid(strikes, maturities)
+        model.set_io_dims(input_dim=input_dim, output_shape=output_shape)
+        model.set_param_bounds(lb, ub)
+        model.fit_output_scaler(Y[tr])
+
+        # Transform outputs
+        Y_tr_scaled = model.transform_output(Y[tr])
+        Y_va_scaled = model.transform_output(Y[va])
+
+        # Tensors
+        Xtr = torch.tensor(X_scaled[tr], dtype=torch.float32)
+        Ytr = torch.tensor(Y_tr_scaled, dtype=torch.float32)
+        Xva = torch.tensor(X_scaled[va], dtype=torch.float32)
+        Yva = torch.tensor(Y_va_scaled, dtype=torch.float32)
 
         train_loader = DataLoader(TensorDataset(Xtr, Ytr), batch_size=batch_size, shuffle=True)
         val_loader   = DataLoader(TensorDataset(Xva, Yva), batch_size=2 * batch_size, shuffle=False)
 
-        strikes = Ks_ref if Ks_ref is not None else np.array(surfaces[0]["grid"]["strikes"], dtype=np.float32)
-        maturities = Ts_ref if Ts_ref is not None else np.array(surfaces[0]["grid"]["maturities"], dtype=np.float32)
-
-        return train_loader, val_loader, input_dim, output_shape, strikes, maturities
+        # Ensure network is built (already in __init__)
+        return model, train_loader, val_loader, strikes, maturities
 
     # --------------------------------------------------------
-    def train_model(self, train_loader, val_loader=None, epochs=50):
+    def train_model(
+        self,
+        train_loader,
+        val_loader=None,
+        epochs=50,
+        lr_schedule=[(0, 1e-3), (30, 5e-4), (60, 1e-4)],
+    ):
+        """
+        Train the MLP model with optional learning rate schedule.
+
+        Parameters
+        ----------
+        train_loader : DataLoader
+            Training data loader.
+        val_loader : DataLoader, optional
+            Validation data loader.
+        epochs : int, default=50
+            Total number of training epochs.
+        lr_schedule : list of (int, float), optional
+            List of (epoch, lr) tuples defining when to update the learning rate.
+            Example: [(0, 1e-3), (30, 5e-4), (60, 1e-4)]
+            Learning rate changes at each specified epoch (>= threshold).
+        """
+        # Sort schedule for safety
+        lr_schedule = sorted(lr_schedule, key=lambda x: x[0])
+        schedule_index = 0
+
+        # Initialize to first LR
+        base_lr = lr_schedule[0][1]
+        for g in self.optimizer.param_groups:
+            g["lr"] = base_lr
+
         for epoch in range(epochs):
-            self.train(); total = 0.0
+            # Check if learning rate needs to be updated
+            if (
+                schedule_index + 1 < len(lr_schedule)
+                and epoch >= lr_schedule[schedule_index + 1][0]
+            ):
+                schedule_index += 1
+                new_lr = lr_schedule[schedule_index][1]
+                for g in self.optimizer.param_groups:
+                    g["lr"] = new_lr
+                print(f"→ Adjusted learning rate to {new_lr:.2e} at epoch {epoch}")
+
+            self.train()
+            total = 0.0
             for x, y in tqdm(train_loader, desc=f"Train {epoch+1}", leave=False):
                 x, y = x.to(self.device), y.to(self.device)
                 pred = self.forward(x)
                 loss = self.criterion(pred, y)
-                self.optimizer.zero_grad(); loss.backward(); self.optimizer.step()
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
                 total += loss.item() * len(y)
+
             train_rmse = float(np.sqrt(total / len(train_loader.dataset)))
 
             if val_loader is not None:
                 val_rmse = float(np.sqrt(self.validate(val_loader)))
-                print(f"Epoch {epoch+1:03d} | train_rmse={train_rmse:.6f}, val_rmse={val_rmse:.6f}")
+                print(
+                    f"Epoch {epoch+1:03d} | "
+                    f"train_rmse={train_rmse:.6f}, val_rmse={val_rmse:.6f}, "
+                    f"lr={self.optimizer.param_groups[0]['lr']:.1e}"
+                )
             else:
-                print(f"Epoch {epoch+1:03d} | train_rmse={train_rmse:.6f}")
+                print(
+                    f"Epoch {epoch+1:03d} | "
+                    f"train_rmse={train_rmse:.6f}, "
+                    f"lr={self.optimizer.param_groups[0]['lr']:.1e}"
+                )
 
     def validate(self, val_loader):
         self.eval(); total = 0.0
@@ -455,56 +803,51 @@ class MLP(BaseModel):
             for x, y in val_loader:
                 x, y = x.to(self.device), y.to(self.device)
                 total += self.criterion(self.forward(x), y).item() * len(y)
-        return total / len(val_loader.dataset)
+        return total / len(val_loader.dataset)   
 
     # --------------------------------------------------------
-    def predict_surface(self, params, store_last: bool = True):
+    def predict_surface(self, params):
         """
         params: dict with keys ("eta", "rho", "H", "xi0_knots")
         Uses stored output shape and grid.
-        Returns (nT, nK) numpy array.
+        Returns (nT, nK) numpy array in ORIGINAL IV scale (inverse-transformed).
         """
         assert self.output_shape is not None, "MLP needs output_shape set."
         assert self.strikes is not None and self.maturities is not None, \
             "MLP needs self.strikes/self.maturities set; call set_grid or train/prepare first."
+        assert self.param_bounds is not None, "param_bounds must be set for scaling"
+        assert self.output_scaler is not None, "output_scaler must be fitted"
 
-        xi0_knots = np.array(params["xi0_knots"]).flatten()
+        xi0_knots = np.array(params["xi0_knots"]).flatten().astype(np.float32)
         x = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots]).astype(np.float32)
-        x = torch.tensor(x, dtype=torch.float32, device=self.device).unsqueeze(0)
+        x_scaled = self.scale_params(x)
 
         with torch.no_grad():
-            pred = self.forward(x)  # (1, nT, nK)
+            x_t = torch.tensor(x_scaled, dtype=torch.float32, device=self.device).unsqueeze(0)
+            pred_scaled = self.forward(x_t)  # (1, nT, nK) in scaled IV space
 
-        surface = pred.squeeze(0).detach().cpu().numpy()
-
+        pred_scaled_np = pred_scaled.squeeze(0).detach().cpu().numpy()
+        surface = self.inverse_transform_surface(pred_scaled_np)
         # Safety: ensure shape matches grid
         nT, nK = self.output_shape
         if surface.shape != (nT, nK):
             surface = surface.reshape(nT, nK)
-
-        if store_last:
-            self._last_pred = surface
-            self._last_params = params
         return surface
 
 
 # ============================================================
 # Usage Notes (example)
 # ============================================================
-# DeepONet:
-#   train_loader, val_loader, bdim, Ks, Ts = DeepONet.prepare_data(train_surfaces)
-#   model = DeepONet(branch_in_dim=bdim, latent_dim=64, hidden_dim=64, lr=1e-3)
-#   model.set_grid(Ks, Ts)
-#   model.set_io_dims(input_dim=bdim)
+# DeepONet (with internal scaling):
+#   model, train_loader, val_loader, Ks, Ts = DeepONet.from_surfaces(train_surfaces,
+#       batch_size=256, val_split=0.2, eta=(0.5,4.0), rho=(0.0,1.0), H=(0.025,0.5), knot=(0.01,0.16))
 #   model.train_model(train_loader, val_loader, epochs=100)
-#   fig = model.plot_evaluation(test_surfaces[0])  # no extra args needed
-#   model.evaluate_and_save(test_surfaces, out_dir="deeponet_eval")
-
-# MLP:
-#   train_loader, val_loader, in_dim, out_shape, Ks, Ts = MLP_IVSurface.prepare_data(train_surfaces)
-#   mlp = MLP_IVSurface(input_dim=in_dim, output_shape=out_shape, hidden_dims=(256,256,256), lr=1e-3)
-#   mlp.set_grid(Ks, Ts)
-#   mlp.set_io_dims(input_dim=in_dim, output_shape=out_shape)
-#   mlp.train_model(train_loader, val_loader, epochs=100)
-#   fig = mlp.plot_evaluation(test_surfaces[0])
-#   mlp.evaluate_and_save(test_surfaces, out_dir="mlp_eval")
+#   fig = model.plot_evaluation(test_surfaces[0])
+#   model.evaluate(test_surfaces, out_dir="deeponet_eval")
+#
+# MLP (with internal scaling):
+#   model, train_loader, val_loader, Ks, Ts = MLP.from_surfaces(train_surfaces,
+#       batch_size=32, val_split=0.2, hidden_dims=(256,256,256), eta=(0.5,4.0), rho=(0.0,1.0), H=(0.025,0.5), knot=(0.01,0.16))
+#   model.train_model(train_loader, val_loader, epochs=100)
+#   fig = model.plot_evaluation(test_surfaces[0])
+#   model.evaluate(test_surfaces, out_dir="mlp_eval")

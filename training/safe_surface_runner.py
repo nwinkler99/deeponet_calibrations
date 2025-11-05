@@ -22,8 +22,8 @@ else:
     SAVE_ROOT = "data/fixed_longrun"  # root directory for all runs
 SLEEP_ON_ERROR = 30              # seconds to wait after failure before retry
 SEED_BASE = 123                  # deterministic seed offset per batch
-MAX_WORKERS = 6                  # number of CPU cores to use
-CHUNK_SIZE = 10                  # number of parameter sets per worker
+MAX_WORKERS = 4                  # number of CPU cores to use
+CHUNK_SIZE = 15                  # number of parameter sets per worker
 
 os.makedirs(SAVE_ROOT, exist_ok=True)
 
@@ -117,8 +117,15 @@ def generate_surfaces_parallel(num_sets=1,
     print(f"Using {max_workers} CPU workers | chunk_size={chunk_size}")
 
     # Create deterministic, non-overlapping seeds for each param set
-    seeds = [seed + 10000 * i for i in range(num_sets)]
+    seeds = [seed + i for i in range(num_sets)]
     chunks = [seeds[i:i + chunk_size] for i in range(0, len(seeds), chunk_size)]
+
+    # --- Inspect which seeds each worker will receive ---
+    chunk_starts = [chunk[0] for chunk in chunks]
+    print("\nPlanned worker seed allocation:")
+    for i, s in enumerate(chunk_starts):
+        print(f"  Worker {i+1:<2d}: seed={s}   handles {len(chunks[i])} param sets ({chunks[i][0]}..{chunks[i][-1]})")
+    print()
 
     all_surfaces = []
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
@@ -134,6 +141,7 @@ def generate_surfaces_parallel(num_sets=1,
             )
             for chunk in chunks
         ]
+
 
         for fut in as_completed(futures):
             try:
@@ -159,7 +167,7 @@ if __name__ == "__main__":
 
         try:
             t0 = time.time()
-            batch_seed = SEED_BASE + batch_idx * 10000
+            batch_seed = SEED_BASE + batch_idx * BATCH_SIZE
 
             surfaces = generate_surfaces_parallel(
                 num_sets=BATCH_SIZE,

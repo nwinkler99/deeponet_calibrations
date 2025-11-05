@@ -1,0 +1,11 @@
+- count number of parameters and speed 
+- allow saving of model parameters
+- formulate each network in numpy after training and check speeds 
+
+- implement interpolation
+- test on irregular grids
+- built the calibration code
+
+Later:
+- build FNO
+- 

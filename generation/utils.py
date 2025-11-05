@@ -139,7 +139,8 @@ class RBergomiParams:
 
 def sample_param_sets_lhs(num_sets: int, rng: np.random.RandomState) -> List[RBergomiParams]:
     """Sample (eta, rho, H) via Latin Hypercube, fully tied to rng."""
-    sampler = qmc.LatinHypercube(d=3, seed=rng)
+    sampler_seed = rng.randint(0, 2**31 - 1)
+    sampler = qmc.LatinHypercube(d=3, seed=sampler_seed)
     sample = sampler.random(num_sets)
 
     lower = np.array([0.5, -0.95, 0.025])
@@ -264,3 +265,66 @@ def plot_iv_surface(
 
     plt.tight_layout()
     plt.show()
+
+
+import numpy as np
+from scipy.ndimage import convolve
+def repair_edges_local_directional(iv_surface: np.ndarray,
+                                   maturities: np.ndarray,
+                                   strikes: np.ndarray,
+                                   t_threshold: float = 0.35,
+                                   dtype: np.dtype = np.float32,
+                                   min_floor: float = 0.05) -> np.ndarray:
+    """
+    Lightweight, local edge stabilization for short maturities.
+    - Fills NaNs row/col-wise.
+    - Lifts left/right edges of short-maturity rows toward neighbors.
+    - Smoothly replaces values < min_floor with weighted 3×3 Gaussian-style local mean.
+    """
+    iv = np.array(iv_surface, dtype=dtype, copy=True)
+    nT, nK = iv.shape
+
+    # --- Row-wise NaN fill
+    for i in range(nT):
+        row = iv[i]
+        if np.any(np.isnan(row)):
+            valid = ~np.isnan(row)
+            if np.any(valid):
+                iv[i] = np.interp(
+                    np.arange(nK),
+                    np.arange(nK)[valid],
+                    row[valid],
+                    left=row[valid][0],
+                    right=row[valid][-1],
+                )
+            else:
+                iv[i] = np.nan
+
+    # --- Column-wise fill
+    if np.isnan(iv).any():
+        col_means = np.nanmean(iv, axis=0)
+        for j in range(nK):
+            nan_idx = np.isnan(iv[:, j])
+            if np.any(nan_idx):
+                iv[nan_idx, j] = col_means[j]
+    iv = np.nan_to_num(iv, nan=np.nanmean(iv)).astype(dtype)
+
+
+    # --- Weighted local-mean correction for values < min_floor
+    mask_rows = maturities <= 1000
+    if np.any(mask_rows):
+        iv_short = iv[mask_rows]
+
+        # Gaussian-like kernel (center-heavy)
+        kernel = np.array([[1, 2, 1],
+                           [2, 4, 2],
+                           [1, 2, 1]], dtype=np.float32)
+        kernel /= kernel.sum()
+
+        local_mean = convolve(iv_short, kernel, mode="reflect")
+
+        mask_low = iv_short < min_floor
+        iv_short[mask_low] = local_mean[mask_low]
+        iv[mask_rows] = iv_short
+
+    return iv.astype(dtype)
