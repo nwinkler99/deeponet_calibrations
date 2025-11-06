@@ -73,8 +73,7 @@ def generate_surfaces(
     cfg: SimulationConfig = None,
     seed: int = 42,
     randomize_grid: bool = False,
-    grid_jitter: float = 0.25,
-    save_every: int = 200,
+    grid_jitter: float = 0.5
 ) -> List[Dict]:
     """
     Generate implied-volatility surfaces from the rBergomi model using Monte Carlo simulation.
@@ -84,11 +83,8 @@ def generate_surfaces(
         sigma_path^2 = (1 - rho^2) * ∫Vds / T.
     Computes iv_rel_error as 1.96 * SE_iv / iv.
     """
-    now = datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
-
-    save_dir = os.path.join("data", date_str if randomize_grid else "fixed_longrun")
-    os.makedirs(save_dir, exist_ok=True)
+    #save_dir = os.path.join("data", date_str if randomize_grid else "fixed_longrun")
+    #os.makedirs(save_dir, exist_ok=True)
 
     results: List[Dict] = []
     rng = np.random.RandomState(seed)
@@ -139,13 +135,13 @@ def generate_surfaces(
             I2_cum = np.cumsum(V_left * dt_incr[None, :], axis=1, dtype=cfg.dtype)
 
             for g_id in range(cfg.G):
-                if randomize_grid:
+                if randomize_grid and g_id > 0:
                     strikes_shifted = np.array(
-                        jitter_grid(strikes_base, grid_jitter=grid_jitter, min_spacing=0.05),
+                        jitter_grid(strikes_base, grid_jitter=grid_jitter, min_spacing=0.02),
                         dtype=cfg.dtype,
                     )
                     maturities_shifted = np.array(
-                        jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.05),
+                        jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.02),
                         dtype=cfg.dtype,
                     )
                 else:

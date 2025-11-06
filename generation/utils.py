@@ -159,7 +159,7 @@ def sample_param_sets_lhs(num_sets: int, rng: np.random.RandomState) -> List[RBe
     return param_sets
 
 
-def jitter_grid(base_grid: np.ndarray, grid_jitter: float = 0.25, min_spacing: float = 0.1) -> np.ndarray:
+def jitter_grid(base_grid: np.ndarray, grid_jitter: float = 0.5, min_spacing: float = 0.05) -> np.ndarray:
     """
     Randomly perturb a base grid while keeping minimum spacing.
     Returns float64; caller can cast to cfg.dtype.

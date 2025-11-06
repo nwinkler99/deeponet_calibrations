@@ -10,24 +10,48 @@ from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from generation.surface_generation import generate_surfaces, SimulationConfig
 
+import argparse
+
+parser = argparse.ArgumentParser(description="Parallel surface generation")
+
+parser.add_argument("--startbatch", type=int, default=0,
+                    help="Index of first batch to start from")
+parser.add_argument("--numbatches", type=int, default=1000,
+                    help="Total number of batches to run")
+parser.add_argument("--batchsize", type=int, default=60,
+                    help="Number of parameter sets per batch")
+parser.add_argument("--sleep", type=int, default=30,
+                    help="Seconds to wait after failure before retry")
+parser.add_argument("--seedbase", type=int, default=1234567,
+                    help="Deterministic seed offset per batch")
+parser.add_argument("--maxworkers", type=int, default=4,
+                    help="Number of CPU cores to use")
+parser.add_argument("--randomizegrid", action="store_true",
+                    help="Randomize time grid per param set")
+parser.add_argument("--chunk", type=int, default=None,
+                    help="Chunk size per worker (default: batchsize / maxworkers)")
+
+args = parser.parse_args()
+
 # ==========================================
 # CONFIGURATION
 # ==========================================
-randomize_grid = False        # whether to randomize time grid per param set
-NUM_BATCHES = 100                # total number of batches to run
-BATCH_SIZE = 60     
+randomize_grid = True #args.randomizegrid
+NUM_BATCHES = args.numbatches
+BATCH_SIZE = args.batchsize
+SLEEP_ON_ERROR = args.sleep
+SEED_BASE = args.seedbase
+MAX_WORKERS = args.maxworkers
+CHUNK_SIZE = args.chunk or int(BATCH_SIZE // MAX_WORKERS)
+START_BATCH = args.startbatch
+
 if randomize_grid:             # number of parameter sets per batch
     SAVE_ROOT = "data/longrun" # root directory for all runs
 else:
     SAVE_ROOT = "data/fixed_longrun"  # root directory for all runs
-SLEEP_ON_ERROR = 30              # seconds to wait after failure before retry
-SEED_BASE = 123                  # deterministic seed offset per batch
-MAX_WORKERS = 4                  # number of CPU cores to use
-CHUNK_SIZE = 15                  # number of parameter sets per worker
-
 os.makedirs(SAVE_ROOT, exist_ok=True)
 
-cfg = SimulationConfig(M=50000, n=int(2.1*252), T_max=2.1, S0=1.0, G=1, dtype=np.float32)
+cfg = SimulationConfig(M=50000, n=int(2.1*252), T_max=2.1, S0=1.0, G=2, dtype=np.float32)
 
 # ==========================================
 # HELPER FUNCTIONS
@@ -58,15 +82,11 @@ def save_checkpoint(batch_idx, data, randomized=randomize_grid):
 def worker_generate_surfaces(chunk_seeds,
                              forward_curves_per_set,
                              cfg,
-                             randomize_grid,
-                             grid_jitter,
-                             save_every):
+                             randomize_grid):
     """
     Top-level worker for multiprocessing.
     Each worker handles one chunk of seeds, processed in a single call to generate_surfaces().
     """
-    import os
-    from generation.surface_generation import generate_surfaces
 
     chunk_seed = chunk_seeds[0]
     print(f"[PID {os.getpid()}] Generating {len(chunk_seeds)} param sets (seed={chunk_seed})")
@@ -77,9 +97,7 @@ def worker_generate_surfaces(chunk_seeds,
             forward_curves_per_set=forward_curves_per_set,
             cfg=cfg,
             seed=chunk_seed,
-            randomize_grid=randomize_grid,
-            grid_jitter=grid_jitter,
-            save_every=save_every,
+            randomize_grid=randomize_grid
         )
         return res
 
@@ -97,8 +115,6 @@ def generate_surfaces_parallel(num_sets=1,
                                cfg=None,
                                seed=42,
                                randomize_grid=randomize_grid,
-                               grid_jitter=0.25,
-                               save_every=200,
                                max_workers=None,
                                chunk_size=None):
     """
@@ -135,9 +151,7 @@ def generate_surfaces_parallel(num_sets=1,
                 chunk,
                 forward_curves_per_set,
                 cfg,
-                randomize_grid,
-                grid_jitter,
-                save_every,
+                randomize_grid
             )
             for chunk in chunks
         ]
@@ -157,9 +171,11 @@ def generate_surfaces_parallel(num_sets=1,
 # MAIN LOOP
 # ==========================================
 
+
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
-    START_BATCH = 0
+    START_BATCH = args.startbatch
+
     print(" Starting long-run data generation...\n")
 
     for batch_idx in range(START_BATCH, NUM_BATCHES):
@@ -174,7 +190,7 @@ if __name__ == "__main__":
                 forward_curves_per_set=10,
                 cfg=cfg,
                 seed=batch_seed,
-                randomize_grid=False,
+                randomize_grid=randomize_grid,
                 max_workers=MAX_WORKERS,
                 chunk_size=CHUNK_SIZE,
             )

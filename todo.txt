@@ -1,5 +1,5 @@
 - count number of parameters and speed 
-- allow saving of model parameters
+- allow saving of NN parameters
 - formulate each network in numpy after training and check speeds 
 
 - implement interpolation
@@ -8,4 +8,4 @@
 
 Later:
 - build FNO
-- 
+- calibrate real data
