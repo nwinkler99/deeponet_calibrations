@@ -9,3 +9,11 @@
 Later:
 - build FNO
 - calibrate real data
+
+
+fixed grid: 
+training time and accuracy on test data across K,T. 
+
+variable grid: 
+training time and accuracy on test data across irregular grids, but binned. 
+also inference speed on full and small grids in the numpy and pytorch variant
