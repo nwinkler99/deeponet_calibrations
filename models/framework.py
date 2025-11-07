@@ -101,11 +101,11 @@ class BaseModel(nn.Module):
                 "output_scaler": {
                     "mean_": self.output_scaler.mean_.tolist(),
                     "scale_": self.output_scaler.scale_.tolist(),
-                } if self.output_scaler is not None else None
+                } if self.output_scaler is not None else None,
+                "strikes": self.strikes.tolist() if self.strikes is not None else None,
+                "maturities": self.maturities.tolist() if self.maturities is not None else None,
             }
-            if self.strikes is not None and self.maturities is not None:
-                export["meta"]["strikes"] = self.strikes.tolist()
-                export["meta"]["maturities"] = self.maturities.tolist()
+
 
 
         # --- DeepONet ---
@@ -137,6 +137,8 @@ class BaseModel(nn.Module):
                     "mean_": self.output_scaler.mean_.tolist(),
                     "scale_": self.output_scaler.scale_.tolist(),
                 } if self.output_scaler is not None else None,
+                "strikes": self.strikes.tolist() if self.strikes is not None else None,
+                "maturities": self.maturities.tolist() if self.maturities is not None else None,
             }
 
         else:
@@ -412,7 +414,8 @@ class BaseModel(nn.Module):
         according to the model's base grid (self.strikes, self.maturities).
 
         Works even if each sample has an irregular or different (K,T) grid.
-        Produces heatmaps of mean/median/max relative error [%].
+        Produces heatmaps of mean/median/max relative error [%],
+        MC sampling error [%], and absolute error.
         """
         assert self.strikes is not None and self.maturities is not None, \
             "Model grid (strikes/maturities) not set; call set_grid first."
@@ -420,8 +423,10 @@ class BaseModel(nn.Module):
 
         nT, nK = len(self.maturities), len(self.strikes)
 
-        # Initialize bins as lists to accumulate per-point errors
-        bin_errs = [[[] for _ in range(nK)] for _ in range(nT)]
+        # Initialize bins for predicted rel error, abs error, and MC rel error
+        bin_errs_rel = [[[] for _ in range(nK)] for _ in range(nT)]
+        bin_errs_abs = [[[] for _ in range(nK)] for _ in range(nT)]
+        bin_errs_mc = [[[] for _ in range(nK)] for _ in range(nT)]
 
         for s in surface_samples:
             params = s["params"]
@@ -433,55 +438,108 @@ class BaseModel(nn.Module):
 
             pred_surface = self.predict_surface(params, grid=grid)
             rel_err = np.abs(true_surface - pred_surface) / np.clip(true_surface, 1e-6, None) * 100.0
+            abs_err = np.abs(true_surface - pred_surface)
 
-            # Assign each error to nearest bin on base grid
+            mc_rel_err = np.array(s.get("iv_rel_error", np.zeros_like(true_surface)), dtype=np.float32) * 100.0
+
+            # --- fill NaNs in mc_rel_err dynamically ---
+            nan_mask = np.isnan(mc_rel_err)
+            if np.any(nan_mask):
+                mc_rel_err = np.where(nan_mask, 0.0, mc_rel_err)  # temporary fill
+
+            # Assign errors to nearest bin on base grid
             for ti, T in enumerate(Ts):
                 t_idx = np.argmin(np.abs(self.maturities - T))
                 for ki, K in enumerate(Ks):
                     k_idx = np.argmin(np.abs(self.strikes - K))
-                    bin_errs[t_idx][k_idx].append(rel_err[ti, ki])
 
-        # Compute aggregated stats
-        mean_err = np.full((nT, nK), np.nan, dtype=np.float32)
-        median_err = np.full((nT, nK), np.nan, dtype=np.float32)
-        max_err = np.full((nT, nK), np.nan, dtype=np.float32)
+                    # --- predicted errors ---
+                    bin_errs_rel[t_idx][k_idx].append(rel_err[ti, ki])
+                    bin_errs_abs[t_idx][k_idx].append(abs_err[ti, ki])
 
-        for t in range(nT):
-            for k in range(nK):
-                vals = bin_errs[t][k]
-                if len(vals) > 0:
-                    mean_err[t, k] = np.mean(vals)
-                    median_err[t, k] = np.median(vals)
-                    max_err[t, k] = np.max(vals)
+                    # --- MC rel error (handle NaN replacement with bin mean) ---
+                    val = mc_rel_err[ti, ki]
+                    if np.isnan(val):
+                        prev_vals = bin_errs_mc[t_idx][k_idx]
+                        if prev_vals:
+                            val = float(np.mean(prev_vals))  # replace with bin mean so far
+                        else:
+                            val = 0.0
+                    bin_errs_mc[t_idx][k_idx].append(val)
 
-        # Fill NaNs with global means
-        global_mean = np.nanmean(mean_err)
-        for arr in [mean_err, median_err, max_err]:
-            arr[np.isnan(arr)] = global_mean
+        def aggregate_bins(bin_errs):
+            mean = np.full((nT, nK), np.nan, dtype=np.float32)
+            median = np.full((nT, nK), np.nan, dtype=np.float32)
+            maxv = np.full((nT, nK), np.nan, dtype=np.float32)
+            for t in range(nT):
+                for k in range(nK):
+                    vals = bin_errs[t][k]
+                    if vals:
+                        mean[t, k] = np.mean(vals)
+                        median[t, k] = np.median(vals)
+                        maxv[t, k] = np.max(vals)
+            global_mean = np.nanmean(mean)
+            for arr in [mean, median, maxv]:
+                arr[np.isnan(arr)] = global_mean
+            return mean, median, maxv, global_mean
 
-        # --- Plot ---
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        mean_rel, median_rel, max_rel, global_mean_rel = aggregate_bins(bin_errs_rel)
+        mean_abs, median_abs, max_abs, global_mean_abs = aggregate_bins(bin_errs_abs)
+        mean_mc, median_mc, max_mc, global_mean_mc = aggregate_bins(bin_errs_mc)
+
+        # --- Plotting ---
         Ks_mesh, Ts_mesh = np.meshgrid(self.strikes, self.maturities, indexing="xy")
 
-        for ax, data, title in zip(
-            axes,
-            [mean_err, median_err, max_err],
-            ["Mean Rel Error (Pred)", "Median Rel Error (Pred)", "Max Rel Error (Pred)"]
-        ):
-            im = ax.pcolormesh(Ks_mesh, Ts_mesh, data, cmap="magma", shading="auto")
-            ax.set_xlabel("Strike (K)")
-            ax.set_ylabel("Maturity (T)")
-            ax.set_title(f"{title} [%]")
-            ax.invert_yaxis()
-            fig.colorbar(im, ax=ax, label="%")
+        def plot_set(data_triplet, titles, fname, label):
+            fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+            for ax, data, title in zip(axes, data_triplet, titles):
+                im = ax.pcolormesh(Ks_mesh, Ts_mesh, data, cmap="magma", shading="auto")
+                ax.set_xlabel("Strike (K)")
+                ax.set_ylabel("Maturity (T)")
+                ax.set_title(f"{title}")
+                ax.invert_yaxis()
+                fig.colorbar(im, ax=ax, label=label)
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, fname), dpi=200)
+            plt.close(fig)
 
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "iv_error_heatmaps_binned.png"), dpi=200)
+        # Predicted relative error
+        plot_set(
+            [mean_rel, median_rel, max_rel],
+            ["Mean Rel Error (Pred)", "Median Rel Error (Pred)", "Max Rel Error (Pred)"],
+            "iv_error_heatmaps_binned.png",
+            "%"
+        )
+
+        # Absolute error
+        plot_set(
+            [mean_abs, median_abs, max_abs],
+            ["Mean Abs Error (Pred)", "Median Abs Error (Pred)", "Max Abs Error (Pred)"],
+            "iv_abs_error_heatmaps_binned.png",
+            "abs(IV diff)"
+        )
+
+        # Monte Carlo sampling relative error
+        plot_set(
+            [mean_mc, median_mc, max_mc],
+            ["Mean Rel Error (MC)", "Median Rel Error (MC)", "Max Rel Error (MC)"],
+            "iv_mc_rel_error_heatmaps_binned.png",
+            "%"
+        )
 
         return {
-            "pred_rel": {"mean": mean_err, "median": median_err, "max": max_err},
-            "global_mean": float(global_mean),
+            "pred_rel": {"mean": mean_rel, "median": median_rel, "max": max_rel},
+            "pred_abs": {"mean": mean_abs, "median": median_abs, "max": max_abs},
+            "mc_rel": {"mean": mean_mc, "median": median_mc, "max": max_mc},
+            "global_mean": {
+                "pred_rel": float(global_mean_rel),
+                "pred_abs": float(global_mean_abs),
+                "mc_rel": float(global_mean_mc),
+            },
         }
+
+
+    
 
 
     def count_parameters(self, trainable_only=True):
@@ -613,7 +671,7 @@ class DeepONet(BaseModel):
     @classmethod
     def from_surfaces(cls, surfaces, batch_size=256, val_split=0.2, shuffle=True,
                     branch_hidden_dims=(64, 64), trunk_hidden_dims=(64, 64),
-                    activation="relu", lr=1e-3, latent_dim=64):
+                    activation="relu", lr=1e-3, latent_dim=64, ref_strikes=None, ref_maturities = None):
         """
         Build a DeepONet model + loaders with internal, leakage-safe scaling:
         - Branch inputs scaled to [-1, 1] using empirical min/max (+5% margin)
@@ -622,6 +680,10 @@ class DeepONet(BaseModel):
         """
         # Flatten all surface data into arrays
         X_branch, X_trunk, Y, strikes, maturities = cls._flatten_surfaces_for_deeponet(surfaces)
+        if ref_strikes is not None:
+            strikes = ref_strikes
+        if ref_maturities is not None:
+            maturities = ref_maturities
 
         # --- Empirical parameter bounds with safety margin ---
         lb = np.min(X_branch, axis=0)
@@ -1105,8 +1167,17 @@ class MLP(BaseModel):
         Ks_target = np.asarray(grid["strikes"], dtype=np.float32)
         Ts_target = np.asarray(grid["maturities"], dtype=np.float32)
 
-        if np.allclose(Ks_target, base_Ks) and np.allclose(Ts_target, base_Ts):
-            return base_surface  # identical grid, no need to interpolate
+        same_shape = (
+            base_Ks is not None
+            and base_Ts is not None
+            and len(base_Ks) == len(Ks_target)
+            and len(base_Ts) == len(Ts_target)
+        )
+
+        if same_shape:
+            if np.allclose(Ks_target, base_Ks) and np.allclose(Ts_target, base_Ts):
+                # identical grid → no interpolation
+                return base_surface
 
         # --- Interpolation ---
         if interp_method == "spline":
@@ -1172,8 +1243,9 @@ class NumpyModel:
         self.input_dim = self.meta.get("input_dim", None)
 
         # Add base grid info
-        self.strikes = np.array(self.meta.get("strikes", []), dtype=np.float32)
-        self.maturities = np.array(self.meta.get("maturities", []), dtype=np.float32)
+        self.strikes = np.array(self.meta.get("strikes"), dtype=np.float32) if self.meta.get("strikes") is not None else None
+        self.maturities = np.array(self.meta.get("maturities"), dtype=np.float32) if self.meta.get("maturities") is not None else None
+
 
     # ------------------------------------------------------------
     # Loading
@@ -1261,30 +1333,16 @@ class NumpyModel:
     # ------------------------------------------------------------
     # Predict (core)
         # ------------------------------------------------------------
-    def predict(self, x_raw, grid=None, interp_method="spline"):
+
+    def predict_surface(self, params, grid=None, interp_method="spline", verbose=True):
         """
         Unified prediction interface for MLP and DeepONet NumPy models.
-
-        Parameters
-        ----------
-        x_raw : np.ndarray
-            Parameter vector(s), shape (N, d)
-            Example: [[eta, rho, H, xi0_1, ..., xi0_n]]
-        grid : dict, optional
-            For both MLP and DeepONet: {"strikes": array, "maturities": array}
-            Defines the (K, T) grid for evaluation.
-            - MLP: used for optional interpolation.
-            - DeepONet: converted into point coordinates for trunk input.
-        interp_method : str, default="spline"
-            For MLP interpolation only ("spline", "linear", or "nearest").
-
-        Returns
-        -------
-        np.ndarray
-            - For MLP: IV surface (nT × nK)
-            - For DeepONet: IV surface (nT × nK)
+        Measures per-step runtime if verbose=True.
         """
         # --- Scale branch/param inputs ---
+        x_raw = np.concatenate(
+            [[params["eta"], params["rho"], params["H"]], params["xi0_knots"]]
+        )[None, :]
         x_scaled = self.scale_params(x_raw)
 
         # =====================================================
@@ -1292,22 +1350,42 @@ class NumpyModel:
         # =====================================================
         if self.model_type == "MLP":
             assert self.output_shape is not None, "MLP export missing output_shape."
+
+            t0 = time.perf_counter()
             y_scaled = self._forward_seq(x_scaled, self.layers)
+            t1 = time.perf_counter()
+
             y = self.inverse_transform_output(y_scaled)
+            t2 = time.perf_counter()
+
             nT, nK = self.output_shape
             surface = y.reshape(-1, nT, nK)[0]
+            t3 = time.perf_counter()
 
-            base_Ts = self.maturities
             base_Ks = self.strikes
+            base_Ts = self.maturities
 
             # --- Optional interpolation to custom grid ---
             if isinstance(grid, dict):
                 Ks_target = np.asarray(grid["strikes"], dtype=np.float32)
                 Ts_target = np.asarray(grid["maturities"], dtype=np.float32)
 
-                if np.allclose(Ks_target, base_Ks) and np.allclose(Ts_target, base_Ts):
+                same_shape = (
+                    base_Ks is not None and base_Ts is not None
+                    and len(base_Ks) == len(Ks_target)
+                    and len(base_Ts) == len(Ts_target)
+                )
+
+                if same_shape and np.allclose(Ks_target, base_Ks) and np.allclose(Ts_target, base_Ts):
+                    if verbose:
+                        print(f"[MLP timing]")
+                        print(f"  Forward        : {t1 - t0:.4f} s")
+                        print(f"  Inverse scale  : {t2 - t1:.4f} s")
+                        print(f"  Reshape        : {t3 - t2:.4f} s")
+                        print(f"  Total          : {t3 - t0:.4f} s\n")
                     return surface
 
+                # otherwise, perform interpolation
                 if interp_method == "spline":
                     from scipy.interpolate import RectBivariateSpline
                     interp = RectBivariateSpline(base_Ts, base_Ks, surface)
@@ -1325,7 +1403,22 @@ class NumpyModel:
                     coords = np.stack([TT.ravel(), KK.ravel()], axis=1)
                     surface_interp = interp(coords).reshape(len(Ts_target), len(Ks_target))
 
+                t4 = time.perf_counter()
+                if verbose:
+                    print(f"[MLP timing]")
+                    print(f"  Forward        : {t1 - t0:.4f} s")
+                    print(f"  Inverse scale  : {t2 - t1:.4f} s")
+                    print(f"  Reshape        : {t3 - t2:.4f} s")
+                    print(f"  Interpolation  : {t4 - t3:.4f} s")
+                    print(f"  Total          : {t4 - t0:.4f} s\n")
                 return surface_interp.astype(np.float32)
+
+            if verbose:
+                print(f"[MLP timing]")
+                print(f"  Forward        : {t1 - t0:.4f} s")
+                print(f"  Inverse scale  : {t2 - t1:.4f} s")
+                print(f"  Reshape        : {t3 - t2:.4f} s")
+                print(f"  Total          : {t3 - t0:.4f} s\n")
 
             return surface.astype(np.float32)
 
@@ -1341,35 +1434,30 @@ class NumpyModel:
             K_mesh, T_mesh = np.meshgrid(Ks, Ts, indexing="xy")
             trunk_coords = np.stack([K_mesh.ravel(), T_mesh.ravel()], axis=1)
 
-            # Forward through branch & trunk
+            t0 = time.perf_counter()
             B = self._forward_seq(x_scaled, self.branch_layers)
+            t1 = time.perf_counter()
             T = self._forward_seq(trunk_coords, self.trunk_layers)
+            t2 = time.perf_counter()
             y_scaled = np.sum(B * T, axis=1, keepdims=True)
+            t3 = time.perf_counter()
             y = self.inverse_transform_output(y_scaled).reshape(len(Ts), len(Ks))
+            t4 = time.perf_counter()
+
+            if verbose:
+                print(f"[DeepONet timing]")
+                print(f"  Branch forward : {t1 - t0:.4f} s")
+                print(f"  Trunk forward  : {t2 - t1:.4f} s")
+                print(f"  Fusion (B*T)   : {t3 - t2:.4f} s")
+                print(f"  Inverse scale  : {t4 - t3:.4f} s")
+                print(f"  Total          : {t4 - t0:.4f} s\n")
+
             return y.astype(np.float32)
 
         else:
             raise ValueError(f"Unsupported model type {self.model_type}")
 
 
-    # ------------------------------------------------------------
-    # Convenience wrapper for human-friendly inputs
-    # ------------------------------------------------------------
-    def predict_from_params(self, eta, rho, H, xi0_knots, trunk_coords=None):
-        """
-        Convenience interface:
-          MLP  → predict full surface
-          DeepONet → predict pointwise values (requires trunk_coords)
-        """
-        xi0_knots = np.array(xi0_knots, dtype=np.float32).flatten()
-        x_raw = np.concatenate([[eta, rho, H], xi0_knots])[None, :]
-
-        if self.model_type == "MLP":
-            return self.predict(x_raw)
-        elif self.model_type == "DeepONet":
-            assert trunk_coords is not None, "trunk_coords required for DeepONet"
-            x_branch = np.repeat(x_raw, len(trunk_coords), axis=0)
-            return self.predict(x_branch, x_trunk=trunk_coords)
 
 
 # ============================================================
