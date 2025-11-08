@@ -758,12 +758,14 @@ class BaseModel(nn.Module):
 # DeepONet (self-contained)
 # ============================================================
 
+# (assuming BaseModel and IVSurfaceDataset are imported or defined elsewhere)
+
 class DeepONet(BaseModel):
     """
     Deep Operator Network for implied volatility surfaces.
     - Branch input: parameter vector θ (eta, rho, H, xi0_knots...)
     - Trunk input: 2D coords (K, T)
-    - Output: IV value per (K, T)
+    - Optional learnable mask acting as contextual filter between branch and trunk.
     """
     def __init__(self,
                  branch_in_dim=None,
@@ -772,7 +774,8 @@ class DeepONet(BaseModel):
                  branch_hidden_dims=(64, 64),
                  trunk_hidden_dims=(64, 64),
                  activation="relu",
-                 lr=1e-3):
+                 lr=1e-3,
+                 mask_type="none"):  # new flag
         super().__init__()
         self.branch_in_dim = branch_in_dim
         self.trunk_in_dim = trunk_in_dim
@@ -781,6 +784,7 @@ class DeepONet(BaseModel):
         self.trunk_hidden_dims = trunk_hidden_dims
         self.activation = activation
         self.lr = lr
+        self.mask_type = mask_type.lower()
 
         if branch_in_dim:
             self._build_networks()
@@ -813,13 +817,280 @@ class DeepONet(BaseModel):
         trunk_layers.append(nn.Linear(dims_t[-1], self.latent_dim))
         self.trunk = nn.Sequential(*trunk_layers)
 
+        # Optional mask
+        self.mask_net = self._build_mask(act_fn)
+
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
 
     # --------------------------------------------------------
-    def forward(self, xb, xt):
-        return torch.sum(self.branch(xb) * self.trunk(xt), dim=1, keepdim=True)
+    def _build_mask(self, act_fn):
+        """Construct a learnable mask network depending on mask_type."""
+        if self.mask_type == "none":
+            return None
+
+        elif self.mask_type == "spatial":
+            # Mask depends only on (K,T)
+            return nn.Sequential(
+                nn.Linear(self.trunk_in_dim, 32),
+                act_fn,
+                nn.Linear(32, 16),
+                act_fn,
+                nn.Linear(16, 1),
+                nn.Sigmoid()
+            )
+
+        elif self.mask_type == "contextual":
+            # Mask depends on both branch and trunk context
+            return nn.Sequential(
+                nn.Linear(self.latent_dim * 2, 128),
+                act_fn,
+                nn.Linear(128, self.latent_dim),
+                nn.Sigmoid()
+            )
+
+        elif self.mask_type == "channel":
+            # Mask modulates each latent feature per (K,T)
+            return nn.Sequential(
+                nn.Linear(self.trunk_in_dim, self.latent_dim),
+                nn.Sigmoid()
+            )
+
+        else:
+            raise ValueError(f"Unknown mask_type '{self.mask_type}'")
 
     # --------------------------------------------------------
+    def forward(self, xb, xt):
+        b = self.branch(xb)  # (batch, latent_dim)
+        t = self.trunk(xt)   # (batch, latent_dim)
+
+        if self.mask_type == "none":
+            return torch.sum(b * t, dim=1, keepdim=True)
+
+        elif self.mask_type == "spatial":
+            mask = self.mask_net(xt)  # (batch,1)
+            return torch.sum(b * t, dim=1, keepdim=True) * mask
+
+        elif self.mask_type == "channel":
+            mask = self.mask_net(xt)  # (batch,latent_dim)
+            return torch.sum(b * t * mask, dim=1, keepdim=True)
+
+        elif self.mask_type == "contextual":
+            mask_input = torch.cat([b, t], dim=1)
+            mask = self.mask_net(mask_input)  # (batch,latent_dim)
+            return torch.sum(b * t * mask, dim=1, keepdim=True)
+
+    # --------------------------------------------------------
+    def test_mask_response(self, xb_sample, xt_grid, visualize=True):
+        """
+        Evaluate and optionally visualize the mask response for a fixed branch vector
+        across a grid of (K,T) coordinates.
+
+        Parameters
+        ----------
+        xb_sample : torch.Tensor or np.ndarray
+            Single branch input vector θ.
+        xt_grid : np.ndarray
+            Array of (K,T) points with shape (nT*nK, 2).
+        visualize : bool
+            If True, plot the resulting mask surface.
+        """
+        import matplotlib.pyplot as plt
+
+        self.eval()
+        if self.mask_net is None:
+            print("No mask network defined (mask_type='none').")
+            return None
+
+        xb_sample = torch.tensor(xb_sample, dtype=torch.float32, device=self.device)
+        xb_sample = xb_sample.unsqueeze(0).repeat(len(xt_grid), 1)
+        xt = torch.tensor(xt_grid, dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            b = self.branch(xb_sample)
+            t = self.trunk(xt)
+
+            if self.mask_type == "spatial":
+                mask = self.mask_net(xt)
+            elif self.mask_type == "channel":
+                mask = self.mask_net(xt)
+                mask = torch.mean(mask, dim=1, keepdim=True)  # avg per channel
+            elif self.mask_type == "contextual":
+                mask_input = torch.cat([b, t], dim=1)
+                mask = self.mask_net(mask_input)
+                mask = torch.mean(mask, dim=1, keepdim=True)
+            else:
+                mask = torch.ones(len(xt), 1, device=self.device)
+
+        mask_np = mask.detach().cpu().numpy().reshape(-1)
+
+        if visualize:
+            nK = len(np.unique(xt_grid[:, 0]))
+            nT = len(np.unique(xt_grid[:, 1]))
+            mask_surf = mask_np.reshape(nT, nK)
+            plt.figure(figsize=(6, 4))
+            plt.imshow(mask_surf, origin="lower", aspect="auto", cmap="magma")
+            plt.colorbar(label="Mask Intensity")
+            plt.title(f"Mask Response ({self.mask_type})")
+            plt.xlabel("Strike Index")
+            plt.ylabel("Maturity Index")
+            plt.tight_layout()
+            plt.show()
+
+        return mask_np
+
+    # --------------------------------------------------------
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+# assuming BaseModel and IVSurfaceDataset are available
+class SparseMask(nn.Module):
+    """Wrapper für mask_net mit integrierter L1- und Entropy-Sparsity."""
+    def __init__(self, mask_net, entropy_lambda=1e-3, l1_lambda=1e-4):
+        super().__init__()
+        self.mask_net = mask_net
+        self.entropy_lambda = entropy_lambda
+        self.l1_lambda = l1_lambda
+        self.loss_reg = torch.tensor(0.0)
+
+    def forward(self, x):
+        m = torch.sigmoid(self.mask_net(x))
+        if self.training:
+            # Regularisierung nur im Trainingsmodus berechnen
+            ent = - (m * torch.log(m + 1e-8) + (1 - m) * torch.log(1 - m + 1e-8))
+            self.loss_reg = (
+                self.l1_lambda * m.abs().mean() +
+                self.entropy_lambda * ent.mean()
+            )
+        else:
+            self.loss_reg = torch.tensor(0.0, device=m.device)
+        return m
+
+
+
+class DeepONet(BaseModel):
+    """
+    Deep Operator Network for implied volatility surfaces.
+    - Branch input: parameter vector θ (eta, rho, H, xi0_knots...)
+    - Trunk input: 2D coords (K, T)
+    - Optional learnable mask acting as contextual filter between branch and trunk
+      (mask_type: 'none', 'spatial', 'channel', or 'contextual').
+    """
+
+    def __init__(self,
+                 branch_in_dim=None,
+                 trunk_in_dim=2,
+                 latent_dim=64,
+                 branch_hidden_dims=(64, 64),
+                 trunk_hidden_dims=(64, 64),
+                 activation="relu",
+                 lr=1e-3,
+                 mask_type="none"):
+        super().__init__()
+        self.branch_in_dim = branch_in_dim
+        self.trunk_in_dim = trunk_in_dim
+        self.latent_dim = latent_dim
+        self.branch_hidden_dims = branch_hidden_dims
+        self.trunk_hidden_dims = trunk_hidden_dims
+        self.activation = activation
+        self.lr = lr
+        self.mask_type = mask_type.lower()
+
+        if branch_in_dim:
+            self._build_networks()
+        self.to(self.device)
+
+    # --------------------------------------------------------
+    def _build_networks(self):
+        act_fn = {
+            "relu": nn.ReLU(),
+            "gelu": nn.GELU(),
+            "tanh": nn.Tanh(),
+            "elu": nn.ELU()
+        }[self.activation]
+
+        # --- Branch network ---
+        branch_layers = []
+        dims = [self.branch_in_dim] + list(self.branch_hidden_dims)
+        for i in range(len(dims) - 1):
+            branch_layers.append(nn.Linear(dims[i], dims[i + 1]))
+            branch_layers.append(act_fn)
+        branch_layers.append(nn.Linear(dims[-1], self.latent_dim))
+        self.branch = nn.Sequential(*branch_layers)
+
+        # --- Trunk network ---
+        trunk_layers = []
+        dims_t = [self.trunk_in_dim] + list(self.trunk_hidden_dims)
+        for i in range(len(dims_t) - 1):
+            trunk_layers.append(nn.Linear(dims_t[i], dims_t[i + 1]))
+            trunk_layers.append(act_fn)
+        trunk_layers.append(nn.Linear(dims_t[-1], self.latent_dim))
+        self.trunk = nn.Sequential(*trunk_layers)
+
+        # --- Learnable mask ---
+        self.mask_net = self._build_mask(act_fn)
+
+        self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
+
+    # --------------------------------------------------------
+    def _build_mask(self, act_fn):
+        """Construct a learnable mask network depending on mask_type."""
+        if self.mask_type == "none":
+            return None
+
+        elif self.mask_type == "spatial":
+            base = nn.Sequential(
+                nn.Linear(self.trunk_in_dim, 32),
+                act_fn,
+                nn.Linear(32, 16),
+                act_fn,
+                nn.Linear(16, 1)
+            )
+            return SparseMask(base)
+
+        elif self.mask_type == "channel":
+            base = nn.Sequential(
+                nn.Linear(self.trunk_in_dim, self.latent_dim)
+            )
+            return SparseMask(base)
+
+        elif self.mask_type == "contextual":
+            base = nn.Sequential(
+                nn.Linear(self.latent_dim * 2, self.latent_dim ),
+                act_fn,
+                nn.Linear(self.latent_dim, self.latent_dim)
+            )
+            return SparseMask(base)
+
+        else:
+            raise ValueError(f"Unknown mask_type '{self.mask_type}'")
+
+
+    # --------------------------------------------------------
+    def forward(self, xb, xt):
+        b = self.branch(xb)  # (batch, latent_dim)
+        t = self.trunk(xt)   # (batch, latent_dim)
+
+        if self.mask_type == "none":
+            return torch.sum(b * t, dim=1, keepdim=True)
+
+        elif self.mask_type == "spatial":
+            mask = self.mask_net(xt)  # (batch, 1)
+            return torch.sum(b * t, dim=1, keepdim=True) * mask
+
+        elif self.mask_type == "channel":
+            mask = self.mask_net(xt)  # (batch, latent_dim)
+            return torch.sum(b * t * mask, dim=1, keepdim=True)
+
+        elif self.mask_type == "contextual":
+            mask_input = torch.cat([b, t], dim=1)
+            mask = self.mask_net(mask_input)  # (batch, latent_dim)
+            return torch.sum(b * t * mask, dim=1, keepdim=True)
+
+    # --------------------------------------------------------
+
     @staticmethod
     def _flatten_surfaces_for_deeponet(surfaces, enforce_shared_grid=False):
         """
@@ -872,31 +1143,38 @@ class DeepONet(BaseModel):
 
         return X_branch, X_trunk, Y, strikes, maturities
 
-    # --------------------------------------------------------
+
     @classmethod
-    def from_surfaces(cls, surfaces, batch_size=256, val_split=0.2, shuffle=True,
-                    branch_hidden_dims=(64, 64), trunk_hidden_dims=(64, 64),
-                    activation="relu", lr=1e-3, latent_dim=64, ref_strikes=None, ref_maturities = None):
+    def from_surfaces(cls,
+                      surfaces,
+                      *,
+                      mask_type="none",
+                      batch_size=256,
+                      val_split=0.2,
+                      shuffle=True,
+                      branch_hidden_dims=(64, 64),
+                      trunk_hidden_dims=(64, 64),
+                      activation="relu",
+                      lr=1e-3,
+                      latent_dim=64,
+                      ref_strikes=None,
+                      ref_maturities=None):
         """
-        Build a DeepONet model + loaders with internal, leakage-safe scaling:
-        - Branch inputs scaled to [-1, 1] using empirical min/max (+5% margin)
-        - Output (IV) scaled via StandardScaler fit on train only
-        Returns: model, train_loader, val_loader, strikes, maturities
+        Build a DeepONet model + loaders with internal, leakage-safe scaling.
+        Includes learnable mask specified by `mask_type`.
         """
-        # Flatten all surface data into arrays
         X_branch, X_trunk, Y, strikes, maturities = cls._flatten_surfaces_for_deeponet(surfaces)
         if ref_strikes is not None:
-            strikes = ref_strikes
+            strikes = np.asarray(ref_strikes, dtype=np.float32)
         if ref_maturities is not None:
-            maturities = ref_maturities
+            maturities = np.asarray(ref_maturities, dtype=np.float32)
 
-        # --- Empirical parameter bounds with safety margin ---
+        # Empirical bounds for branch normalization
         lb = np.min(X_branch, axis=0)
         ub = np.max(X_branch, axis=0)
         margin = 0.01 * (ub - lb)
         lb -= margin
         ub += margin
-
         Xb_scaled = BaseModel._scale_to_m1_p1(X_branch, lb, ub)
 
         n_total = len(Y)
@@ -911,24 +1189,104 @@ class DeepONet(BaseModel):
                     trunk_hidden_dims=trunk_hidden_dims,
                     activation=activation,
                     latent_dim=latent_dim,
-                    lr=lr)
+                    lr=lr,
+                    mask_type=mask_type)
 
         model.set_grid(strikes, maturities)
         model.set_io_dims(input_dim=Xb_scaled.shape[1])
-        model.set_param_bounds(lb, ub)
         model.fit_output_scaler(Y[tr])
+        model.set_param_bounds(lb, ub)
 
         Y_tr_scaled = model.transform_output(Y[tr])
         Y_va_scaled = model.transform_output(Y[va])
 
         train_ds = IVSurfaceDataset(Xb_scaled[tr], X_trunk[tr], Y_tr_scaled)
-        val_ds   = IVSurfaceDataset(Xb_scaled[va], X_trunk[va], Y_va_scaled)
+        val_ds = IVSurfaceDataset(Xb_scaled[va], X_trunk[va], Y_va_scaled)
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        val_loader   = DataLoader(val_ds, batch_size=2 * batch_size, shuffle=False)
+        val_loader = DataLoader(val_ds, batch_size=2 * batch_size, shuffle=False)
 
         return model, train_loader, val_loader, strikes, maturities
 
+    def test_mask_response(self, xb_sample, xt_grid, visualize=True, channels=None):
+        """
+        Evaluate and optionally visualize individual latent mask channels
+        for a fixed branch vector across a grid of (K,T) coordinates.
+
+        Parameters
+        ----------
+        xb_sample : array-like
+            Parameter vector (eta, rho, H, xi0_knots...).
+        xt_grid : np.ndarray of shape [N, 2]
+            Grid of (K, T) coordinates.
+        visualize : bool, default=True
+            If True, plots selected mask channels as 2D heatmaps.
+        channels : list[int], optional
+            Specific channel indices to visualize (e.g. [0, 3, 7]).
+            If None, visualizes all latent channels.
+
+        Returns
+        -------
+        mask_np : np.ndarray
+            Full mask array of shape [N, latent_dim].
+        """
+        import torch, numpy as np, matplotlib.pyplot as plt
+
+        self.eval()
+        if getattr(self, "mask_net", None) is None:
+            print("No mask network defined (mask_type='none').")
+            return None
+
+        # Prepare input tensors
+        xb_sample = torch.tensor(xb_sample, dtype=torch.float32, device=self.device)
+        xb_sample = xb_sample.unsqueeze(0).repeat(len(xt_grid), 1)
+        xt = torch.tensor(xt_grid, dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            b = self.branch(xb_sample)
+            t = self.trunk(xt)
+
+            if self.mask_type == "spatial":
+                mask = self.mask_net(xt)
+            elif self.mask_type == "channel":
+                mask = self.mask_net(xt)
+            elif self.mask_type == "contextual":
+                mask_input = torch.cat([b, t], dim=1)
+                mask = self.mask_net(mask_input)
+            else:
+                mask = torch.ones(len(xt), self.latent_dim, device=self.device)
+
+        mask_np = mask.detach().cpu().numpy()  # [N, latent_dim]
+        nK = len(np.unique(xt_grid[:, 0]))
+        nT = len(np.unique(xt_grid[:, 1]))
+        latent_dim = mask_np.shape[1]
+
+        # ----------------------------------------------------------
+        # Visualization
+        # ----------------------------------------------------------
+        if visualize:
+            if channels is None:
+                channels = list(range(latent_dim))
+            else:
+                channels = [c for c in channels if c < latent_dim]
+
+            n_show = len(channels)
+            fig, axes = plt.subplots(1, n_show, figsize=(3.5 * n_show, 4))
+
+            for idx, c in enumerate(channels):
+                ax = axes[idx] if n_show > 1 else axes
+                mask_c = mask_np[:, c].reshape(nT, nK)
+                im = ax.imshow(mask_c, origin="lower", aspect="auto", cmap="magma")
+                ax.set_title(f"Channel {c}")
+                ax.set_xlabel("Strike (K)")
+                ax.set_ylabel("Maturity (T)")
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            plt.suptitle(f"Mask Channels ({self.mask_type})", fontsize=13)
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            plt.show()
+
+        return mask_np
 
     # --------------------------------------------------------
     def train_model(
@@ -984,6 +1342,8 @@ class DeepONet(BaseModel):
                 xb, xt, y = xb.to(self.device), xt.to(self.device), y.to(self.device)
                 pred = self.forward(xb, xt)
                 loss = self.compute_loss(pred, y)
+                if hasattr(self.mask_net, "loss_reg"):
+                    loss += self.mask_net.loss_reg
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
