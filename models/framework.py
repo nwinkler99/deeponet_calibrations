@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from scipy.interpolate import RectBivariateSpline, RegularGridInterpolator
 import time
-
+from scipy.optimize import minimize, least_squares, differential_evolution
 
 # ============================================================
 # Dataset Wrapper (for DeepONet per-point supervision)
@@ -538,10 +538,215 @@ class BaseModel(nn.Module):
             },
         }
 
+    # ============================================================
+    # Calibration utilities
+    # ============================================================
+    def calibrate(self, target_surface, optimiser="L-BFGS-B", bounds=None, maxiter=1000, verbose=False):
+        """
+        Calibrate model parameters θ̂ to a given implied-volatility surface by minimizing RMSE.
+
+        Notes
+        -----
+        - Works purely in physical parameter and IV space.
+        - predict_surface() already returns physical implied volatilities.
+        - No scaling or normalization is done anywhere in this method.
+        """
+        import time
+        import numpy as np
+        from scipy.optimize import minimize, least_squares, differential_evolution
+
+        assert self.param_bounds is not None, "Call set_param_bounds() first."
+        lb, ub = self.param_bounds if bounds is None else np.array(list(zip(*bounds)))
+        lb, ub = np.asarray(lb, dtype=np.float32), np.asarray(ub, dtype=np.float32)
+
+        true_surface = np.asarray(target_surface["iv_surface"], dtype=np.float32)
+        Ks = np.asarray(target_surface["grid"]["strikes"], dtype=np.float32)
+        Ts = np.asarray(target_surface["grid"]["maturities"], dtype=np.float32)
+        true_params = target_surface.get("params", None)
+
+        def rmse_objective(x_phys):
+            params = {
+                "eta": x_phys[0],
+                "rho": x_phys[1],
+                "H": x_phys[2],
+                "xi0_knots": x_phys[3:]
+            }
+            pred = self.predict_surface(params, grid={"strikes": Ks, "maturities": Ts})
+            return np.sqrt(np.mean((pred - true_surface) ** 2))
+
+        def residuals(x_phys):
+            params = {
+                "eta": x_phys[0],
+                "rho": x_phys[1],
+                "H": x_phys[2],
+                "xi0_knots": x_phys[3:]
+            }
+            pred = self.predict_surface(params, grid={"strikes": Ks, "maturities": Ts})
+            return (pred - true_surface).ravel()
+
+        x0 = 0.5 * (lb + ub)
+        
+        t0 = time.perf_counter()
+
+        opt_lower = optimiser.lower()
+        if opt_lower == "differential evolution":
+            res = differential_evolution(rmse_objective, bounds=list(zip(lb, ub)), maxiter=maxiter, disp=verbose)
+        elif opt_lower in ["levenberg-marquardt", "lm"]:
+            res = least_squares(residuals, x0, method="trf", bounds=(lb, ub), max_nfev=maxiter, verbose=2 if verbose else 0)
+        else:
+            res = minimize(rmse_objective, x0, method=optimiser, bounds=list(zip(lb, ub)),
+                        options={"maxiter": maxiter, "disp": verbose})
+
+        t1 = time.perf_counter()
+        theta_hat = res.x
+
+        param_names = ["eta", "rho", "H"] + [f"xi0_{i}" for i in range(len(theta_hat) - 3)]
+        if true_params is not None:
+            true_vec = np.concatenate([
+                [true_params["eta"], true_params["rho"], true_params["H"]],
+                np.array(true_params["xi0_knots"], dtype=np.float32).ravel()
+            ])
+            rel_errs = np.abs(theta_hat - true_vec) / np.clip(np.abs(true_vec), 1e-8, None)
+            rel_err_dict = dict(zip(param_names, rel_errs))
+        else:
+            rel_err_dict = {k: 0.0 for k in param_names}
+
+        rmse = rmse_objective(theta_hat)
+
+        return {
+            "theta_hat": theta_hat,
+            "error_rel_dict": rel_err_dict,
+            "rmse": float(rmse),
+            "runtime_ms": (t1 - t0) * 1000,
+            "optimizer": optimiser
+        }
+
+
+
+    # ------------------------------------------------------------
+
+    def evaluate_calibrate(self, surfaces, optimiser="L-BFGS-B", maxiter=500, out_dir="calibration_eval"):
+        """
+        Run calibration across multiple surfaces using a single optimizer,
+        producing per-parameter error statistics, CDF plots, and returning
+        full true/estimated parameter arrays.
+
+        Parameters
+        ----------
+        surfaces : list of dict
+            Each surface dict: {"iv_surface": ..., "grid": ..., "params": ...}
+        optimiser : str
+            Optimizer to use (e.g. 'L-BFGS-B', 'SLSQP', etc.)
+        maxiter : int
+        out_dir : str
+            Directory to save plots.
+        """
+
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"\nEvaluating calibration using {optimiser} on {len(surfaces)} surfaces...")
+
+        runtimes, rmses = [], []
+        per_param_errors = {}   # key: param_name -> list of rel errors
+        true_params_all = []    # list of physical true param vectors
+        est_params_all = []     # list of calibrated param vectors
+
+        for i, s in enumerate(surfaces, start=1):
+            r = self.calibrate(s, optimiser=optimiser, maxiter=maxiter)
+            runtimes.append(r["runtime_ms"])
+            rmses.append(r["rmse"])
+            est_params_all.append(r["theta_hat"])
+
+            # true parameters (in physical units)
+            tp = s.get("params", None)
+            if tp is not None:
+                tvec = np.concatenate([
+                    [tp["eta"], tp["rho"], tp["H"]],
+                    np.array(tp["xi0_knots"], dtype=np.float32).ravel()
+                ])
+                true_params_all.append(tvec)
+            else:
+                true_params_all.append(np.full_like(r["theta_hat"], np.nan))
+
+            # per-parameter errors
+            for k, v in r["error_rel_dict"].items():
+                per_param_errors.setdefault(k, []).append(v)
+
+            # Verbose progress every 50 surfaces
+            if i % 50 == 0 or i == len(surfaces):
+                mean_rmse = np.mean(rmses)
+                print(f"  [{i}/{len(surfaces)}]  mean RMSE={mean_rmse:.5f}  "
+                    f"avg time={np.mean(runtimes):.1f} ms")
+                summary_str = "     " + "  ".join(
+                    [f"{k}: {np.mean(v_list)*100:.2f}%" for k, v_list in per_param_errors.items()])
+                print(summary_str)
+
+        # Convert dicts/lists to arrays
+        for k in per_param_errors:
+            per_param_errors[k] = np.array(per_param_errors[k])
+        runtimes = np.array(runtimes)
+        rmses = np.array(rmses)
+        true_params_all = np.array(true_params_all)
+        est_params_all = np.array(est_params_all)
+
+        avg_time = np.mean(runtimes)
+        print(f"\n→ Final avg time: {avg_time:.1f} ms, mean RMSE={np.mean(rmses):.5f}")
+        print("\nMean relative errors per parameter:")
+        for k, vals in per_param_errors.items():
+            print(f"   {k:<8s} | mean={np.mean(vals)*100:.3f}% | median={np.median(vals)*100:.3f}% | std={np.std(vals)*100:.3f}%")
+
+        # --- Plot ECDFs per parameter ---
+        def ecdf(x):
+            xs = np.sort(x)
+            ys = np.linspace(0, 1, len(x))
+            return xs, ys
+
+        n_params = len(per_param_errors)
+        ncols = min(4, n_params)
+        nrows = int(np.ceil(n_params / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 3*nrows), squeeze=False)
+
+        for i, (k, vals) in enumerate(per_param_errors.items()):
+            ax = axes[i // ncols, i % ncols]
+            xs, ys = ecdf(vals)
+            ax.plot(ys, xs * 100)
+            ax.set_title(f"{k}")
+            ax.set_xlabel("Quantiles")
+            ax.set_ylabel("Rel. Error [%]")
+            ax.grid(True, ls=":", lw=0.5)
+
+        for j in range(i + 1, nrows * ncols):
+            axes[j // ncols, j % ncols].axis("off")
+
+        plt.suptitle(f"Parameter Relative Error CDFs ({optimiser})")
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        plt.savefig(os.path.join(out_dir, f"param_error_cdfs_{optimiser}.png"), dpi=200)
+        plt.close()
+
+        # --- RMSE CDF ---
+        plt.figure(figsize=(6, 4))
+        xs, ys = ecdf(rmses)
+        plt.plot(ys, xs)
+        plt.axvline(0.99, ls="--", c="k")
+        plt.xlabel("Quantiles")
+        plt.ylabel("RMSE")
+        plt.title(f"{optimiser}: Surface RMSE CDF")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"rmse_cdf_{optimiser}.png"), dpi=200)
+        plt.close()
+
+        return {
+            "optimizer": optimiser,
+            "avg_time_ms": float(avg_time),
+            "mean_rmse": float(np.mean(rmses)),
+            "per_param_errors": per_param_errors,
+            "true_params": true_params_all,     # shape (N, n_params)
+            "est_params": est_params_all,       # shape (N, n_params)
+            "rmses": rmses,
+            "runtimes": runtimes,
+        }
+
 
     
-
-
     def count_parameters(self, trainable_only=True):
         """Return the number of (trainable) parameters."""
         if trainable_only:
@@ -688,7 +893,7 @@ class DeepONet(BaseModel):
         # --- Empirical parameter bounds with safety margin ---
         lb = np.min(X_branch, axis=0)
         ub = np.max(X_branch, axis=0)
-        margin = 0.05 * (ub - lb)
+        margin = 0.01 * (ub - lb)
         lb -= margin
         ub += margin
 
@@ -719,7 +924,7 @@ class DeepONet(BaseModel):
         train_ds = IVSurfaceDataset(Xb_scaled[tr], X_trunk[tr], Y_tr_scaled)
         val_ds   = IVSurfaceDataset(Xb_scaled[va], X_trunk[va], Y_va_scaled)
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         val_loader   = DataLoader(val_ds, batch_size=2 * batch_size, shuffle=False)
 
         return model, train_loader, val_loader, strikes, maturities
@@ -973,7 +1178,7 @@ class MLP(BaseModel):
         # --- Empirical parameter bounds (+5% margin) ---
         lb = np.min(X, axis=0)
         ub = np.max(X, axis=0)
-        margin = 0.05 * (ub - lb)
+        margin = 0.01 * (ub - lb)
         lb -= margin
         ub += margin
 
