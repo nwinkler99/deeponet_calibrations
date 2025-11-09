@@ -1,10 +1,4 @@
-- count number of parameters and speed 
-- allow saving of NN parameters
-- formulate each network in numpy after training and check speeds 
-
-- implement interpolation
-- test on irregular grids
-- built the calibration code
+- calculate jacobian sensitivity
 
 Later:
 - build FNO
@@ -32,6 +26,23 @@ deeponet_model.train_model(train_loader, val_loader, epochs=30, lr_schedule=[(0,
 print("DeepONet Model param counts: ",deeponet_model.count_parameters())
 # fig = model.plot_evaluation(test_surfaces[0])
 deeponet_eval = deeponet_model.evaluate(test_data, out_dir="deeponet_eval")
+
+Epoch 035 | train_rmse=0.027980, val_rmse=0.026921, lr=1.0e-04, time=129.93s, ETA=10.68 min
+→ Adjusted learning rate to 1.00e-05 at epoch 35
+                                                              
+Epoch 036 | train_rmse=0.027531, val_rmse=0.026308, lr=1.0e-05, time=129.41s, ETA=8.55 min
+                                                              
+Epoch 037 | train_rmse=0.027498, val_rmse=0.026305, lr=1.0e-05, time=131.74s, ETA=6.41 min
+                                                               
+Epoch 038 | train_rmse=0.027491, val_rmse=0.026319, lr=1.0e-05, time=129.47s, ETA=4.28 min
+                                                              
+Epoch 039 | train_rmse=0.027485, val_rmse=0.026280, lr=1.0e-05, time=129.46s, ETA=2.14 min
+                                                              
+Epoch 040 | train_rmse=0.027483, val_rmse=0.026296, lr=1.0e-05, time=128.22s, ETA=0.00 min
+
+✅ Training completed in 85.56 min (avg 128.34s per epoch)
+Model exported to exports\deeponet_final.json
+DeepONet Model param counts:  30208
 
 → Final avg time: 139.6 ms, mean RMSE=0.00106
 
@@ -67,6 +78,17 @@ print("DeepONet Model param counts: ",deeponet_model.count_parameters())
 # fig = model.plot_evaluation(test_surfaces[0])
 deeponet_eval = deeponet_model.evaluate(test_data, out_dir="deeponet_eval")
 
+Epoch 035 | train_rmse=0.029780, val_rmse=0.029915, lr=1.0e-04, time=105.20s, ETA=8.99 min
+→ Adjusted learning rate to 1.00e-05 at epoch 35
+                                                              
+Epoch 036 | train_rmse=0.029210, val_rmse=0.029300, lr=1.0e-05, time=106.94s, ETA=7.19 min
+                                                              
+Epoch 037 | train_rmse=0.029173, val_rmse=0.029254, lr=1.0e-05, time=105.70s, ETA=5.39 min
+                                                              
+Epoch 038 | train_rmse=0.029169, val_rmse=0.029260, lr=1.0e-05, time=106.71s, ETA=3.59 min
+                                                              
+Epoch 039 | train_rmse=0.029162, val_rmse=0.029271, lr=1.0e-05, time=106.67s, ETA=1.80 min
+                                                              
 Epoch 040 | train_rmse=0.029156, val_rmse=0.029260, lr=1.0e-05, time=104.63s, ETA=0.00 min
 
 ✅ Training completed in 71.79 min (avg 107.68s per epoch)
@@ -74,7 +96,6 @@ Model exported to exports\deeponet_final.json
 DeepONet Model param counts:  30272
 
 → Final avg time: 139.7 ms, mean RMSE=0.00129
-
 Mean relative errors per parameter:
    eta      | mean=1.939% | median=1.082% | std=3.778%
    rho      | mean=2.298% | median=1.314% | std=3.509%
@@ -104,6 +125,17 @@ print("MLP Model param counts: ",mlp_model.count_parameters())
 #fig = model.plot_evaluation(test_surfaces[0])
 mlp_eval = mlp_model.evaluate(test_data, out_dir="mlp_eval")
 
+Epoch 035 | train_rmse=0.034623, val_rmse=0.034946, lr=1.0e-04, time=15.02s, ETA=1.21 min
+→ Adjusted learning rate to 1.00e-05 at epoch 35
+                                                              
+Epoch 036 | train_rmse=0.033727, val_rmse=0.034048, lr=1.0e-05, time=15.06s, ETA=0.97 min
+                                                              
+Epoch 037 | train_rmse=0.033675, val_rmse=0.033977, lr=1.0e-05, time=14.54s, ETA=0.73 min
+                                                              
+Epoch 038 | train_rmse=0.033668, val_rmse=0.033971, lr=1.0e-05, time=14.85s, ETA=0.49 min
+                                                              
+Epoch 039 | train_rmse=0.033658, val_rmse=0.033957, lr=1.0e-05, time=15.03s, ETA=0.24 min
+                                                              
 Epoch 040 | train_rmse=0.033657, val_rmse=0.033956, lr=1.0e-05, time=14.87s, ETA=0.00 min
 
 ✅ Training completed in 9.73 min (avg 14.59s per epoch)
@@ -111,7 +143,6 @@ Model exported to exports\mlp_final.json
 MLP Model param counts:  30441
 
 → Final avg time: 109.0 ms, mean RMSE=0.00127
-
 Mean relative errors per parameter:
    eta      | mean=2.164% | median=1.188% | std=3.780%
    rho      | mean=2.297% | median=1.348% | std=2.897%

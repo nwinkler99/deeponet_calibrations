@@ -328,3 +328,158 @@ def repair_edges_local_directional(iv_surface: np.ndarray,
         iv[mask_rows] = iv_short
 
     return iv.astype(dtype)
+
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize, least_squares, differential_evolution
+
+
+import re
+
+def _natural_key(name: str):
+    """
+    Sort helper: 'xi0_10' -> ('xi0_', 10), 'eta' -> ('eta', -1)
+    Ensures xi0_2 < xi0_10.
+    """
+    m = re.match(r"^([A-Za-z_]+)(\d+)$", name)
+    if m:
+        return (m.group(1), int(m.group(2)))
+    return (name, -1)
+
+
+def plot_param_error_ecdfs(error_dicts, labels, out_dir="calibration_plots", kind="relative"):
+    """
+    Compare ECDFs of per-parameter errors across multiple models (natural order).
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Natural / numeric order
+    all_params = sorted({k for d in error_dicts for k in d.keys()}, key=_natural_key)
+
+    ncols = min(4, len(all_params))
+    nrows = int(np.ceil(len(all_params) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows), squeeze=False)
+
+    def ecdf(x):
+        xs = np.sort(x)
+        ys = np.linspace(0, 1, len(x))
+        return xs, ys
+
+    for i, param in enumerate(all_params):
+        ax = axes[i // ncols, i % ncols]
+        for errs, label in zip(error_dicts, labels):
+            if param in errs:
+                xs, ys = ecdf(errs[param])
+                ax.plot(ys, xs * (100 if kind == "relative" else 1), label=label)
+        ax.set_title(param)
+        ax.set_xlabel("Quantiles")
+        ax.set_ylabel(f"{kind.title()} Error" + (" [%]" if kind == "relative" else ""))
+        ax.grid(True, ls=":", lw=0.5)
+        ax.legend(fontsize=8)
+
+    for j in range(i + 1, nrows * ncols):
+        axes[j // ncols, j % ncols].axis("off")
+
+    plt.suptitle(f"Parameter {kind.title()} Error CDFs")
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    path = os.path.join(out_dir, f"param_error_cdfs_{kind}.png")
+    plt.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"Saved {kind} error ECDF comparison to {path}")
+
+
+def plot_param_true_vs_est(
+    results,
+    labels,
+    out_dir="calibration_plots",
+    alpha=0.6,
+):
+    """
+    Compare true vs estimated parameters across multiple models.
+
+    Parameters
+    ----------
+    results : list[dict]
+        Each dict must contain:
+            - 'true_params': (N, d) array
+            - 'est_params': (N, d) array
+            - optionally 'per_param_abs_errors' or 'per_param_rel_errors' (for param names)
+    labels : list[str]
+        Model names corresponding to each result dict.
+    out_dir : str
+        Output directory for saved figures.
+    alpha : float
+        Scatter transparency for overlapping points.
+    """
+    import os, numpy as np, matplotlib.pyplot as plt
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Determine parameter names (prefer consistent naming if present)
+    all_param_names = None
+    for res in results:
+        if "per_param_abs_errors" in res:
+            all_param_names = list(res["per_param_abs_errors"].keys())
+            break
+        elif "per_param_rel_errors" in res:
+            all_param_names = list(res["per_param_rel_errors"].keys())
+            break
+
+    if all_param_names is None:
+        # fallback: infer names as generic indices
+        max_dim = max(r["true_params"].shape[1] for r in results)
+        all_param_names = [f"param_{i}" for i in range(max_dim)]
+
+    n_params = len(all_param_names)
+    ncols = min(4, n_params)
+    nrows = int(np.ceil(n_params / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows), squeeze=False)
+
+    colors = plt.cm.tab10.colors  # distinct color palette
+
+    for i, param in enumerate(all_param_names):
+        ax = axes[i // ncols, i % ncols]
+
+        for j, (res, label) in enumerate(zip(results, labels)):
+            if i >= res["true_params"].shape[1]:
+                continue  # skip if model has fewer parameters
+
+            true_vals = res["true_params"][:, i]
+            est_vals = res["est_params"][:, i]
+
+            ax.scatter(
+                true_vals,
+                est_vals,
+                alpha=alpha,
+                s=12,
+                color=colors[j % len(colors)],
+                label=label,
+                edgecolors="none",
+            )
+
+        # draw perfect-fit line
+        all_true = np.concatenate(
+            [r["true_params"][:, i] for r in results if i < r["true_params"].shape[1]]
+        )
+        lo, hi = np.nanmin(all_true), np.nanmax(all_true)
+        ax.plot([lo, hi], [lo, hi], "k--", lw=1, label="Perfect fit")
+
+        ax.set_title(param)
+        ax.set_xlabel("True")
+        ax.set_ylabel("Estimated")
+        ax.grid(True, ls=":", lw=0.5)
+        ax.legend(fontsize=8)
+
+    # turn off unused subplots
+    for j in range(i + 1, nrows * ncols):
+        axes[j // ncols, j % ncols].axis("off")
+
+    plt.suptitle("True vs Estimated Parameters (Calibration Comparison)")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    path = os.path.join(out_dir, "param_true_vs_est.png")
+    plt.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"Saved scatter comparison to {path}")
+

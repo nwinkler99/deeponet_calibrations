@@ -621,34 +621,20 @@ class BaseModel(nn.Module):
             "optimizer": optimiser
         }
 
-
-
-    # ------------------------------------------------------------
-
-    def evaluate_calibrate(self, surfaces, optimiser="L-BFGS-B", maxiter=500, out_dir="calibration_eval"):
+    def evaluate_calibrate(self, surfaces, optimiser="L-BFGS-B", maxiter=500,
+                        out_dir="calibration_eval", verbose=False):
         """
         Run calibration across multiple surfaces using a single optimizer,
-        producing per-parameter error statistics, CDF plots, and returning
-        full true/estimated parameter arrays.
-
-        Parameters
-        ----------
-        surfaces : list of dict
-            Each surface dict: {"iv_surface": ..., "grid": ..., "params": ...}
-        optimiser : str
-            Optimizer to use (e.g. 'L-BFGS-B', 'SLSQP', etc.)
-        maxiter : int
-        out_dir : str
-            Directory to save plots.
+        producing per-parameter error statistics, ECDF plots, and returning
+        true/estimated parameter arrays.
         """
 
         os.makedirs(out_dir, exist_ok=True)
         print(f"\nEvaluating calibration using {optimiser} on {len(surfaces)} surfaces...")
 
         runtimes, rmses = [], []
-        per_param_errors = {}   # key: param_name -> list of rel errors
-        true_params_all = []    # list of physical true param vectors
-        est_params_all = []     # list of calibrated param vectors
+        per_param_rel_errors, per_param_abs_errors = {}, {}
+        true_params_all, est_params_all = [], []
 
         for i, s in enumerate(surfaces, start=1):
             r = self.calibrate(s, optimiser=optimiser, maxiter=maxiter)
@@ -656,7 +642,6 @@ class BaseModel(nn.Module):
             rmses.append(r["rmse"])
             est_params_all.append(r["theta_hat"])
 
-            # true parameters (in physical units)
             tp = s.get("params", None)
             if tp is not None:
                 tvec = np.concatenate([
@@ -667,80 +652,56 @@ class BaseModel(nn.Module):
             else:
                 true_params_all.append(np.full_like(r["theta_hat"], np.nan))
 
-            # per-parameter errors
-            for k, v in r["error_rel_dict"].items():
-                per_param_errors.setdefault(k, []).append(v)
+            # Compute and store errors
+            theta_hat = np.array(r["theta_hat"], dtype=np.float32)
+            true_vec = np.array(true_params_all[-1], dtype=np.float32)
+            param_names = ["eta", "rho", "H"] + [f"xi0_{j}" for j in range(len(theta_hat) - 3)]
 
-            # Verbose progress every 50 surfaces
-            if i % 50 == 0 or i == len(surfaces):
+            abs_errs = np.abs(theta_hat - true_vec)
+            rel_errs = abs_errs / np.clip(np.abs(true_vec), 1e-8, None)
+
+            for k, aerr, rerr in zip(param_names, abs_errs, rel_errs):
+                per_param_abs_errors.setdefault(k, []).append(aerr)
+                per_param_rel_errors.setdefault(k, []).append(rerr)
+
+            if verbose and (i % 50 == 0 or i == len(surfaces)):
                 mean_rmse = np.mean(rmses)
-                print(f"  [{i}/{len(surfaces)}]  mean RMSE={mean_rmse:.5f}  "
+                print(f"  [{i}/{len(surfaces)}] mean RMSE={mean_rmse:.5f}, "
                     f"avg time={np.mean(runtimes):.1f} ms")
-                summary_str = "     " + "  ".join(
-                    [f"{k}: {np.mean(v_list)*100:.2f}%" for k, v_list in per_param_errors.items()])
-                print(summary_str)
 
         # Convert dicts/lists to arrays
-        for k in per_param_errors:
-            per_param_errors[k] = np.array(per_param_errors[k])
-        runtimes = np.array(runtimes)
-        rmses = np.array(rmses)
-        true_params_all = np.array(true_params_all)
-        est_params_all = np.array(est_params_all)
+        for d in (per_param_abs_errors, per_param_rel_errors):
+            for k in d:
+                d[k] = np.array(d[k])
 
+        runtimes, rmses = np.array(runtimes), np.array(rmses)
+        true_params_all, est_params_all = np.array(true_params_all), np.array(est_params_all)
         avg_time = np.mean(runtimes)
-        print(f"\n→ Final avg time: {avg_time:.1f} ms, mean RMSE={np.mean(rmses):.5f}")
-        print("\nMean relative errors per parameter:")
-        for k, vals in per_param_errors.items():
-            print(f"   {k:<8s} | mean={np.mean(vals)*100:.3f}% | median={np.median(vals)*100:.3f}% | std={np.std(vals)*100:.3f}%")
 
-        # --- Plot ECDFs per parameter ---
-        def ecdf(x):
-            xs = np.sort(x)
-            ys = np.linspace(0, 1, len(x))
-            return xs, ys
+        # Summary output
+        print(f"\n→ Final avg time: {avg_time:.1f} ms, mean RMSE={np.mean(rmses):.5f}\n")
 
-        n_params = len(per_param_errors)
-        ncols = min(4, n_params)
-        nrows = int(np.ceil(n_params / ncols))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 3*nrows), squeeze=False)
+        def summarize(errors, kind):
+            print(f"{kind.title()} Errors per Parameter:")
+            for k, vals in errors.items():
+                scale = 100 if kind == "relative" else 1
+                print(f"   {k:<8s} | mean={np.mean(vals)*scale:.3f}"
+                    f"{'%' if kind=='relative' else ''} | median={np.median(vals)*scale:.3f}"
+                    f"{'%' if kind=='relative' else ''} | std={np.std(vals)*scale:.3f}"
+                    f"{'%' if kind=='relative' else ''}")
 
-        for i, (k, vals) in enumerate(per_param_errors.items()):
-            ax = axes[i // ncols, i % ncols]
-            xs, ys = ecdf(vals)
-            ax.plot(ys, xs * 100)
-            ax.set_title(f"{k}")
-            ax.set_xlabel("Quantiles")
-            ax.set_ylabel("Rel. Error [%]")
-            ax.grid(True, ls=":", lw=0.5)
-
-        for j in range(i + 1, nrows * ncols):
-            axes[j // ncols, j % ncols].axis("off")
-
-        plt.suptitle(f"Parameter Relative Error CDFs ({optimiser})")
-        plt.tight_layout(rect=[0, 0, 1, 0.97])
-        plt.savefig(os.path.join(out_dir, f"param_error_cdfs_{optimiser}.png"), dpi=200)
-        plt.close()
-
-        # --- RMSE CDF ---
-        plt.figure(figsize=(6, 4))
-        xs, ys = ecdf(rmses)
-        plt.plot(ys, xs)
-        plt.axvline(0.99, ls="--", c="k")
-        plt.xlabel("Quantiles")
-        plt.ylabel("RMSE")
-        plt.title(f"{optimiser}: Surface RMSE CDF")
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f"rmse_cdf_{optimiser}.png"), dpi=200)
-        plt.close()
+        summarize(per_param_rel_errors, "relative")
+        print()
+        summarize(per_param_abs_errors, "absolute")
 
         return {
             "optimizer": optimiser,
             "avg_time_ms": float(avg_time),
             "mean_rmse": float(np.mean(rmses)),
-            "per_param_errors": per_param_errors,
-            "true_params": true_params_all,     # shape (N, n_params)
-            "est_params": est_params_all,       # shape (N, n_params)
+            "per_param_rel_errors": per_param_rel_errors,
+            "per_param_abs_errors": per_param_abs_errors,
+            "true_params": true_params_all,
+            "est_params": est_params_all,
             "rmses": rmses,
             "runtimes": runtimes,
         }
@@ -760,190 +721,6 @@ class BaseModel(nn.Module):
 
 # (assuming BaseModel and IVSurfaceDataset are imported or defined elsewhere)
 
-class DeepONet(BaseModel):
-    """
-    Deep Operator Network for implied volatility surfaces.
-    - Branch input: parameter vector θ (eta, rho, H, xi0_knots...)
-    - Trunk input: 2D coords (K, T)
-    - Optional learnable mask acting as contextual filter between branch and trunk.
-    """
-    def __init__(self,
-                 branch_in_dim=None,
-                 trunk_in_dim=2,
-                 latent_dim=64,
-                 branch_hidden_dims=(64, 64),
-                 trunk_hidden_dims=(64, 64),
-                 activation="relu",
-                 lr=1e-3,
-                 mask_type="none"):  # new flag
-        super().__init__()
-        self.branch_in_dim = branch_in_dim
-        self.trunk_in_dim = trunk_in_dim
-        self.latent_dim = latent_dim
-        self.branch_hidden_dims = branch_hidden_dims
-        self.trunk_hidden_dims = trunk_hidden_dims
-        self.activation = activation
-        self.lr = lr
-        self.mask_type = mask_type.lower()
-
-        if branch_in_dim:
-            self._build_networks()
-        self.to(self.device)
-
-    # --------------------------------------------------------
-    def _build_networks(self):
-        act_fn = {
-            "relu": nn.ReLU(),
-            "gelu": nn.GELU(),
-            "tanh": nn.Tanh(),
-            "elu": nn.ELU()
-        }[self.activation]
-
-        # Branch network
-        branch_layers = []
-        dims = [self.branch_in_dim] + list(self.branch_hidden_dims)
-        for i in range(len(dims) - 1):
-            branch_layers.append(nn.Linear(dims[i], dims[i + 1]))
-            branch_layers.append(act_fn)
-        branch_layers.append(nn.Linear(dims[-1], self.latent_dim))
-        self.branch = nn.Sequential(*branch_layers)
-
-        # Trunk network
-        trunk_layers = []
-        dims_t = [self.trunk_in_dim] + list(self.trunk_hidden_dims)
-        for i in range(len(dims_t) - 1):
-            trunk_layers.append(nn.Linear(dims_t[i], dims_t[i + 1]))
-            trunk_layers.append(act_fn)
-        trunk_layers.append(nn.Linear(dims_t[-1], self.latent_dim))
-        self.trunk = nn.Sequential(*trunk_layers)
-
-        # Optional mask
-        self.mask_net = self._build_mask(act_fn)
-
-        self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
-
-    # --------------------------------------------------------
-    def _build_mask(self, act_fn):
-        """Construct a learnable mask network depending on mask_type."""
-        if self.mask_type == "none":
-            return None
-
-        elif self.mask_type == "spatial":
-            # Mask depends only on (K,T)
-            return nn.Sequential(
-                nn.Linear(self.trunk_in_dim, 32),
-                act_fn,
-                nn.Linear(32, 16),
-                act_fn,
-                nn.Linear(16, 1),
-                nn.Sigmoid()
-            )
-
-        elif self.mask_type == "contextual":
-            # Mask depends on both branch and trunk context
-            return nn.Sequential(
-                nn.Linear(self.latent_dim * 2, 128),
-                act_fn,
-                nn.Linear(128, self.latent_dim),
-                nn.Sigmoid()
-            )
-
-        elif self.mask_type == "channel":
-            # Mask modulates each latent feature per (K,T)
-            return nn.Sequential(
-                nn.Linear(self.trunk_in_dim, self.latent_dim),
-                nn.Sigmoid()
-            )
-
-        else:
-            raise ValueError(f"Unknown mask_type '{self.mask_type}'")
-
-    # --------------------------------------------------------
-    def forward(self, xb, xt):
-        b = self.branch(xb)  # (batch, latent_dim)
-        t = self.trunk(xt)   # (batch, latent_dim)
-
-        if self.mask_type == "none":
-            return torch.sum(b * t, dim=1, keepdim=True)
-
-        elif self.mask_type == "spatial":
-            mask = self.mask_net(xt)  # (batch,1)
-            return torch.sum(b * t, dim=1, keepdim=True) * mask
-
-        elif self.mask_type == "channel":
-            mask = self.mask_net(xt)  # (batch,latent_dim)
-            return torch.sum(b * t * mask, dim=1, keepdim=True)
-
-        elif self.mask_type == "contextual":
-            mask_input = torch.cat([b, t], dim=1)
-            mask = self.mask_net(mask_input)  # (batch,latent_dim)
-            return torch.sum(b * t * mask, dim=1, keepdim=True)
-
-    # --------------------------------------------------------
-    def test_mask_response(self, xb_sample, xt_grid, visualize=True):
-        """
-        Evaluate and optionally visualize the mask response for a fixed branch vector
-        across a grid of (K,T) coordinates.
-
-        Parameters
-        ----------
-        xb_sample : torch.Tensor or np.ndarray
-            Single branch input vector θ.
-        xt_grid : np.ndarray
-            Array of (K,T) points with shape (nT*nK, 2).
-        visualize : bool
-            If True, plot the resulting mask surface.
-        """
-        import matplotlib.pyplot as plt
-
-        self.eval()
-        if self.mask_net is None:
-            print("No mask network defined (mask_type='none').")
-            return None
-
-        xb_sample = torch.tensor(xb_sample, dtype=torch.float32, device=self.device)
-        xb_sample = xb_sample.unsqueeze(0).repeat(len(xt_grid), 1)
-        xt = torch.tensor(xt_grid, dtype=torch.float32, device=self.device)
-
-        with torch.no_grad():
-            b = self.branch(xb_sample)
-            t = self.trunk(xt)
-
-            if self.mask_type == "spatial":
-                mask = self.mask_net(xt)
-            elif self.mask_type == "channel":
-                mask = self.mask_net(xt)
-                mask = torch.mean(mask, dim=1, keepdim=True)  # avg per channel
-            elif self.mask_type == "contextual":
-                mask_input = torch.cat([b, t], dim=1)
-                mask = self.mask_net(mask_input)
-                mask = torch.mean(mask, dim=1, keepdim=True)
-            else:
-                mask = torch.ones(len(xt), 1, device=self.device)
-
-        mask_np = mask.detach().cpu().numpy().reshape(-1)
-
-        if visualize:
-            nK = len(np.unique(xt_grid[:, 0]))
-            nT = len(np.unique(xt_grid[:, 1]))
-            mask_surf = mask_np.reshape(nT, nK)
-            plt.figure(figsize=(6, 4))
-            plt.imshow(mask_surf, origin="lower", aspect="auto", cmap="magma")
-            plt.colorbar(label="Mask Intensity")
-            plt.title(f"Mask Response ({self.mask_type})")
-            plt.xlabel("Strike Index")
-            plt.ylabel("Maturity Index")
-            plt.tight_layout()
-            plt.show()
-
-        return mask_np
-
-    # --------------------------------------------------------
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 # assuming BaseModel and IVSurfaceDataset are available
 class SparseMask(nn.Module):
@@ -1152,6 +929,7 @@ class DeepONet(BaseModel):
                       batch_size=256,
                       val_split=0.2,
                       shuffle=True,
+                      shuffle_training_batches=False,
                       branch_hidden_dims=(64, 64),
                       trunk_hidden_dims=(64, 64),
                       activation="relu",
@@ -1203,7 +981,7 @@ class DeepONet(BaseModel):
         train_ds = IVSurfaceDataset(Xb_scaled[tr], X_trunk[tr], Y_tr_scaled)
         val_ds = IVSurfaceDataset(Xb_scaled[va], X_trunk[va], Y_va_scaled)
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle_training_batches)
         val_loader = DataLoader(val_ds, batch_size=2 * batch_size, shuffle=False)
 
         return model, train_loader, val_loader, strikes, maturities
