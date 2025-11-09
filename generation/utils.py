@@ -335,43 +335,66 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize, least_squares, differential_evolution
 
-
-import re
+import os, re, numpy as np, matplotlib.pyplot as plt
 
 def _natural_key(name: str):
-    """
-    Sort helper: 'xi0_10' -> ('xi0_', 10), 'eta' -> ('eta', -1)
-    Ensures xi0_2 < xi0_10.
-    """
+    """Sort helper: ensures xi0_2 < xi0_10, while keeping eta, rho, H first."""
     m = re.match(r"^([A-Za-z_]+)(\d+)$", name)
     if m:
         return (m.group(1), int(m.group(2)))
     return (name, -1)
 
 
-def plot_param_error_ecdfs(error_dicts, labels, out_dir="calibration_plots", kind="relative"):
+def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="relative"):
     """
-    Compare ECDFs of per-parameter errors across multiple models (natural order).
+    Compare ECDFs of per-parameter errors across multiple models.
+    Parameter order now exactly matches that used in plot_param_true_vs_est().
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    # Natural / numeric order
-    all_params = sorted({k for d in error_dicts for k in d.keys()}, key=_natural_key)
+    # --- 1. Extract per-model error dicts depending on kind ---
+    param_sets = []
+    for r in results:
+        if kind == "absolute":
+            if "per_param_abs_errors" in r:
+                param_sets.append(r["per_param_abs_errors"])
+            else:
+                raise KeyError("Missing 'per_param_abs_errors' in result dict.")
+        else:
+            for key in ["per_param_rel_errors", "per_param_errors"]:
+                if key in r:
+                    param_sets.append(r[key])
+                    break
+            else:
+                raise KeyError("Missing relative error dict (expected 'per_param_rel_errors' or 'per_param_errors').")
 
-    ncols = min(4, len(all_params))
-    nrows = int(np.ceil(len(all_params) / ncols))
+    # --- 2. Determine canonical parameter order ---
+    # Prefer the first model’s key order for consistency with scatterplot
+    first_dict = param_sets[0]
+    all_param_names = list(first_dict.keys())
+
+    # Fallback: use natural sorted order if unordered mapping
+    if not all_param_names or isinstance(first_dict, dict) and not hasattr(first_dict, "__iter__"):
+        all_param_names = sorted(
+            {k for d in param_sets for k in d.keys()},
+            key=_natural_key
+        )
+
+    ncols = min(4, len(all_param_names))
+    nrows = int(np.ceil(len(all_param_names) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows), squeeze=False)
 
     def ecdf(x):
-        xs = np.sort(x)
-        ys = np.linspace(0, 1, len(x))
+        xs = np.sort(np.asarray(x))
+        ys = np.linspace(0, 1, len(xs))
         return xs, ys
 
-    for i, param in enumerate(all_params):
+    # --- 3. Plot ECDFs per parameter ---
+    for i, param in enumerate(all_param_names):
         ax = axes[i // ncols, i % ncols]
-        for errs, label in zip(error_dicts, labels):
-            if param in errs:
-                xs, ys = ecdf(errs[param])
+        for data, label in zip(param_sets, labels):
+            if param in data:
+                xs, ys = ecdf(data[param])
                 ax.plot(ys, xs * (100 if kind == "relative" else 1), label=label)
         ax.set_title(param)
         ax.set_xlabel("Quantiles")
@@ -379,6 +402,7 @@ def plot_param_error_ecdfs(error_dicts, labels, out_dir="calibration_plots", kin
         ax.grid(True, ls=":", lw=0.5)
         ax.legend(fontsize=8)
 
+    # Hide unused subplots
     for j in range(i + 1, nrows * ncols):
         axes[j // ncols, j % ncols].axis("off")
 
@@ -482,4 +506,3 @@ def plot_param_true_vs_est(
     plt.savefig(path, dpi=200)
     plt.close(fig)
     print(f"Saved scatter comparison to {path}")
-
