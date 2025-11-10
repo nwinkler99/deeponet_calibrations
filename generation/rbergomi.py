@@ -1,5 +1,7 @@
 import numpy as np
 from .utils import *
+import numpy as np
+from numpy.fft import rfft, irfft
 
 class rBergomi(object):
     """
@@ -32,37 +34,42 @@ class rBergomi(object):
 
     def Y(self, dW):
         """
-        Constructs Volterra process from appropriately
-        correlated 2d Brownian increments.
+        Constructs Volterra process from appropriately correlated
+        2D Brownian increments (FFT-accelerated version).
+        Equivalent to the original np.convolve() approach,
+        but O(N * s log s) instead of O(N * s^2).
         """
-        Y1 = np.zeros((self.N, 1 + self.s)) # Exact integrals
-        Y2 = np.zeros((self.N, 1 + self.s)) # Riemann sums
 
-        # Construct Y1 through exact integral
-        for i in np.arange(1, 1 + self.s, 1):
-            Y1[:,i] = dW[:,i-1,1] # Assumes kappa = 1
 
-        # Construct arrays for convolution
-        G = np.zeros(1 + self.s) # Gamma
-        for k in np.arange(2, 1 + self.s, 1):
-            G[k] = g(b(k, self.a)/self.n, self.a)
+        # --- shapes & constants ---
+        N = self.N          # number of Monte Carlo paths
+        s = self.s          # number of time steps (minus 1)
+        a = self.a
+        n = self.n
 
-        X = dW[:,:,0] # Xi
+        # --- Y1 term (exact integral) ---
+        Y1 = np.zeros((N, 1 + s))
+        Y1[:, 1:] = dW[:, :, 1]
 
-        # Initialise convolution result, GX
-        GX = np.zeros((self.N, len(X[0,:]) + len(G) - 1))
+        # --- build Gamma kernel G (same as before) ---
+        G = np.zeros(1 + s)
+        for k in range(2, 1 + s):
+            G[k] = g(b(k, a) / n, a)
 
-        # Compute convolution, FFT not used for small n
-        # Possible to compute for all paths in C-layer?
-        for i in range(self.N):
-            GX[i,:] = np.convolve(G, X[i,:])
+        # --- extract Xi process (first Brownian component) ---
+        X = dW[:, :, 0]     # shape (N, s)
 
-        # Extract appropriate part of convolution
-        Y2 = GX[:,:1 + self.s]
+        # --- FFT-based convolution for all paths simultaneously ---
+        L = len(G) + X.shape[1] - 1   # full linear conv length
+        G_fft = rfft(G, n=L)
+        X_fft = rfft(X, n=L, axis=1)
+        GX = irfft(G_fft[None, :] * X_fft, n=L, axis=1)
+        Y2 = GX[:, :1 + s]             # truncate to same shape as before
 
-        # Finally contruct and return full process
-        Y = np.sqrt(2 * self.a + 1) * (Y1 + Y2)
+        # --- final combination ---
+        Y = np.sqrt(2 * a + 1) * (Y1 + Y2)
         return Y
+
 
     def dW2(self):
         """
@@ -89,38 +96,36 @@ class rBergomi(object):
         V = xi * np.exp(eta * Y - 0.5 * eta**2 * t**(2 * a + 1))
         return V
 
-    def S(self, V, dB, S0 = 1):
+    def S(self, V, dB, S0=1.0):
         """
-        rBergomi price process.
+        rBergomi price process (optimized for memory locality).
         """
         self.S0 = S0
         dt = self.dt
         rho = self.rho
 
-        # Construct non-anticipative Riemann increments
-        increments = np.sqrt(V[:,:-1]) * dB - 0.5 * V[:,:-1] * dt
+        # Compute increments
+        sqrtV = np.sqrt(V[:, :-1], dtype=V.dtype)
+        increments = sqrtV * dB - 0.5 * V[:, :-1] * dt
 
-        # Cumsum is a little slower than Python loop.
-        integral = np.cumsum(increments, axis = 1)
+        # Cumulative sum along time
+        np.cumsum(increments, axis=1, out=increments)
 
-        S = np.zeros_like(V)
-        S[:,0] = S0
-        S[:,1:] = S0 * np.exp(integral)
+        # Build price paths
+        S = np.empty_like(V)
+        S[:, 0] = S0
+        S[:, 1:] = S0 * np.exp(increments)
         return S
 
-    def S1(self, V, dW1, rho, S0 = 1):
+    def S1(self, V, dW1, rho, S0=1.0):
         """
-        rBergomi parallel price process.
+        rBergomi parallel price process (optimized for memory locality).
         """
         dt = self.dt
-
-        # Construct non-anticipative Riemann increments
-        increments = rho * np.sqrt(V[:,:-1]) * dW1[:,:,0] - 0.5 * rho**2 * V[:,:-1] * dt
-
-        # Cumsum is a little slower than Python loop.
-        integral = np.cumsum(increments, axis = 1)
-
-        S = np.zeros_like(V)
-        S[:,0] = S0
-        S[:,1:] = S0 * np.exp(integral)
+        sqrtV = np.sqrt(V[:, :-1], dtype=V.dtype)
+        increments = rho * sqrtV * dW1[:, :, 0] - 0.5 * rho**2 * V[:, :-1] * dt
+        np.cumsum(increments, axis=1, out=increments)
+        S = np.empty_like(V)
+        S[:, 0] = S0
+        S[:, 1:] = S0 * np.exp(increments)
         return S

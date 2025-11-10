@@ -621,107 +621,104 @@ class BaseModel(nn.Module):
             "optimizer": optimiser
         }
 
-def evaluate_calibrate(self, surfaces, optimiser="L-BFGS-B", maxiter=500,
-                       out_dir="calibration_eval", verbose=False):
-    """
-    Run calibration across multiple surfaces using a single optimizer,
-    producing per-parameter error statistics (mean/median/std + RMSE for absolute),
-    and returning true/estimated parameter arrays.
-    """
+    def evaluate_calibrate(self, surfaces, optimiser="L-BFGS-B", maxiter=500,
+                        out_dir="calibration_eval", verbose=False):
+        """
+        Run calibration across multiple surfaces using a single optimizer,
+        producing per-parameter error statistics (mean/median/std + RMSE for absolute),
+        and returning true/estimated parameter arrays.
+        """
 
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"\nEvaluating calibration using {optimiser} on {len(surfaces)} surfaces...")
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"\nEvaluating calibration using {optimiser} on {len(surfaces)} surfaces...")
 
-    runtimes, rmses = [], []
-    per_param_rel_errors, per_param_abs_errors = {}, {}
-    true_params_all, est_params_all = [], []
+        runtimes, rmses = [], []
+        per_param_rel_errors, per_param_abs_errors = {}, {}
+        true_params_all, est_params_all = [], []
 
-    for i, s in enumerate(surfaces, start=1):
-        r = self.calibrate(s, optimiser=optimiser, maxiter=maxiter)
-        runtimes.append(r["runtime_ms"])
-        rmses.append(r["rmse"])
-        est_params_all.append(r["theta_hat"])
+        for i, s in enumerate(surfaces, start=1):
+            r = self.calibrate(s, optimiser=optimiser, maxiter=maxiter)
+            runtimes.append(r["runtime_ms"])
+            rmses.append(r["rmse"])
+            est_params_all.append(r["theta_hat"])
 
-        tp = s.get("params", None)
-        if tp is not None:
-            tvec = np.concatenate([
-                [tp["eta"], tp["rho"], tp["H"]],
-                np.array(tp["xi0_knots"], dtype=np.float32).ravel()
-            ])
-            true_params_all.append(tvec)
-        else:
-            true_params_all.append(np.full_like(r["theta_hat"], np.nan))
-
-        theta_hat = np.array(r["theta_hat"], dtype=np.float32)
-        true_vec = np.array(true_params_all[-1], dtype=np.float32)
-        param_names = ["eta", "rho", "H"] + [f"xi0_{j}" for j in range(len(theta_hat) - 3)]
-
-        abs_errs = np.abs(theta_hat - true_vec)
-        rel_errs = abs_errs / np.clip(np.abs(true_vec), 1e-8, None)
-
-        for k, aerr, rerr in zip(param_names, abs_errs, rel_errs):
-            per_param_abs_errors.setdefault(k, []).append(aerr)
-            per_param_rel_errors.setdefault(k, []).append(rerr)
-
-        if verbose and (i % 50 == 0 or i == len(surfaces)):
-            mean_rmse = np.mean(rmses)
-            print(f"  [{i}/{len(surfaces)}] mean RMSE={mean_rmse:.5f}, "
-                  f"avg time={np.mean(runtimes):.1f} ms")
-
-    # Convert lists to arrays
-    for d in (per_param_abs_errors, per_param_rel_errors):
-        for k in d:
-            d[k] = np.array(d[k])
-
-    runtimes, rmses = np.array(runtimes), np.array(rmses)
-    true_params_all, est_params_all = np.array(true_params_all), np.array(est_params_all)
-    avg_time = np.mean(runtimes)
-
-    # --- Helper for summary printing ---
-    def summarize(errors, kind):
-        print(f"{kind.title()} Errors per Parameter:")
-        for k, vals in errors.items():
-            scale = 100 if kind == "relative" else 1
-            mean = np.mean(vals)
-            median = np.median(vals)
-            std = np.std(vals)
-            unit = "%" if kind == "relative" else ""
-            if kind == "absolute":
-                rmse = np.sqrt(np.mean(vals ** 2))
-                print(f"   {k:<8s} | mean={mean*scale:.3f}{unit}"
-                      f" | median={median*scale:.3f}{unit}"
-                      f" | std={std*scale:.3f}{unit}"
-                      f" | RMSE={rmse*scale:.3f}{unit}")
+            tp = s.get("params", None)
+            if tp is not None:
+                tvec = np.concatenate([
+                    [tp["eta"], tp["rho"], tp["H"]],
+                    np.array(tp["xi0_knots"], dtype=np.float32).ravel()
+                ])
+                true_params_all.append(tvec)
             else:
-                print(f"   {k:<8s} | mean={mean*scale:.3f}{unit}"
-                      f" | median={median*scale:.3f}{unit}"
-                      f" | std={std*scale:.3f}{unit}")
+                true_params_all.append(np.full_like(r["theta_hat"], np.nan))
 
-    # --- Output summary ---
-    print(f"\n→ Final avg time: {avg_time:.1f} ms, mean RMSE={np.mean(rmses):.5f}\n")
-    summarize(per_param_rel_errors, "relative")
-    print()
-    summarize(per_param_abs_errors, "absolute")
+            theta_hat = np.array(r["theta_hat"], dtype=np.float32)
+            true_vec = np.array(true_params_all[-1], dtype=np.float32)
+            param_names = ["eta", "rho", "H"] + [f"xi0_{j}" for j in range(len(theta_hat) - 3)]
 
-    # --- Return data (only abs RMSEs computed) ---
-    per_param_abs_rmse = {k: np.sqrt(np.mean(v ** 2)) for k, v in per_param_abs_errors.items()}
+            abs_errs = np.abs(theta_hat - true_vec)
+            rel_errs = abs_errs / np.clip(np.abs(true_vec), 1e-8, None)
 
-    return {
-        "optimizer": optimiser,
-        "avg_time_ms": float(avg_time),
-        "mean_rmse": float(np.mean(rmses)),
-        "per_param_rel_errors": per_param_rel_errors,
-        "per_param_abs_errors": per_param_abs_errors,
-        "per_param_abs_rmse": per_param_abs_rmse,
-        "true_params": true_params_all,
-        "est_params": est_params_all,
-        "rmses": rmses,
-        "runtimes": runtimes,
-    }
+            for k, aerr, rerr in zip(param_names, abs_errs, rel_errs):
+                per_param_abs_errors.setdefault(k, []).append(aerr)
+                per_param_rel_errors.setdefault(k, []).append(rerr)
 
+            if verbose and (i % 50 == 0 or i == len(surfaces)):
+                mean_rmse = np.mean(rmses)
+                print(f"  [{i}/{len(surfaces)}] mean RMSE={mean_rmse:.5f}, "
+                    f"avg time={np.mean(runtimes):.1f} ms")
 
+        # Convert lists to arrays
+        for d in (per_param_abs_errors, per_param_rel_errors):
+            for k in d:
+                d[k] = np.array(d[k])
 
-    
+        runtimes, rmses = np.array(runtimes), np.array(rmses)
+        true_params_all, est_params_all = np.array(true_params_all), np.array(est_params_all)
+        avg_time = np.mean(runtimes)
+
+        # --- Helper for summary printing ---
+        def summarize(errors, kind):
+            print(f"{kind.title()} Errors per Parameter:")
+            for k, vals in errors.items():
+                scale = 100 if kind == "relative" else 1
+                mean = np.mean(vals)
+                median = np.median(vals)
+                std = np.std(vals)
+                unit = "%" if kind == "relative" else ""
+                if kind == "absolute":
+                    rmse = np.sqrt(np.mean(vals ** 2))
+                    print(f"   {k:<8s} | mean={mean*scale:.3f}{unit}"
+                        f" | median={median*scale:.3f}{unit}"
+                        f" | std={std*scale:.3f}{unit}"
+                        f" | RMSE={rmse*scale:.3f}{unit}")
+                else:
+                    print(f"   {k:<8s} | mean={mean*scale:.3f}{unit}"
+                        f" | median={median*scale:.3f}{unit}"
+                        f" | std={std*scale:.3f}{unit}")
+
+        # --- Output summary ---
+        print(f"\n→ Final avg time: {avg_time:.1f} ms, mean RMSE={np.mean(rmses):.5f}\n")
+        summarize(per_param_rel_errors, "relative")
+        print()
+        summarize(per_param_abs_errors, "absolute")
+
+        # --- Return data (only abs RMSEs computed) ---
+        per_param_abs_rmse = {k: np.sqrt(np.mean(v ** 2)) for k, v in per_param_abs_errors.items()}
+
+        return {
+            "optimizer": optimiser,
+            "avg_time_ms": float(avg_time),
+            "mean_rmse": float(np.mean(rmses)),
+            "per_param_rel_errors": per_param_rel_errors,
+            "per_param_abs_errors": per_param_abs_errors,
+            "per_param_abs_rmse": per_param_abs_rmse,
+            "true_params": true_params_all,
+            "est_params": est_params_all,
+            "rmses": rmses,
+            "runtimes": runtimes,
+        }
+
     def count_parameters(self, trainable_only=True):
         """Return the number of (trainable) parameters."""
         if trainable_only:

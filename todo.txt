@@ -27,40 +27,40 @@ print("DeepONet Model param counts: ",deeponet_model.count_parameters())
 # fig = model.plot_evaluation(test_surfaces[0])
 deeponet_eval = deeponet_model.evaluate(test_data, out_dir="deeponet_eval")
 
-Epoch 035 | train_rmse=0.027980, val_rmse=0.026921, lr=1.0e-04, time=129.93s, ETA=10.68 min
+Epoch 035 | train_rmse=0.027766, val_rmse=0.026923, lr=1.0e-04, time=114.21s, ETA=9.67 min
 → Adjusted learning rate to 1.00e-05 at epoch 35
-                                                              
-Epoch 036 | train_rmse=0.027531, val_rmse=0.026308, lr=1.0e-05, time=129.41s, ETA=8.55 min
-                                                              
-Epoch 037 | train_rmse=0.027498, val_rmse=0.026305, lr=1.0e-05, time=131.74s, ETA=6.41 min
                                                                
-Epoch 038 | train_rmse=0.027491, val_rmse=0.026319, lr=1.0e-05, time=129.47s, ETA=4.28 min
-                                                              
-Epoch 039 | train_rmse=0.027485, val_rmse=0.026280, lr=1.0e-05, time=129.46s, ETA=2.14 min
-                                                              
-Epoch 040 | train_rmse=0.027483, val_rmse=0.026296, lr=1.0e-05, time=128.22s, ETA=0.00 min
+Epoch 036 | train_rmse=0.027291, val_rmse=0.026287, lr=1.0e-05, time=110.83s, ETA=7.73 min
+                                                               
+Epoch 037 | train_rmse=0.027262, val_rmse=0.026279, lr=1.0e-05, time=111.62s, ETA=5.79 min
+                                                               
+Epoch 038 | train_rmse=0.027254, val_rmse=0.026274, lr=1.0e-05, time=109.83s, ETA=3.85 min
+                                                               
+Epoch 039 | train_rmse=0.027249, val_rmse=0.026271, lr=1.0e-05, time=111.74s, ETA=1.93 min
+                                                               
+Epoch 040 | train_rmse=0.027245, val_rmse=0.026269, lr=1.0e-05, time=109.98s, ETA=0.00 min
 
-✅ Training completed in 85.56 min (avg 128.34s per epoch)
+✅ Training completed in 76.92 min (avg 115.38s per epoch)
 Model exported to exports\deeponet_final.json
 DeepONet Model param counts:  30208
 
-→ Final avg time: 139.6 ms, mean RMSE=0.00106
+→ Final avg time: 140.4 ms, mean RMSE=0.00111
 
-Mean relative errors per parameter:
-   eta      | mean=1.646% | median=0.945% | std=3.418%
-   rho      | mean=1.779% | median=1.088% | std=2.435%
-   H        | mean=6.263% | median=3.382% | std=17.877%
-   xi0_0    | mean=4.308% | median=1.458% | std=10.033%
-   xi0_1    | mean=5.406% | median=2.274% | std=12.253%
-   xi0_2    | mean=9.082% | median=4.172% | std=15.933%
-   xi0_3    | mean=13.259% | median=5.867% | std=21.010%
-   xi0_4    | mean=17.850% | median=7.381% | std=33.927%
-   xi0_5    | mean=23.437% | median=12.092% | std=38.005%
-   xi0_6    | mean=31.209% | median=15.952% | std=56.293%
-   xi0_7    | mean=42.239% | median=24.359% | std=71.572%
-   xi0_8    | mean=58.019% | median=35.577% | std=89.054%
-   xi0_9    | mean=65.519% | median=45.621% | std=78.479%
-   xi0_10   | mean=67.379% | median=41.396% | std=90.180%
+Relative Errors per Parameter:
+   eta      | mean=1.634% | median=0.951% | std=2.543%
+   rho      | mean=1.820% | median=1.093% | std=2.335%
+   H        | mean=6.218% | median=3.318% | std=10.122%
+   xi0_0    | mean=3.722% | median=1.327% | std=6.813%
+   xi0_1    | mean=5.702% | median=2.688% | std=9.618%
+   xi0_2    | mean=11.671% | median=4.273% | std=27.483%
+   xi0_3    | mean=15.498% | median=6.010% | std=32.373%
+   xi0_4    | mean=19.746% | median=7.777% | std=40.329%
+   xi0_5    | mean=25.165% | median=10.250% | std=52.835%
+   xi0_6    | mean=30.372% | median=14.318% | std=60.475%
+   xi0_7    | mean=39.335% | median=22.606% | std=61.081%
+   xi0_8    | mean=52.830% | median=32.989% | std=75.420%
+   xi0_9    | mean=64.913% | median=46.328% | std=83.559%
+   xi0_10   | mean=64.028% | median=43.869% | std=91.222%
 
 
 

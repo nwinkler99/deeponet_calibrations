@@ -24,7 +24,7 @@ parser.add_argument("--sleep", type=int, default=30,
                     help="Seconds to wait after failure before retry")
 parser.add_argument("--seedbase", type=int, default=1234567,
                     help="Deterministic seed offset per batch")
-parser.add_argument("--maxworkers", type=int, default=4,
+parser.add_argument("--maxworkers", type=int, default=3,
                     help="Number of CPU cores to use")
 parser.add_argument("--randomizegrid", action="store_true",
                     help="Randomize time grid per param set")
@@ -187,7 +187,7 @@ if __name__ == "__main__":
 
             surfaces = generate_surfaces_parallel(
                 num_sets=BATCH_SIZE,
-                forward_curves_per_set=10,
+                forward_curves_per_set=1,
                 cfg=cfg,
                 seed=batch_seed,
                 randomize_grid=randomize_grid,

@@ -344,17 +344,18 @@ def _natural_key(name: str):
         return (m.group(1), int(m.group(2)))
     return (name, -1)
 
-
 def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="relative"):
     """
     Compare ECDFs of per-parameter errors across multiple models.
-    Parameter order now exactly matches that used in plot_param_true_vs_est().
+    Also plots ECDF of overall RMSE distributions.
     """
     os.makedirs(out_dir, exist_ok=True)
 
     # --- 1. Extract per-model error dicts depending on kind ---
     param_sets = []
+    rmses_sets = []
     for r in results:
+        rmses_sets.append(r.get("rmses", []))
         if kind == "absolute":
             if "per_param_abs_errors" in r:
                 param_sets.append(r["per_param_abs_errors"])
@@ -369,15 +370,13 @@ def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="r
                 raise KeyError("Missing relative error dict (expected 'per_param_rel_errors' or 'per_param_errors').")
 
     # --- 2. Determine canonical parameter order ---
-    # Prefer the first model’s key order for consistency with scatterplot
     first_dict = param_sets[0]
     all_param_names = list(first_dict.keys())
 
-    # Fallback: use natural sorted order if unordered mapping
     if not all_param_names or isinstance(first_dict, dict) and not hasattr(first_dict, "__iter__"):
         all_param_names = sorted(
             {k for d in param_sets for k in d.keys()},
-            key=_natural_key
+            key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", s)]
         )
 
     ncols = min(4, len(all_param_names))
@@ -408,10 +407,29 @@ def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="r
 
     plt.suptitle(f"Parameter {kind.title()} Error CDFs")
     plt.tight_layout(rect=[0, 0, 1, 0.97])
-    path = os.path.join(out_dir, f"param_error_cdfs_{kind}.png")
-    plt.savefig(path, dpi=200)
+    path_params = os.path.join(out_dir, f"param_error_cdfs_{kind}.png")
+    plt.savefig(path_params, dpi=200)
     plt.close(fig)
-    print(f"Saved {kind} error ECDF comparison to {path}")
+    print(f"Saved {kind} error ECDF comparison to {path_params}")
+
+    # --- 4. Plot RMSE ECDF ---
+    fig, ax = plt.subplots(figsize=(5, 4))
+    for rmses, label in zip(rmses_sets, labels):
+        if len(rmses) == 0:
+            continue
+        xs, ys = ecdf(rmses)
+        ax.plot(ys, xs, label=label)
+    ax.set_xlabel("Quantiles")
+    ax.set_ylabel("RMSE")
+    ax.set_title("Calibration RMSE ECDFs")
+    ax.grid(True, ls=":", lw=0.5)
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    path_rmse = os.path.join(out_dir, "rmse_ecdf.png")
+    plt.savefig(path_rmse, dpi=200)
+    plt.close(fig)
+    print(f"Saved RMSE ECDF comparison to {path_rmse}")
+
 
 
 def plot_param_true_vs_est(

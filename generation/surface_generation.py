@@ -283,14 +283,46 @@ def generate_fixed_surface(
 
     t0_global = time.perf_counter()
 
-    # ----------------- 1. Simulator setup -----------------
+        # ----------------- 1. Simulator setup -----------------
+    t0_total = time.perf_counter()
+
+    # --- 1. rBergomi object creation ---
     t0 = time.perf_counter()
     rb = rBergomi(n=cfg.n, N=cfg.M, T=float(maturities[-1]), a=float(a))
+    t_obj = time.perf_counter() - t0
+
+    # --- 2. Time grid construction ---
+    t0 = time.perf_counter()
     t_grid = rb.t.flatten().astype(dtype)
     dt = np.diff(t_grid, prepend=dtype(0.0))
-    dW1, dW2 = rb.dW1(), rb.dW2()
-    dB, Y = rb.dB(dW1, dW2, rho=float(rho)), rb.Y(dW1)
-    sim_time = time.perf_counter() - t0
+    t_grid_time = time.perf_counter() - t0
+
+    # --- 3. Draw Brownian motions ---
+    t0 = time.perf_counter()
+    dW1 = rb.dW1()
+    dW2 = rb.dW2()
+    t_brown_time = time.perf_counter() - t0
+
+    # --- 4. Correlated driver dB ---
+    t0 = time.perf_counter()
+    dB = rb.dB(dW1, dW2, rho=float(rho))
+    t_dB_time = time.perf_counter() - t0
+
+    # --- 5. fBM kernel convolution / Y computation ---
+    t0 = time.perf_counter()
+    Y = rb.Y(dW1)
+    t_Y_time = time.perf_counter() - t0
+
+    t_total = time.perf_counter() - t0_total
+
+    print(f"\n=== Simulator setup breakdown ===")
+    print(f"rBergomi object init : {t_obj:7.3f} s")
+    print(f"t-grid + dt setup    : {t_grid_time:7.3f} s")
+    print(f"Brownian draws (W1,W2): {t_brown_time:7.3f} s")
+    print(f"dB computation        : {t_dB_time:7.3f} s")
+    print(f"Y computation (fBM)   : {t_Y_time:7.3f} s")
+    print(f"TOTAL setup           : {t_total:7.3f} s")
+    sim_time = time.perf_counter() - t0_global
 
     # ----------------- 2. Forward variance mapping -----------------
     t0 = time.perf_counter()
