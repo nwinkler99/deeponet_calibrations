@@ -15,8 +15,29 @@ from scipy.optimize import brentq
 from dataclasses import dataclass
 from typing import List, Tuple
 import matplotlib.pyplot as plt
+from numpy.random import SeedSequence, default_rng
 
+plt.rcParams.update({
+    "font.size": 10,
+    "axes.titlesize": 13,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 9,
+    "lines.linewidth": 1.8,
+    "axes.grid": True,
+    "grid.linestyle": ":",
+    "grid.linewidth": 0.5,
+    "axes.edgecolor": "#333333",
+    "axes.labelcolor": "#222222",
+    "axes.titleweight": "semibold",
+    "figure.dpi": 150,
+})
 
+def _tight_suptitle(fig, title, fontsize=17):
+    """Add a large, bold suptitle closer to subplots."""
+    fig.suptitle(title, fontsize=fontsize, weight="bold", y=0.97)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
 # --------------------------------------------------------------------------------------------------------
 # TBSS / rBergomi helper functions
 # --------------------------------------------------------------------------------------------------------
@@ -159,28 +180,28 @@ def sample_param_sets_lhs(num_sets: int, rng: np.random.RandomState) -> List[RBe
     return param_sets
 
 
-def jitter_grid(base_grid: np.ndarray, grid_jitter: float = 0.5, min_spacing: float = 0.05) -> np.ndarray:
-    """
-    Randomly perturb a base grid while keeping minimum spacing.
-    Returns float64; caller can cast to cfg.dtype.
-    """
-    base_grid = np.sort(np.array(base_grid, dtype=float))
-    n = len(base_grid)
-    lo, hi = base_grid[0], base_grid[-1]
-    total_range = hi - lo
-    total_budget = grid_jitter * total_range
 
-    grid_shifted = base_grid.copy()
-    for _ in range(100):
-        signs = np.random.choice([-1, 1], size=n)
-        weights = np.random.uniform(0, 1, size=n)
-        weights /= np.sum(weights) + 1e-12
-        jitter = signs * weights * total_budget
-        grid_shifted = np.clip(np.sort(base_grid + jitter), lo, hi)
-        if np.all(np.diff(grid_shifted) > min_spacing):
-            return np.round(grid_shifted, 6)
+def jitter_grid(x, grid_jitter=0.5, min_spacing=0.02, rng=None):
+    """
+    Apply small random jitter to grid points while preserving spacing.
+    Deterministic if rng is provided.
+    """
+    rng = rng or default_rng()
+    x = np.array(x, dtype=float, copy=True)
+    n = len(x)
+    if n < 2:
+        return x
 
-    return np.round(grid_shifted, 6)
+    step = np.median(np.diff(x))
+    jitter = rng.normal(0.0, grid_jitter * step, size=n)
+    y = np.clip(x + jitter, x.min(), x.max())
+    y.sort()
+
+    # enforce minimal spacing
+    for i in range(1, n):
+        if y[i] - y[i - 1] < min_spacing:
+            y[i] = y[i - 1] + min_spacing
+    return y
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -336,7 +357,6 @@ import matplotlib.pyplot as plt
 from scipy.optimize import minimize, least_squares, differential_evolution
 
 import os, re, numpy as np, matplotlib.pyplot as plt
-
 def _natural_key(name: str):
     """Sort helper: ensures xi0_2 < xi0_10, while keeping eta, rho, H first."""
     m = re.match(r"^([A-Za-z_]+)(\d+)$", name)
@@ -344,183 +364,238 @@ def _natural_key(name: str):
         return (m.group(1), int(m.group(2)))
     return (name, -1)
 
-def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="relative"):
-    """
-    Compare ECDFs of per-parameter errors across multiple models.
-    Also plots ECDF of overall RMSE distributions.
-    """
+
+def plot_param_true_vs_est(results, labels, out_dir="calibration_plots", alpha=0.6):
+    """Compare true vs estimated parameters across multiple models."""
     os.makedirs(out_dir, exist_ok=True)
+    colors = plt.cm.tab10.colors
 
-    # --- 1. Extract per-model error dicts depending on kind ---
-    param_sets = []
-    rmses_sets = []
-    for r in results:
-        rmses_sets.append(r.get("rmses", []))
-        if kind == "absolute":
-            if "per_param_abs_errors" in r:
-                param_sets.append(r["per_param_abs_errors"])
-            else:
-                raise KeyError("Missing 'per_param_abs_errors' in result dict.")
-        else:
-            for key in ["per_param_rel_errors", "per_param_errors"]:
-                if key in r:
-                    param_sets.append(r[key])
-                    break
-            else:
-                raise KeyError("Missing relative error dict (expected 'per_param_rel_errors' or 'per_param_errors').")
-
-    # --- 2. Determine canonical parameter order ---
-    first_dict = param_sets[0]
-    all_param_names = list(first_dict.keys())
-
-    if not all_param_names or isinstance(first_dict, dict) and not hasattr(first_dict, "__iter__"):
-        all_param_names = sorted(
-            {k for d in param_sets for k in d.keys()},
-            key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", s)]
-        )
-
-    ncols = min(4, len(all_param_names))
-    nrows = int(np.ceil(len(all_param_names) / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows), squeeze=False)
-
-    def ecdf(x):
-        xs = np.sort(np.asarray(x))
-        ys = np.linspace(0, 1, len(xs))
-        return xs, ys
-
-    # --- 3. Plot ECDFs per parameter ---
-    for i, param in enumerate(all_param_names):
-        ax = axes[i // ncols, i % ncols]
-        for data, label in zip(param_sets, labels):
-            if param in data:
-                xs, ys = ecdf(data[param])
-                ax.plot(ys, xs * (100 if kind == "relative" else 1), label=label)
-        ax.set_title(param)
-        ax.set_xlabel("Quantiles")
-        ax.set_ylabel(f"{kind.title()} Error" + (" [%]" if kind == "relative" else ""))
-        ax.grid(True, ls=":", lw=0.5)
-        ax.legend(fontsize=8)
-
-    # Hide unused subplots
-    for j in range(i + 1, nrows * ncols):
-        axes[j // ncols, j % ncols].axis("off")
-
-    plt.suptitle(f"Parameter {kind.title()} Error CDFs")
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
-    path_params = os.path.join(out_dir, f"param_error_cdfs_{kind}.png")
-    plt.savefig(path_params, dpi=200)
-    plt.close(fig)
-    print(f"Saved {kind} error ECDF comparison to {path_params}")
-
-    # --- 4. Plot RMSE ECDF ---
-    fig, ax = plt.subplots(figsize=(5, 4))
-    for rmses, label in zip(rmses_sets, labels):
-        if len(rmses) == 0:
-            continue
-        xs, ys = ecdf(rmses)
-        ax.plot(ys, xs, label=label)
-    ax.set_xlabel("Quantiles")
-    ax.set_ylabel("RMSE")
-    ax.set_title("Calibration RMSE ECDFs")
-    ax.grid(True, ls=":", lw=0.5)
-    ax.legend(fontsize=9)
-    plt.tight_layout()
-    path_rmse = os.path.join(out_dir, "rmse_ecdf.png")
-    plt.savefig(path_rmse, dpi=200)
-    plt.close(fig)
-    print(f"Saved RMSE ECDF comparison to {path_rmse}")
-
-
-
-def plot_param_true_vs_est(
-    results,
-    labels,
-    out_dir="calibration_plots",
-    alpha=0.6,
-):
-    """
-    Compare true vs estimated parameters across multiple models.
-
-    Parameters
-    ----------
-    results : list[dict]
-        Each dict must contain:
-            - 'true_params': (N, d) array
-            - 'est_params': (N, d) array
-            - optionally 'per_param_abs_errors' or 'per_param_rel_errors' (for param names)
-    labels : list[str]
-        Model names corresponding to each result dict.
-    out_dir : str
-        Output directory for saved figures.
-    alpha : float
-        Scatter transparency for overlapping points.
-    """
-    import os, numpy as np, matplotlib.pyplot as plt
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Determine parameter names (prefer consistent naming if present)
     all_param_names = None
     for res in results:
-        if "per_param_abs_errors" in res:
-            all_param_names = list(res["per_param_abs_errors"].keys())
-            break
-        elif "per_param_rel_errors" in res:
-            all_param_names = list(res["per_param_rel_errors"].keys())
+        for key in ["per_param_abs_errors", "per_param_rel_errors"]:
+            if key in res:
+                all_param_names = list(res[key].keys())
+                break
+        if all_param_names:
             break
 
     if all_param_names is None:
-        # fallback: infer names as generic indices
         max_dim = max(r["true_params"].shape[1] for r in results)
         all_param_names = [f"param_{i}" for i in range(max_dim)]
+
+    all_param_names = sorted(
+        all_param_names,
+        key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", s)],
+    )
 
     n_params = len(all_param_names)
     ncols = min(4, n_params)
     nrows = int(np.ceil(n_params / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows), squeeze=False)
 
-    colors = plt.cm.tab10.colors  # distinct color palette
-
     for i, param in enumerate(all_param_names):
         ax = axes[i // ncols, i % ncols]
-
         for j, (res, label) in enumerate(zip(results, labels)):
             if i >= res["true_params"].shape[1]:
-                continue  # skip if model has fewer parameters
-
+                continue
             true_vals = res["true_params"][:, i]
             est_vals = res["est_params"][:, i]
+            ax.scatter(true_vals, est_vals, alpha=alpha, s=12,
+                       color=colors[j % len(colors)], label=label, edgecolors="none")
 
-            ax.scatter(
-                true_vals,
-                est_vals,
-                alpha=alpha,
-                s=12,
-                color=colors[j % len(colors)],
-                label=label,
-                edgecolors="none",
-            )
-
-        # draw perfect-fit line
         all_true = np.concatenate(
             [r["true_params"][:, i] for r in results if i < r["true_params"].shape[1]]
         )
         lo, hi = np.nanmin(all_true), np.nanmax(all_true)
-        ax.plot([lo, hi], [lo, hi], "k--", lw=1, label="Perfect fit")
-
-        ax.set_title(param)
+        ax.plot([lo, hi], [lo, hi], "k--", lw=1)
+        ax.set_title(param, fontsize=14)
         ax.set_xlabel("True")
         ax.set_ylabel("Estimated")
-        ax.grid(True, ls=":", lw=0.5)
-        ax.legend(fontsize=8)
+        if i == 0:
+            ax.legend(frameon=True, loc="upper left")
 
-    # turn off unused subplots
     for j in range(i + 1, nrows * ncols):
         axes[j // ncols, j % ncols].axis("off")
 
-    plt.suptitle("True vs Estimated Parameters (Calibration Comparison)")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    _tight_suptitle(fig, "True vs Estimated Parameters (Calibration Comparison)")
     path = os.path.join(out_dir, "param_true_vs_est.png")
     plt.savefig(path, dpi=200)
     plt.close(fig)
     print(f"Saved scatter comparison to {path}")
+
+
+
+def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="relative"):
+    """Compare ECDFs of per-parameter errors and RMSEs across multiple models."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    param_sets, rmses_sets = [], []
+    for r in results:
+        rmses_sets.append(r.get("rmses", []))
+        if kind == "absolute":
+            param_sets.append(r["per_param_abs_errors"])
+        else:
+            for key in ["per_param_rel_errors", "per_param_errors"]:
+                if key in r:
+                    param_sets.append(r[key])
+                    break
+
+    first_dict = param_sets[0]
+    if not first_dict or isinstance(first_dict, dict) and not hasattr(first_dict, "__iter__"):
+        all_param_names = sorted(
+            {k for d in param_sets for k in d.keys()},
+            key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", s)],
+        )
+    else:
+        all_param_names = sorted(
+            list(first_dict.keys()),
+            key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", s)],
+        )
+
+    ncols = min(4, len(all_param_names))
+    nrows = int(np.ceil(len(all_param_names) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.2 * nrows), squeeze=False)
+
+    def ecdf(x):
+        xs = np.sort(np.asarray(x))
+        ys = np.linspace(0, 1, len(xs))
+        return xs, ys
+
+    for i, param in enumerate(all_param_names):
+        ax = axes[i // ncols, i % ncols]
+        for data, label in zip(param_sets, labels):
+            xs, ys = ecdf(data[param])
+            ax.plot(ys, xs * (100 if kind == "relative" else 1), label=label)
+        ax.set_title(param, fontsize=14)
+        ax.set_xlabel("Quantiles")
+        ax.set_ylabel(f"{kind.title()} Error" + (" [%]" if kind == "relative" else ""))
+        if i == 0:
+            ax.legend(frameon=True, loc="upper left")
+
+    for j in range(i + 1, nrows * ncols):
+        axes[j // ncols, j % ncols].axis("off")
+
+    _tight_suptitle(fig, f"Parameter {kind.title()} Error CDFs")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    path_params = os.path.join(out_dir, f"param_error_cdfs_{kind}.png")
+    plt.savefig(path_params, dpi=200)
+    plt.close(fig)
+    print(f"Saved {kind} error ECDF comparison to {path_params}")
+
+    # RMSE ECDF
+    fig, ax = plt.subplots(figsize=(5, 4))
+    for rmses, label in zip(rmses_sets, labels):
+        xs, ys = ecdf(rmses)
+        ax.plot(ys, xs, label=label)
+    ax.set_xlabel("Quantiles")
+    ax.set_ylabel("RMSE")
+    ax.legend(frameon=True, loc="upper left")
+    _tight_suptitle(fig, "Calibration RMSE ECDFs")
+    path_rmse = os.path.join(out_dir, "rmse_ecdf.png")
+    plt.savefig(path_rmse, dpi=200)
+    plt.close(fig)
+    print(f"Saved RMSE ECDF comparison to {path_rmse}")
+
+
+import os, numpy as np, matplotlib.pyplot as plt, copy
+
+def apply_structured_noise(iv_surface, sigma=0.01, mode="both"):
+    """Apply structured multiplicative noise (row/col/both) to an IV surface."""
+    noisy = iv_surface.copy()
+    nT, nK = iv_surface.shape
+    if mode in ["row", "both"]:
+        row_factors = 1 + np.random.normal(0, sigma, size=nT)
+        noisy *= row_factors[:, None]
+    if mode in ["col", "both"]:
+        col_factors = 1 + np.random.normal(0, sigma, size=nK)
+        noisy *= col_factors[None, :]
+    return noisy
+
+
+def compare_model_robustness(
+    models,
+    model_labels,
+    surfaces,
+    noise_levels=(0.001, 0.002, 0.005, 0.01, 0.02),
+    n_real=10,
+    out_dir="robustness_comparison",
+    mode="both",
+):
+    """Compare robustness of multiple models under structured IV perturbations."""
+    os.makedirs(out_dir, exist_ok=True)
+    eps = 1e-8
+    colors = plt.cm.tab10.colors
+
+    n_knots = len(surfaces[0]["params"]["xi0_knots"])
+    param_names = ["eta", "rho", "H"] + [f"xi0_{i+1}" for i in range(n_knots)]
+
+    # sort using same rule as ECDFs
+    param_names = sorted(
+        param_names,
+        key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", s)],
+    )
+
+    stats = []
+    for model, label in zip(models, model_labels):
+        mean_err = {p: [] for p in param_names}
+        low_q = {p: [] for p in param_names}
+        high_q = {p: [] for p in param_names}
+
+        for sigma in noise_levels:
+            rel_errs_lvl = {p: [] for p in param_names}
+            for s in surfaces:
+                base = model.calibrate(s, optimiser="levenberg-marquardt")["theta_hat"]
+                for _ in range(n_real):
+                    s_noisy = copy.deepcopy(s)
+                    if sigma > 0:
+                        s_noisy["iv_surface"] = apply_structured_noise(s["iv_surface"], sigma, mode)
+                    noisy = model.calibrate(s_noisy, optimiser="levenberg-marquardt")["theta_hat"]
+                    for i, p in enumerate(param_names):
+                        rel = abs(noisy[i] - base[i]) / (abs(base[i]) + eps)
+                        rel_errs_lvl[p].append(rel)
+
+            for p in param_names:
+                errs = np.array(rel_errs_lvl[p])
+                mean_err[p].append(np.mean(errs))
+                low_q[p].append(np.quantile(errs, 0.05))
+                high_q[p].append(np.quantile(errs, 0.95))
+
+        stats.append({"label": label, "mean": mean_err, "low": low_q, "high": high_q})
+
+    # Plot layout
+    n_params = len(param_names)
+    ncols = min(4, n_params)
+    nrows = int(np.ceil(n_params / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows), squeeze=False)
+
+    for i, pname in enumerate(param_names):
+        ax = axes[i // ncols, i % ncols]
+        for mi, s in enumerate(stats):
+            mean = np.array(s["mean"][pname])
+            lo = np.array(s["low"][pname])
+            hi = np.array(s["high"][pname])
+            c = colors[mi % len(colors)]
+            ax.plot(noise_levels, mean, color=c, lw=2, label=s["label"])
+            ax.plot(noise_levels, lo, color=c, ls="--", lw=1)
+            ax.plot(noise_levels, hi, color=c, ls="--", lw=1)
+        #ax.set_xscale("symlog", linthresh=1e-4)
+        ax.set_xlabel("Noise Std")
+        ax.set_ylabel(f"Rel |Δ{pname}|")
+        ax.set_title(pname)
+        if i == 0:
+            ax.legend(frameon=True, loc="upper left")
+
+    for j in range(i + 1, nrows * ncols):
+        axes[j // ncols, j % ncols].axis("off")
+    # X-Ticks styling
+    for ax in axes.flat:
+        ax.set_xticks(noise_levels)
+        ax.set_xticklabels([f"{x:.3g}" for x in noise_levels], rotation=45, ha="right")
+
+    _tight_suptitle(fig, "Model Robustness Comparison under IV Perturbations")
+    path = os.path.join(out_dir, "robustness_comparison.png")
+    plt.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"Saved comparison plot to {path}")
+
+    return stats

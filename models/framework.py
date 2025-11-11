@@ -15,6 +15,7 @@ from matplotlib import cm
 from scipy.interpolate import RectBivariateSpline, RegularGridInterpolator
 import time
 from scipy.optimize import minimize, least_squares, differential_evolution
+import sys
 
 # ============================================================
 # Dataset Wrapper (for DeepONet per-point supervision)
@@ -1078,6 +1079,7 @@ class DeepONet(BaseModel):
         return mask_np
 
     # --------------------------------------------------------
+
     def train_model(
         self,
         train_loader,
@@ -1086,20 +1088,7 @@ class DeepONet(BaseModel):
         lr_schedule=[(0, 1e-3), (5, 5e-4), (8, 1e-4)],
     ):
         """
-        Train the DeepONet model with optional learning-rate schedule, timing, and ETA display.
-
-        Parameters
-        ----------
-        train_loader : DataLoader
-            Training data loader (xb, xt, y) batches.
-        val_loader : DataLoader, optional
-            Validation data loader.
-        epochs : int, default=10
-            Total number of training epochs.
-        lr_schedule : list of (int, float), optional
-            List of (epoch, lr) tuples defining the learning-rate schedule.
-            Example: [(0, 1e-3), (30, 5e-4), (60, 1e-4)]
-            Learning rate changes at each specified epoch threshold.
+        Train the DeepONet model with minimal one-line logging (no tqdm).
         """
         lr_schedule = sorted(lr_schedule, key=lambda x: x[0])
         schedule_index = 0
@@ -1122,12 +1111,12 @@ class DeepONet(BaseModel):
                 new_lr = lr_schedule[schedule_index][1]
                 for g in self.optimizer.param_groups:
                     g["lr"] = new_lr
-                print(f"→ Adjusted learning rate to {new_lr:.2e} at epoch {epoch}")
+                sys.stdout.write(f"\n→ Adjusted learning rate to {new_lr:.2e} at epoch {epoch}\n")
 
             # --- Training loop ---
             self.train()
             total_loss = 0.0
-            for xb, xt, y in tqdm(train_loader, desc=f"Train {epoch+1}", leave=False):
+            for xb, xt, y in train_loader:
                 xb, xt, y = xb.to(self.device), xt.to(self.device), y.to(self.device)
                 pred = self.forward(xb, xt)
                 loss = self.compute_loss(pred, y)
@@ -1159,10 +1148,14 @@ class DeepONet(BaseModel):
             eta = remaining_epochs * avg_time
 
             msg += f", time={epoch_time:.2f}s, ETA={eta/60:.2f} min"
-            print(msg)
+
+            # --- Overwrite last line in-place ---
+            sys.stdout.write("\r\033[K" + msg)
+            sys.stdout.flush()
 
         # --- Summary ---
         total_time = time.time() - start_time
+        print()  # newline after final overwrite
         print(f"\n✅ Training completed in {total_time/60:.2f} min "
             f"(avg {total_time/epochs:.2f}s per epoch)")
 
@@ -1171,6 +1164,7 @@ class DeepONet(BaseModel):
             out_dir="exports",
             filename=f"{self.__class__.__name__.lower()}_final.json"
         )
+
 
 
 

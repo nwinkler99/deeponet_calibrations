@@ -22,9 +22,9 @@ parser.add_argument("--batchsize", type=int, default=60,
                     help="Number of parameter sets per batch")
 parser.add_argument("--sleep", type=int, default=30,
                     help="Seconds to wait after failure before retry")
-parser.add_argument("--seedbase", type=int, default=1234567,
+parser.add_argument("--seedbase", type=int, default=12345678,
                     help="Deterministic seed offset per batch")
-parser.add_argument("--maxworkers", type=int, default=3,
+parser.add_argument("--maxworkers", type=int, default=2,
                     help="Number of CPU cores to use")
 parser.add_argument("--randomizegrid", action="store_true",
                     help="Randomize time grid per param set")
@@ -46,9 +46,9 @@ CHUNK_SIZE = args.chunk or int(BATCH_SIZE // MAX_WORKERS)
 START_BATCH = args.startbatch
 
 if randomize_grid:             # number of parameter sets per batch
-    SAVE_ROOT = "data/longrun" # root directory for all runs
+    SAVE_ROOT = "data/new_longrun" # root directory for all runs
 else:
-    SAVE_ROOT = "data/fixed_longrun"  # root directory for all runs
+    SAVE_ROOT = "data/new_fixed_longrun"  # root directory for all runs
 os.makedirs(SAVE_ROOT, exist_ok=True)
 
 cfg = SimulationConfig(M=50000, n=int(2.1*252), T_max=2.1, S0=1.0, G=2, dtype=np.float32)

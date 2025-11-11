@@ -7,7 +7,7 @@
 # - Stable implied vol inversion (clipping + NaN handling)
 # - Piecewise constant xi0, Antithetic variates, batch seeding
 # --------------------------------------------------------------------------------------------------------
-
+import gc
 import os
 import pickle
 from datetime import datetime
@@ -67,81 +67,153 @@ class SimulationConfig:
 # Surface generation (batch)
 # --------------------------------------------------------------------------------------------------------
 
+import gc
+import numpy as np
+from numpy.random import SeedSequence, default_rng
+from typing import List, Dict
+
+# ============================================================
+# Helper 1️⃣: jitter_grid with explicit RNG
+# ============================================================
+def jitter_grid(x, grid_jitter=0.5, min_spacing=0.02, rng=None):
+    """
+    Apply small random jitter to grid points while preserving spacing.
+    Deterministic if rng is provided.
+    """
+    rng = rng or default_rng()
+    x = np.array(x, dtype=float, copy=True)
+    n = len(x)
+    if n < 2:
+        return x
+
+    step = np.median(np.diff(x))
+    jitter = rng.normal(0.0, grid_jitter * step, size=n)
+    y = np.clip(x + jitter, x.min(), x.max())
+    y.sort()
+
+    # enforce minimal spacing
+    for i in range(1, n):
+        if y[i] - y[i - 1] < min_spacing:
+            y[i] = y[i - 1] + min_spacing
+    return y
+
+
+# ============================================================
+# Helper 2️⃣: LHS parameter sampling with RNG injection
+# ============================================================
+from scipy.stats import qmc
+
+class RBergomiParams:
+    def __init__(self, eta, rho, H):
+        self.eta = eta
+        self.rho = rho
+        self.H = H
+
+
+def sample_param_sets_lhs(num_sets: int, rng) -> List[RBergomiParams]:
+    """Latin Hypercube sampling for (eta, rho, H) with explicit RNG control."""
+    sampler_seed = rng.integers(0, 2**31 - 1)
+    sampler = qmc.LatinHypercube(d=3, seed=sampler_seed)
+    sample = sampler.random(num_sets)
+
+    lower = np.array([0.5, -0.95, 0.025])
+    upper = np.array([4.0, -0.1, 0.5])
+    scaled = qmc.scale(sample, lower, upper)
+
+    return [
+        RBergomiParams(float(scaled[i, 0]), float(scaled[i, 1]), float(scaled[i, 2]))
+        for i in range(num_sets)
+    ]
+
+
+# ============================================================
+#  Main generator: fully reproducible
+# ============================================================
 def generate_surfaces(
     num_sets: int = 1,
     forward_curves_per_set: int = 1,
-    cfg: SimulationConfig = None,
+    cfg=None,
     seed: int = 42,
     randomize_grid: bool = False,
-    grid_jitter: float = 0.5
+    grid_jitter: float = 0.5,
 ) -> List[Dict]:
     """
-    Generate implied-volatility surfaces from the rBergomi model using Monte Carlo simulation.
-    Uses rho-aware conditional Monte Carlo (martingale control variate):
-      per path and maturity, use BS with
-        F_path = S0*exp(rho*∫sqrt(V)dW - 0.5*rho^2∫Vds)
-        sigma_path^2 = (1 - rho^2) * ∫Vds / T.
-    Computes iv_rel_error as 1.96 * SE_iv / iv.
+    Deterministic generation of implied-volatility surfaces from rBergomi model.
+
+    Every stochastic element (param LHS, xi0, rBergomi paths, jitter grids)
+    is driven by explicitly controlled RNGs derived from one SeedSequence.
     """
-    #save_dir = os.path.join("data", date_str if randomize_grid else "fixed_longrun")
-    #os.makedirs(save_dir, exist_ok=True)
+    from generation.rbergomi import rBergomi, bs_call_vec_pathwise, bsinv, bs_vega  # adjust paths if needed
 
     results: List[Dict] = []
-    rng = np.random.RandomState(seed)
+
+    # --- 1️⃣ Central deterministic seed hierarchy ---
+    root_seq = SeedSequence(seed)
+    rng_params = default_rng(root_seq.spawn(1)[0])
+    param_sets = sample_param_sets_lhs(num_sets, rng_params)
+    set_seqs = root_seq.spawn(num_sets)
+
     n, T_max = cfg.n, cfg.T_max
 
-    param_sets = sample_param_sets_lhs(num_sets, rng)
-
-    for s, params in enumerate(param_sets):
-        set_seed = rng.randint(0, 2**31 - 1)
-        set_rng = np.random.RandomState(set_seed)
+    # --- 2️⃣ Generate per param set ---
+    for s, (params, set_seq) in enumerate(zip(param_sets, set_seqs)):
+        subseqs = set_seq.spawn(3)
+        rng_rb = default_rng(subseqs[0])     # for Brownian increments (rBergomi)
+        rng_xi = default_rng(subseqs[1])     # for xi0 knots
+        rng_jit = default_rng(subseqs[2])    # for jitter grids
 
         eta, rho, H = float(params.eta), float(params.rho), float(params.H)
         a = H - 0.5
 
-        # --- Simulator
+        # --- 3️⃣ rBergomi simulation (deterministic via rng_rb) ---
+        np.random.seed(rng_rb.integers(0, 2**31 - 1))  # if rBergomi uses np.random internally
         rb = rBergomi(n=n, N=cfg.M, T=T_max, a=a)
         t_grid = rb.t.flatten().astype(cfg.dtype)
         dt = np.diff(t_grid, prepend=cfg.dtype(0.0)).astype(cfg.dtype)
+
         dW1, dW2 = rb.dW1(), rb.dW2()
         dB, Y = rb.dB(dW1, dW2, rho=rho), rb.Y(dW1)
-
-        # volatility driver increments W^(1)
         dW_vol = dW1[..., 0] if dW1.ndim == 3 else dW1
         dW_vol = dW_vol.astype(cfg.dtype, copy=False)
+        del dW1, dW2
+        gc.collect()
 
+        # --- 4️⃣ Forward variance curve generation ---
         for j in range(forward_curves_per_set):
             strikes_base = cfg.strikes.astype(cfg.dtype)
             maturities_base = cfg.maturities.astype(cfg.dtype)
-            xi0_knots = set_rng.uniform(0.01, 0.16, size=len(maturities_base)).astype(cfg.dtype)
 
-            # --- map xi0_knots to sim grid
-            base_edges = np.concatenate([[0.0], maturities_base.astype(float)])
+            forward_points = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.1])
+            xi0_knots = rng_xi.uniform(0.01, 0.16, size=len(forward_points)).astype(cfg.dtype)
+
+            # map xi0_knots to sim grid
+            base_edges = np.concatenate([[0.0], forward_points.astype(float)])
             target_u = np.linspace(0, 1, len(xi0_knots) + 1)
             bin_edges = np.interp(target_u, np.linspace(0, 1, len(base_edges)), base_edges)
             idx = np.searchsorted(bin_edges, t_grid.astype(float), side="right") - 1
             idx = np.clip(idx, 0, len(xi0_knots) - 1)
             xi_t = xi0_knots[idx]
 
+            # simulate volatility & price paths
             V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=eta).astype(cfg.dtype)
             S = rb.S(V, dB, S0=cfg.S0).astype(cfg.dtype)
 
-            # Precompute cumulative integrals for CMC
+            # precompute cumulative integrals for conditional MC
             V_left = V[:, :-1].astype(cfg.dtype, copy=False)
             dt_incr = dt[1:]
             sqrtV_left = np.sqrt(np.maximum(V_left, cfg.dtype(0.0)))
-
             I1_cum = np.cumsum(sqrtV_left * dW_vol, axis=1, dtype=cfg.dtype)
             I2_cum = np.cumsum(V_left * dt_incr[None, :], axis=1, dtype=cfg.dtype)
 
+            # --- 5️⃣ Grid generation & IV computation ---
             for g_id in range(cfg.G):
                 if randomize_grid and g_id > 0:
                     strikes_shifted = np.array(
-                        jitter_grid(strikes_base, grid_jitter=grid_jitter, min_spacing=0.02),
+                        jitter_grid(strikes_base, grid_jitter=grid_jitter, min_spacing=0.02, rng=rng_jit),
                         dtype=cfg.dtype,
                     )
                     maturities_shifted = np.array(
-                        jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.02),
+                        jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.02, rng=rng_jit),
                         dtype=cfg.dtype,
                     )
                 else:
@@ -154,7 +226,6 @@ def generate_surfaces(
                 S0 = cfg.dtype(cfg.S0)
 
                 for mi, Tm in enumerate(maturities_shifted):
-                    # maturity index on sim grid
                     t_idx = np.searchsorted(t_grid.astype(float), float(Tm), side="right") - 1
                     t_idx = int(np.clip(t_idx, 0, S.shape[1] - 1))
                     T_float = float(Tm)
@@ -162,7 +233,7 @@ def generate_surfaces(
                         iv_surf[mi, :], iv_relerr[mi, :] = np.nan, np.nan
                         continue
 
-                    # pull integrals up to t_idx
+                    # pull integrals
                     if t_idx == 0:
                         I1 = np.zeros((V.shape[0],), dtype=cfg.dtype)
                         I2 = np.zeros((V.shape[0],), dtype=cfg.dtype)
@@ -170,67 +241,34 @@ def generate_surfaces(
                         I1 = I1_cum[:, t_idx - 1]
                         I2 = I2_cum[:, t_idx - 1]
 
-                    # Conditional forward and vol per path (rho-aware)
-                    F_path = S0 * np.exp(
-                        cfg.dtype(rho) * I1
-                        - cfg.dtype(0.5) * (cfg.dtype(rho) * cfg.dtype(rho)) * I2
-                    )
+                    F_path = S0 * np.exp(cfg.dtype(rho) * I1 - cfg.dtype(0.5) * (cfg.dtype(rho) ** 2) * I2)
                     sigma_path = np.sqrt(
-                        np.maximum(
-                            (cfg.dtype(1.0) - cfg.dtype(rho) * cfg.dtype(rho)) * I2 / Tm,
-                            cfg.dtype(1e-16),
-                        )
+                        np.maximum((cfg.dtype(1.0) - cfg.dtype(rho) ** 2) * I2 / Tm, cfg.dtype(1e-16))
                     )
 
                     for ki, K_ in enumerate(strikes_shifted):
                         K_abs = K_ * S0
-
-                        # Choose OTM side: right wing (K > S0) -> call, left wing -> put (via parity)
                         use_call = bool(float(K_abs) > float(S0))
-                        call_vals = bs_call_vec_pathwise(
-                            F_path, float(K_abs), T_float, sigma_path
-                        ).astype(cfg.dtype)
-
-                        if use_call:
-                            cond_vals = call_vals
-                            o_flag = "call"
-                        else:
-                            cond_vals = (call_vals - (F_path - K_abs)).astype(cfg.dtype)
-                            o_flag = "put"
-
-                        # Mean and SE across paths (of conditional expectations)
+                        call_vals = bs_call_vec_pathwise(F_path, float(K_abs), T_float, sigma_path).astype(cfg.dtype)
+                        cond_vals = call_vals if use_call else (call_vals - (F_path - K_abs)).astype(cfg.dtype)
                         price_cmc = cfg.dtype(np.mean(cond_vals))
-                        se_price = cfg.dtype(np.std(cond_vals, ddof=1)) / cfg.dtype(
-                            np.sqrt(cfg.M)
-                        )
+                        se_price = cfg.dtype(np.std(cond_vals, ddof=1)) / cfg.dtype(np.sqrt(cfg.M))
 
-                        # guard tiny prices (ill-posed inversion)
                         if not np.isfinite(price_cmc) or price_cmc < cfg.dtype(1e-8):
-                            iv_surf[mi, ki] = np.nan
-                            iv_relerr[mi, ki] = np.nan
+                            iv_surf[mi, ki], iv_relerr[mi, ki] = np.nan, np.nan
                             continue
 
-                        # Invert with correct option flag; propagate SE via vega
                         try:
-                            iv_val = bsinv(
-                                float(price_cmc), float(S0), float(K_abs), T_float, o=o_flag
-                            )
+                            iv_val = bsinv(float(price_cmc), float(S0), float(K_abs), T_float, o="call" if use_call else "put")
                             iv_surf[mi, ki] = cfg.dtype(iv_val)
                             vega = bs_vega(float(S0), float(K_abs), T_float, float(iv_val))
-                            if (
-                                np.isfinite(vega)
-                                and vega > 1e-12
-                                and iv_val > 1e-12
-                            ):
+                            if np.isfinite(vega) and vega > 1e-12 and iv_val > 1e-12:
                                 se_iv = se_price / cfg.dtype(vega)
-                                iv_relerr[mi, ki] = (
-                                    cfg.dtype(1.96) * se_iv / cfg.dtype(iv_val)
-                                )
+                                iv_relerr[mi, ki] = cfg.dtype(1.96) * se_iv / cfg.dtype(iv_val)
                             else:
                                 iv_relerr[mi, ki] = np.nan
                         except Exception:
-                            iv_surf[mi, ki] = np.nan
-                            iv_relerr[mi, ki] = np.nan
+                            iv_surf[mi, ki], iv_relerr[mi, ki] = np.nan, np.nan
 
                     iv_surf[mi, :] = np.clip(iv_surf[mi, :], cfg.dtype(1e-4), cfg.dtype(5.0))
 
@@ -255,6 +293,7 @@ def generate_surfaces(
                 )
 
     return results
+
 
 
 # --------------------------------------------------------------------------------------------------------
