@@ -16,6 +16,9 @@ from scipy.interpolate import RectBivariateSpline, RegularGridInterpolator
 import time
 from scipy.optimize import minimize, least_squares, differential_evolution
 import sys
+from functorch import vmap, jacrev
+import torch.nn.functional as F
+
 
 # ============================================================
 # Dataset Wrapper (for DeepONet per-point supervision)
@@ -64,103 +67,6 @@ class BaseModel(nn.Module):
         self._last_params = None
 
     # -------------------- Shared helpers --------------------
-
-    def export_to_numpy(self, out_dir="exports", filename=None, autosave=True):
-        """
-        Export model weights + metadata for NumPy-only inference.
-        Automatically saves to disk if autosave=True.
-
-        Returns
-        -------
-        export_dict : dict
-            A fully serializable dictionary for pure NumPy inference.
-        """
-        model_type = self.__class__.__name__
-        export = {"model_type": model_type, "meta": {}, "layers": []}
-
-        # --- MLP ---
-        if model_type == "MLP":
-            net = self.net
-            for layer in net:
-                if isinstance(layer, torch.nn.Linear):
-                    W = layer.weight.detach().cpu().numpy().T  # (in, out)
-                    b = layer.bias.detach().cpu().numpy()
-                    act = None
-                elif isinstance(layer, (torch.nn.ReLU, torch.nn.GELU, torch.nn.Tanh, torch.nn.ELU)):
-                    W, b, act = None, None, layer.__class__.__name__.lower()
-                else:
-                    continue
-                export["layers"].append({"W": W, "b": b, "act": act})
-
-            export["meta"] = {
-                "input_dim": self.input_dim,
-                "output_shape": self.output_shape,
-                "param_bounds": (
-                    self.param_bounds[0].tolist() if self.param_bounds else None,
-                    self.param_bounds[1].tolist() if self.param_bounds else None,
-                ),
-                "output_scaler": {
-                    "mean_": self.output_scaler.mean_.tolist(),
-                    "scale_": self.output_scaler.scale_.tolist(),
-                } if self.output_scaler is not None else None,
-                "strikes": self.strikes.tolist() if self.strikes is not None else None,
-                "maturities": self.maturities.tolist() if self.maturities is not None else None,
-            }
-
-
-
-        # --- DeepONet ---
-        elif model_type == "DeepONet":
-            def _extract_seq(seq):
-                layers = []
-                for layer in seq:
-                    if isinstance(layer, torch.nn.Linear):
-                        W = layer.weight.detach().cpu().numpy().T
-                        b = layer.bias.detach().cpu().numpy()
-                        act = None
-                    elif isinstance(layer, (torch.nn.ReLU, torch.nn.GELU, torch.nn.Tanh, torch.nn.ELU)):
-                        W, b, act = None, None, layer.__class__.__name__.lower()
-                    else:
-                        continue
-                    layers.append({"W": W, "b": b, "act": act})
-                return layers
-
-            export["branch_layers"] = _extract_seq(self.branch)
-            export["trunk_layers"]  = _extract_seq(self.trunk)
-            export["meta"] = {
-                "input_dim": self.input_dim,
-                "output_shape": self.output_shape,
-                "param_bounds": (
-                    self.param_bounds[0].tolist() if self.param_bounds else None,
-                    self.param_bounds[1].tolist() if self.param_bounds else None,
-                ),
-                "output_scaler": {
-                    "mean_": self.output_scaler.mean_.tolist(),
-                    "scale_": self.output_scaler.scale_.tolist(),
-                } if self.output_scaler is not None else None,
-                "strikes": self.strikes.tolist() if self.strikes is not None else None,
-                "maturities": self.maturities.tolist() if self.maturities is not None else None,
-            }
-
-        else:
-            raise NotImplementedError(f"Unsupported model type {model_type}")
-
-        # --- Autosave ---
-        if autosave:
-            os.makedirs(out_dir, exist_ok=True)
-            if filename is None:
-                filename = f"{model_type.lower()}_export.json"
-            path = os.path.join(out_dir, filename)
-
-            def _default(o):
-                if isinstance(o, np.ndarray): return o.tolist()
-                raise TypeError(f"Object of type {type(o)} not serializable")
-
-            with open(path, "w") as f:
-                json.dump(export, f, indent=2, default=_default)
-            print(f"Model exported to {path}")
-
-        return export
 
     def set_grid(self, strikes, maturities):
         self.strikes = np.array(strikes, dtype=np.float32)
@@ -298,6 +204,7 @@ class BaseModel(nn.Module):
 
         # Predict surface on model's own grid
         pred_surface = self.predict_surface(params)  # always on (self.maturities, self.strikes)
+        pred_surface = pred_surface.detach().cpu().numpy()
 
         # If grids differ, interpolate true_surface onto model's grid
         if not (np.allclose(Ks_true, self.strikes) and np.allclose(Ts_true, self.maturities)):
@@ -358,6 +265,7 @@ class BaseModel(nn.Module):
         # Predict surface on model's canonical grid
         strikes, maturities = self.strikes, self.maturities
         pred_surface = self.predict_surface(params)
+        pred_surface = pred_surface.detach().cpu().numpy()
 
         # Interpolate true surface to the model's grid if needed
         if not (np.allclose(Ks_true, strikes) and np.allclose(Ts_true, maturities)):
@@ -408,15 +316,17 @@ class BaseModel(nn.Module):
 
         print(f"MAE = {mae:.6f}, RMSE = {rmse:.6f}")
         return fig
-
+    
     def evaluate(self, surface_samples, out_dir):
         """
         Evaluates model-predicted vs. true IV surfaces by binning errors
         according to the model's base grid (self.strikes, self.maturities).
 
-        Works even if each sample has an irregular or different (K,T) grid.
-        Produces heatmaps of mean/median/max relative error [%],
-        MC sampling error [%], and absolute error.
+        Adds:
+        - RMSE per surface
+        - RMSE ECDF/Quantile plot (axes swapped)
+        - RMSE heatmaps (mean/median/max)
+        - RMSE vs parameter plots (eta, H, rho)
         """
         assert self.strikes is not None and self.maturities is not None, \
             "Model grid (strikes/maturities) not set; call set_grid first."
@@ -424,13 +334,24 @@ class BaseModel(nn.Module):
 
         nT, nK = len(self.maturities), len(self.strikes)
 
-        # Initialize bins for predicted rel error, abs error, and MC rel error
+        # Bins
         bin_errs_rel = [[[] for _ in range(nK)] for _ in range(nT)]
         bin_errs_abs = [[[] for _ in range(nK)] for _ in range(nT)]
-        bin_errs_mc = [[[] for _ in range(nK)] for _ in range(nT)]
+        bin_errs_mc  = [[[] for _ in range(nK)] for _ in range(nT)]
+        bin_sqerr    = [[[] for _ in range(nK)] for _ in range(nT)]
+
+        # Store surface-level RMSE and parameters
+        rmses = []
+        etas  = []
+        Hs    = []
+        rhos  = []
 
         for s in surface_samples:
             params = s["params"]
+            etas.append(params["eta"])
+            Hs.append(params["H"])
+            rhos.append(params["rho"])
+
             true_surface = np.array(s["iv_surface"], dtype=np.float32)
 
             grid = s.get("grid", {"strikes": self.strikes, "maturities": self.maturities})
@@ -438,36 +359,30 @@ class BaseModel(nn.Module):
             Ts = np.asarray(grid["maturities"], dtype=np.float32)
 
             pred_surface = self.predict_surface(params, grid=grid)
+
+            # 🔥 safe conversion (outside of optimization)
+            pred_surface = pred_surface.detach().cpu().numpy()
+
             rel_err = np.abs(true_surface - pred_surface) / np.clip(true_surface, 1e-6, None) * 100.0
             abs_err = np.abs(true_surface - pred_surface)
+            sq_err  = (true_surface - pred_surface)**2
+            # RMSE for this surface
+            rmses.append(float(np.sqrt(np.mean(sq_err))))
 
             mc_rel_err = np.array(s.get("iv_rel_error", np.zeros_like(true_surface)), dtype=np.float32) * 100.0
+            mc_rel_err = np.nan_to_num(mc_rel_err, nan=0.0)
 
-            # --- fill NaNs in mc_rel_err dynamically ---
-            nan_mask = np.isnan(mc_rel_err)
-            if np.any(nan_mask):
-                mc_rel_err = np.where(nan_mask, 0.0, mc_rel_err)  # temporary fill
-
-            # Assign errors to nearest bin on base grid
             for ti, T in enumerate(Ts):
                 t_idx = np.argmin(np.abs(self.maturities - T))
                 for ki, K in enumerate(Ks):
                     k_idx = np.argmin(np.abs(self.strikes - K))
 
-                    # --- predicted errors ---
                     bin_errs_rel[t_idx][k_idx].append(rel_err[ti, ki])
                     bin_errs_abs[t_idx][k_idx].append(abs_err[ti, ki])
+                    bin_errs_mc[t_idx][k_idx].append(mc_rel_err[ti, ki])
+                    bin_sqerr[t_idx][k_idx].append(sq_err[ti, ki])
 
-                    # --- MC rel error (handle NaN replacement with bin mean) ---
-                    val = mc_rel_err[ti, ki]
-                    if np.isnan(val):
-                        prev_vals = bin_errs_mc[t_idx][k_idx]
-                        if prev_vals:
-                            val = float(np.mean(prev_vals))  # replace with bin mean so far
-                        else:
-                            val = 0.0
-                    bin_errs_mc[t_idx][k_idx].append(val)
-
+        # ---- aggregation helper ----
         def aggregate_bins(bin_errs):
             mean = np.full((nT, nK), np.nan, dtype=np.float32)
             median = np.full((nT, nK), np.nan, dtype=np.float32)
@@ -476,19 +391,31 @@ class BaseModel(nn.Module):
                 for k in range(nK):
                     vals = bin_errs[t][k]
                     if vals:
-                        mean[t, k] = np.mean(vals)
+                        mean[t, k]   = np.mean(vals)
                         median[t, k] = np.median(vals)
-                        maxv[t, k] = np.max(vals)
+                        maxv[t, k]   = np.max(vals)
             global_mean = np.nanmean(mean)
-            for arr in [mean, median, maxv]:
+            for arr in (mean, median, maxv):
                 arr[np.isnan(arr)] = global_mean
             return mean, median, maxv, global_mean
 
+        # Rel error
         mean_rel, median_rel, max_rel, global_mean_rel = aggregate_bins(bin_errs_rel)
+        # Abs error
         mean_abs, median_abs, max_abs, global_mean_abs = aggregate_bins(bin_errs_abs)
+        # MC error
         mean_mc, median_mc, max_mc, global_mean_mc = aggregate_bins(bin_errs_mc)
 
-        # --- Plotting ---
+        # RMSE
+        mean_sqerr, median_sqerr, max_sqerr, _ = aggregate_bins(bin_sqerr)
+        mean_rmse  = np.sqrt(mean_sqerr)
+        median_rmse = np.sqrt(median_sqerr)
+        max_rmse    = np.sqrt(max_sqerr)
+        global_mean_rmse = float(np.nanmean(mean_rmse))
+
+        # ------------------------------------------------------------
+        # plotting infra
+        # ------------------------------------------------------------
         Ks_mesh, Ts_mesh = np.meshgrid(self.strikes, self.maturities, indexing="xy")
 
         def plot_set(data_triplet, titles, fname, label):
@@ -497,14 +424,14 @@ class BaseModel(nn.Module):
                 im = ax.pcolormesh(Ks_mesh, Ts_mesh, data, cmap="magma", shading="auto")
                 ax.set_xlabel("Strike (K)")
                 ax.set_ylabel("Maturity (T)")
-                ax.set_title(f"{title}")
+                ax.set_title(title)
                 ax.invert_yaxis()
                 fig.colorbar(im, ax=ax, label=label)
             plt.tight_layout()
             plt.savefig(os.path.join(out_dir, fname), dpi=200)
             plt.close(fig)
 
-        # Predicted relative error
+        # Rel error
         plot_set(
             [mean_rel, median_rel, max_rel],
             ["Mean Rel Error (Pred)", "Median Rel Error (Pred)", "Max Rel Error (Pred)"],
@@ -512,7 +439,7 @@ class BaseModel(nn.Module):
             "%"
         )
 
-        # Absolute error
+        # Abs error
         plot_set(
             [mean_abs, median_abs, max_abs],
             ["Mean Abs Error (Pred)", "Median Abs Error (Pred)", "Max Abs Error (Pred)"],
@@ -520,7 +447,7 @@ class BaseModel(nn.Module):
             "abs(IV diff)"
         )
 
-        # Monte Carlo sampling relative error
+        # MC error
         plot_set(
             [mean_mc, median_mc, max_mc],
             ["Mean Rel Error (MC)", "Median Rel Error (MC)", "Max Rel Error (MC)"],
@@ -528,20 +455,133 @@ class BaseModel(nn.Module):
             "%"
         )
 
+        # RMSE heatmaps
+        plot_set(
+            [mean_rmse, median_rmse, max_rmse],
+            ["Mean RMSE", "Median RMSE", "Max RMSE"],
+            "iv_rmse_heatmaps_binned.png",
+            "RMSE"
+        )
+
+        # ------------------------------------------------------------
+        # RMSE ECDF WITH AXES SWAPPED
+        # ------------------------------------------------------------
+        fig, ax = plt.subplots(figsize=(6, 5))
+        sorted_r = np.sort(rmses)
+        p = np.linspace(0, 1, len(sorted_r))
+
+        # y = RMSE, x = quantile
+        ax.plot(p, sorted_r, lw=2)
+
+        ax.set_xlabel("Quantile")
+        ax.set_ylabel("RMSE")
+        ax.set_title("RMSE ECDF")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "iv_rmse_quantiles.png"), dpi=200)
+        plt.close(fig)
+
+        # ------------------------------------------------------------
+        # RMSE VS PARAMETER SCATTERPLOTS
+        # ------------------------------------------------------------
+        def scatter(x, y, name_x, fname):
+            fig, ax = plt.subplots(figsize=(6,5))
+            ax.scatter(x, y, s=12, alpha=0.7)
+
+            # ---- MOVING AVERAGE LINE (robust version) ----
+            import numpy as np
+
+            x = np.asarray(x)
+            y = np.asarray(y)
+            idx = np.argsort(x)
+            xs = x[idx]
+            ys = y[idx]
+
+            window = 100
+            if len(ys) > window:
+                # Compute moving average
+                kernel = np.ones(window) / window
+                ma = np.convolve(ys, kernel, mode="valid")
+
+                # Create xs for MA with exact matching length
+                pad = (len(xs) - len(ma)) // 2
+                xs_ma = xs[pad: pad + len(ma)]   # guaranteed to match ma exactly
+
+                # Plot line
+                ax.plot(xs_ma, ma, linewidth=2.5, color="red", label=f"MA({window})")
+
+            ax.set_xlabel(name_x)
+            ax.set_ylabel("RMSE")
+            ax.set_title(f"RMSE vs {name_x}")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, fname), dpi=200)
+            plt.close(fig)
+
+
+        scatter(etas, rmses, "eta", "rmse_vs_eta.png")
+        scatter(Hs,   rmses, "H",   "rmse_vs_H.png")
+        scatter(rhos, rmses, "rho", "rmse_vs_rho.png")
+
+        # ------------------------------------------------------------
+        # worst surfaces
+        # ------------------------------------------------------------
+        worst_idx = np.argsort(rmses)[-10:][::-1]
+
+        print("\nWorst 10 surfaces by RMSE:")
+        for rank, idx in enumerate(worst_idx, 1):
+            print(f"{rank:2d}. index={idx}, RMSE={rmses[idx]:.6f}")
+
         return {
             "pred_rel": {"mean": mean_rel, "median": median_rel, "max": max_rel},
             "pred_abs": {"mean": mean_abs, "median": median_abs, "max": max_abs},
-            "mc_rel": {"mean": mean_mc, "median": median_mc, "max": max_mc},
+            "mc_rel":  {"mean": mean_mc, "median": median_mc, "max": max_mc},
+            "rmse":    {"mean": mean_rmse, "median": median_rmse, "max": max_rmse},
+            "rmses": rmses,
+            "worst_indices": worst_idx.tolist(),
+            "parameters": {"eta": etas, "H": Hs, "rho": rhos},
             "global_mean": {
                 "pred_rel": float(global_mean_rel),
                 "pred_abs": float(global_mean_abs),
-                "mc_rel": float(global_mean_mc),
-            },
+                "mc_rel":   float(global_mean_mc),
+                "rmse":     float(global_mean_rmse),
+            }
         }
+
+
+
 
     # ============================================================
     # Calibration utilities
     # ============================================================
+
+
+    def residuals_autograd(self, x_phys, true_surface, Ks, Ts):
+        device = self.device
+
+        x = torch.tensor(x_phys, dtype=torch.float32, requires_grad=True, device=device)
+
+        def f_single(x_vec):
+            params = {
+                "eta": x_vec[0],
+                "rho": x_vec[1],
+                "H":   x_vec[2],
+                "xi0_knots": x_vec[3:]
+            }
+            pred = self.predict_surface(params, {"strikes": Ks, "maturities": Ts})
+            true_t = torch.as_tensor(true_surface, dtype=torch.float32, device=device)
+            return (pred - true_t).reshape(-1)
+
+        # jacrev returns Jacobian with efficient reuse of graph
+        J_fn = jacrev(f_single)
+
+        J = J_fn(x)  # shape (N, n_params)
+        res = f_single(x)
+
+        return res.detach().cpu().numpy(), J.detach().cpu().numpy()
+
     def calibrate(self, target_surface, optimiser="L-BFGS-B", bounds=None, maxiter=1000, verbose=False):
         """
         Calibrate model parameters θ̂ to a given implied-volatility surface by minimizing RMSE.
@@ -573,27 +613,42 @@ class BaseModel(nn.Module):
                 "xi0_knots": x_phys[3:]
             }
             pred = self.predict_surface(params, grid={"strikes": Ks, "maturities": Ts})
-            return np.sqrt(np.mean((pred - true_surface) ** 2))
+            pred = pred.detach().cpu().numpy()
 
-        def residuals(x_phys):
-            params = {
-                "eta": x_phys[0],
-                "rho": x_phys[1],
-                "H": x_phys[2],
-                "xi0_knots": x_phys[3:]
-            }
-            pred = self.predict_surface(params, grid={"strikes": Ks, "maturities": Ts})
-            return (pred - true_surface).ravel()
+            # --- Dimension check ---
+            assert pred.shape == true_surface.shape, (
+                f"Shape mismatch: predicted surface {pred.shape} vs true surface {true_surface.shape}"
+            )
+            val = np.sqrt(np.sum((pred - true_surface)**2))
+            if not np.isfinite(val):
+                return 1e6  # penalize NaN region
+            return val
 
         x0 = 0.5 * (lb + ub)
-        
         t0 = time.perf_counter()
 
         opt_lower = optimiser.lower()
         if opt_lower == "differential evolution":
             res = differential_evolution(rmse_objective, bounds=list(zip(lb, ub)), maxiter=maxiter, disp=verbose)
         elif opt_lower in ["levenberg-marquardt", "lm"]:
-            res = least_squares(residuals, x0, method="trf", bounds=(lb, ub), max_nfev=maxiter, verbose=2 if verbose else 0)
+            
+            def fun_ls(x):
+                res_np, _ = self.residuals_autograd(x, true_surface, Ks, Ts)
+                return res_np
+
+            def jac_ls(x):
+                _, J_np = self.residuals_autograd(x, true_surface, Ks, Ts)
+                return J_np
+
+            res = least_squares(
+                fun_ls,
+                x0,
+                jac=jac_ls,
+                method="trf",                # LM braucht unconstrained, aber trf akzeptiert bounds.
+                bounds=(lb, ub),
+                max_nfev=maxiter,
+                verbose=2 if verbose else 0
+            )
         else:
             res = minimize(rmse_objective, x0, method=optimiser, bounds=list(zip(lb, ub)),
                         options={"maxiter": maxiter, "disp": verbose})
@@ -638,7 +693,7 @@ class BaseModel(nn.Module):
         true_params_all, est_params_all = [], []
 
         for i, s in enumerate(surfaces, start=1):
-            r = self.calibrate(s, optimiser=optimiser, maxiter=maxiter)
+            r = self.calibrate(s, optimiser=optimiser, maxiter=maxiter, verbose=verbose)
             runtimes.append(r["runtime_ms"])
             rmses.append(r["rmse"])
             est_params_all.append(r["theta_hat"])
@@ -664,10 +719,10 @@ class BaseModel(nn.Module):
                 per_param_abs_errors.setdefault(k, []).append(aerr)
                 per_param_rel_errors.setdefault(k, []).append(rerr)
 
-            if verbose and (i % 50 == 0 or i == len(surfaces)):
-                mean_rmse = np.mean(rmses)
-                print(f"  [{i}/{len(surfaces)}] mean RMSE={mean_rmse:.5f}, "
-                    f"avg time={np.mean(runtimes):.1f} ms")
+            # if verbose and (i % 50 == 0 or i == len(surfaces)):
+            #     mean_rmse = np.mean(rmses)
+            #     print(f"  [{i}/{len(surfaces)}] mean RMSE={mean_rmse:.5f}, "
+            #         f"avg time={np.mean(runtimes):.1f} ms")
 
         # Convert lists to arrays
         for d in (per_param_abs_errors, per_param_rel_errors):
@@ -686,17 +741,24 @@ class BaseModel(nn.Module):
                 mean = np.mean(vals)
                 median = np.median(vals)
                 std = np.std(vals)
+                q95 = np.quantile(vals, 0.95)
+                q99 = np.quantile(vals, 0.99)
                 unit = "%" if kind == "relative" else ""
+
                 if kind == "absolute":
                     rmse = np.sqrt(np.mean(vals ** 2))
                     print(f"   {k:<8s} | mean={mean*scale:.3f}{unit}"
                         f" | median={median*scale:.3f}{unit}"
                         f" | std={std*scale:.3f}{unit}"
+                        f" | q95={q95*scale:.3f}{unit}"
+                        f" | q99={q99*scale:.3f}{unit}"
                         f" | RMSE={rmse*scale:.3f}{unit}")
                 else:
                     print(f"   {k:<8s} | mean={mean*scale:.3f}{unit}"
                         f" | median={median*scale:.3f}{unit}"
-                        f" | std={std*scale:.3f}{unit}")
+                        f" | std={std*scale:.3f}{unit}"
+                        f" | q95={q95*scale:.3f}{unit}"
+                        f" | q99={q99*scale:.3f}{unit}")
 
         # --- Output summary ---
         print(f"\n→ Final avg time: {avg_time:.1f} ms, mean RMSE={np.mean(rmses):.5f}\n")
@@ -706,6 +768,38 @@ class BaseModel(nn.Module):
 
         # --- Return data (only abs RMSEs computed) ---
         per_param_abs_rmse = {k: np.sqrt(np.mean(v ** 2)) for k, v in per_param_abs_errors.items()}
+
+        # ------------------------------------------------------------
+        # Print top-5 highest absolute + relative errors per parameter
+        # ------------------------------------------------------------
+        print("\nTop-5 absolute & relative errors per parameter:")
+        for k in per_param_abs_errors.keys():
+            abs_vals = per_param_abs_errors[k]      # shape (n_surfaces,)
+            rel_vals = per_param_rel_errors[k]
+
+            # --- Top-5 absolute ---
+            top5_abs_idx = np.argsort(abs_vals)[-5:][::-1]
+            top5_abs_vals = abs_vals[top5_abs_idx]
+
+            # --- Top-5 relative ---
+            top5_rel_idx = np.argsort(rel_vals)[-5:][::-1]
+            top5_rel_vals = rel_vals[top5_rel_idx]
+
+            print(f"\nParameter: {k}")
+            print("  Top-5 ABS errors:")
+            for rank, (idx, val) in enumerate(zip(top5_abs_idx, top5_abs_vals), 1):
+                print(
+                    f"    {rank}. index={int(idx):4d} | abs_err={float(val):.6f} "
+                    f"| surface_RMSE={float(rmses[idx]):.6f}"
+                )
+
+            print("  Top-5 REL errors:")
+            for rank, (idx, val) in enumerate(zip(top5_rel_idx, top5_rel_vals), 1):
+                print(
+                    f"    {rank}. index={int(idx):4d} | rel_err={float(val):.6f} "
+                    f"| surface_RMSE={float(rmses[idx]):.6f}"
+                )
+
 
         return {
             "optimizer": optimiser,
@@ -1079,7 +1173,6 @@ class DeepONet(BaseModel):
         return mask_np
 
     # --------------------------------------------------------
-
     def train_model(
         self,
         train_loader,
@@ -1088,8 +1181,10 @@ class DeepONet(BaseModel):
         lr_schedule=[(0, 1e-3), (5, 5e-4), (8, 1e-4)],
     ):
         """
-        Train the DeepONet model with minimal one-line logging (no tqdm).
+        Train DeepONet in scaled output space (StandardScaler),
+        but additionally compute & report RMSE in ORIGINAL IV space.
         """
+
         lr_schedule = sorted(lr_schedule, key=lambda x: x[0])
         schedule_index = 0
         base_lr = lr_schedule[0][1]
@@ -1102,7 +1197,7 @@ class DeepONet(BaseModel):
         for epoch in range(epochs):
             epoch_start = time.time()
 
-            # --- Learning rate schedule update ---
+            # --- update LR ---
             if (
                 schedule_index + 1 < len(lr_schedule)
                 and epoch >= lr_schedule[schedule_index + 1][0]
@@ -1113,61 +1208,98 @@ class DeepONet(BaseModel):
                     g["lr"] = new_lr
                 sys.stdout.write(f"\n→ Adjusted learning rate to {new_lr:.2e} at epoch {epoch}\n")
 
-            # --- Training loop ---
+            # --- TRAINING ---
             self.train()
-            total_loss = 0.0
+            total_scaled_loss = 0.0
+            total_iv_rmse = 0.0
+            n_samples = len(train_loader.dataset)
             for xb, xt, y in train_loader:
                 xb, xt, y = xb.to(self.device), xt.to(self.device), y.to(self.device)
+
                 pred = self.forward(xb, xt)
                 loss = self.compute_loss(pred, y)
                 if hasattr(self.mask_net, "loss_reg"):
                     loss += self.mask_net.loss_reg
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-                total_loss += loss.item() * len(y)
 
-            train_rmse = float(np.sqrt(total_loss / len(train_loader.dataset)))
+                # accumulate scaled loss
+                batch_size = len(y)
+                total_scaled_loss += loss.item() * batch_size
 
-            # --- Validation ---
+                # ---- compute IV RMSE ----
+                pred_np = pred.detach().cpu().numpy().reshape(batch_size, -1)
+                y_np    = y.detach().cpu().numpy().reshape(batch_size, -1)
+
+                pred_iv = self.inverse_transform_output_single(pred_np)
+                y_iv    = self.inverse_transform_output_single(y_np)
+
+                total_iv_rmse += np.sum((pred_iv - y_iv)**2)
+
+            # per-epoch metrics
+            train_rmse_scaled = float(np.sqrt(total_scaled_loss / n_samples))
+            train_rmse_iv     = float(np.sqrt(total_iv_rmse / n_samples))
+
+            # --- VALIDATION ---
             if val_loader is not None:
-                val_rmse = float(np.sqrt(self.validate(val_loader)))
+                val_rmse_scaled, val_rmse_iv = self._validate_dual(val_loader)
                 msg = (f"Epoch {epoch+1:03d} | "
-                    f"train_rmse={train_rmse:.6f}, val_rmse={val_rmse:.6f}, "
+                    f"train_scaled={train_rmse_scaled:.6f}, val_scaled={val_rmse_scaled:.6f}, "
+                    f"train_iv={train_rmse_iv:.6f}, val_iv={val_rmse_iv:.6f}, "
                     f"lr={self.optimizer.param_groups[0]['lr']:.1e}")
             else:
                 msg = (f"Epoch {epoch+1:03d} | "
-                    f"train_rmse={train_rmse:.6f}, "
+                    f"train_scaled={train_rmse_scaled:.6f}, train_iv={train_rmse_iv:.6f}, "
                     f"lr={self.optimizer.param_groups[0]['lr']:.1e}")
 
-            # --- Timing & ETA ---
+            # ETA & timing
             epoch_time = time.time() - epoch_start
             epoch_durations.append(epoch_time)
             avg_time = np.mean(epoch_durations)
-            remaining_epochs = epochs - (epoch + 1)
-            eta = remaining_epochs * avg_time
+            eta = (epochs - (epoch + 1)) * avg_time
+            msg += f", time={epoch_time:.2f}s, ETA={eta/60:.1f} min"
 
-            msg += f", time={epoch_time:.2f}s, ETA={eta/60:.2f} min"
-
-            # --- Overwrite last line in-place ---
             sys.stdout.write("\r\033[K" + msg)
             sys.stdout.flush()
 
-        # --- Summary ---
+        print()
         total_time = time.time() - start_time
-        print()  # newline after final overwrite
-        print(f"\n✅ Training completed in {total_time/60:.2f} min "
-            f"(avg {total_time/epochs:.2f}s per epoch)")
+        print(f"\n✅ Training completed in {total_time/60:.2f} min")
 
-        # --- Automatic export ---
-        self.export_to_numpy(
-            out_dir="exports",
-            filename=f"{self.__class__.__name__.lower()}_final.json"
+
+
+    def _validate_dual(self, val_loader):
+        """
+        Return (rmse_scaled, rmse_iv) for validation.
+        """
+        self.eval()
+        total_scaled = 0.0
+        total_iv = 0.0
+        n = len(val_loader.dataset)
+
+        with torch.no_grad():
+            for xb, xt, y in val_loader:
+                xb, xt, y = xb.to(self.device), xt.to(self.device), y.to(self.device)
+                pred = self.forward(xb, xt)
+
+                # scaled MSE
+                scaled = self.compute_loss(pred, y).item()
+                batch_size = len(y)
+                total_scaled += scaled * batch_size
+
+                # IV RMSE
+                pred_np = pred.detach().cpu().numpy().reshape(batch_size, -1)
+                y_np    = y.detach().cpu().numpy().reshape(batch_size, -1)
+                pred_iv = self.inverse_transform_output_single(pred_np)
+                y_iv    = self.inverse_transform_output_single(y_np)
+                total_iv +=(np.sum((pred_iv - y_iv)**2))
+
+        return (
+            float(np.sqrt(total_scaled / n)),
+            float(np.sqrt(total_iv/n))
         )
-
-
-
-
 
     def validate(self, val_loader):
         self.eval(); total = 0.0
@@ -1179,55 +1311,78 @@ class DeepONet(BaseModel):
         return total / len(val_loader.dataset)
 
     # --------------------------------------------------------
+    ###############################################
+    #   Fully Torch-Based predict_surface()
+    #   Drop-in replacement for DeepONet models
+    ###############################################
+
     def predict_surface(self, params, grid=None):
-        """
-        Predict implied vol surface for a given parameter set and optional grid.
+        device = self.device
 
-        Parameters
-        ----------
-        params : dict
-            Model parameters (eta, rho, H, xi0_knots)
-        grid : dict, optional
-            Custom grid with "strikes" and "maturities" arrays.
-            If None, uses the model's stored self.strikes/self.maturities.
-
-        Returns
-        -------
-        surface : np.ndarray
-            Predicted IV surface in ORIGINAL scale, shape (nT, nK)
-        """
-        # Determine which grid to use
-        if grid is not None:
-            strikes = np.asarray(grid["strikes"], dtype=np.float32)
-            maturities = np.asarray(grid["maturities"], dtype=np.float32)
+        # ---------------------------------------------------------
+        # 1) Choose grid
+        # ---------------------------------------------------------
+        if grid is None:
+            strikes = torch.tensor(self.strikes, dtype=torch.float32, device=device)
+            maturities = torch.tensor(self.maturities, dtype=torch.float32, device=device)
         else:
-            assert self.strikes is not None and self.maturities is not None, \
-                "No grid provided and no default grid stored; set one via set_grid()."
-            strikes, maturities = self.strikes, self.maturities
+            strikes = torch.tensor(grid["strikes"], dtype=torch.float32, device=device)
+            maturities = torch.tensor(grid["maturities"], dtype=torch.float32, device=device)
 
-        # Parameter scaling
-        assert self.param_bounds is not None, "param_bounds must be set for scaling"
-        assert self.output_scaler is not None, "output_scaler must be fitted"
+        # ---------------------------------------------------------
+        # 2) Construct unscaled parameter vector (torch)
+        # ---------------------------------------------------------
+        eta = torch.as_tensor(params["eta"], dtype=torch.float32, device=device)
+        rho = torch.as_tensor(params["rho"], dtype=torch.float32, device=device)
+        H   = torch.as_tensor(params["H"],   dtype=torch.float32, device=device)
+        xi0 = torch.as_tensor(params["xi0_knots"], dtype=torch.float32, device=device).flatten()
 
-        xi0_knots = np.array(params["xi0_knots"], dtype=np.float32).flatten()
-        param_vec = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots]).astype(np.float32)
-        xb_np = self.scale_params(param_vec)  # [-1, 1] scaling
+        x_phys = torch.cat([eta.unsqueeze(0), rho.unsqueeze(0), H.unsqueeze(0), xi0], dim=0)  # (d_branch,)
 
-        # Build trunk coords on the chosen grid
-        K_mesh, T_mesh = np.meshgrid(strikes, maturities)
-        trunk_coords = np.stack([K_mesh.ravel(), T_mesh.ravel()], axis=1).astype(np.float32)
+        # ---------------------------------------------------------
+        # 3) Scale parameters exactly like in training (AUTOGRAD SAFE)
+        # ---------------------------------------------------------
+        lb = torch.as_tensor(self.param_bounds[0], dtype=torch.float32, device=device)
+        ub = torch.as_tensor(self.param_bounds[1], dtype=torch.float32, device=device)
 
-        # Torch forward pass
-        with torch.no_grad():
-            xb = torch.tensor(xb_np, dtype=torch.float32, device=self.device).unsqueeze(0)
-            xb = xb.repeat(len(trunk_coords), 1)
-            xt = torch.tensor(trunk_coords, dtype=torch.float32, device=self.device)
-            pred_scaled = self.forward(xb, xt)
+        # scale to [-1,1]
+        x_scaled = 2.0 * (x_phys - lb) / (ub - lb) - 1.0     # (d_branch,)
 
-        pred_scaled_np = pred_scaled.detach().cpu().numpy().reshape(-1)
-        pred_iv = self.inverse_transform_output_single(pred_scaled_np)
-        surface = pred_iv.reshape(len(maturities), len(strikes))
-        return surface
+        # repeat for each trunk point
+        # will be repeated after trunk construction
+
+        # ---------------------------------------------------------
+        # 4) Construct trunk coordinates
+        # ---------------------------------------------------------
+        K_mesh, T_mesh = torch.meshgrid(strikes, maturities, indexing="xy")
+        xt = torch.stack([K_mesh.reshape(-1), T_mesh.reshape(-1)], dim=1)  # (nPts, 2)
+
+        # ---------------------------------------------------------
+        # 5) Broadcast branch vector
+        # ---------------------------------------------------------
+        xb = x_scaled.unsqueeze(0).repeat(xt.shape[0], 1)   # (nPts, d_branch)
+
+        # ---------------------------------------------------------
+        # 6) Forward pass (scaled output)
+        # ---------------------------------------------------------
+        pred_scaled = self.forward(xb, xt).reshape(-1)
+
+        # ---------------------------------------------------------
+        # 7) Inverse output-scaling in TORCH
+        # ---------------------------------------------------------
+        mean = torch.as_tensor(self.output_scaler.mean_[0], dtype=torch.float32, device=device)
+        std  = torch.as_tensor(self.output_scaler.scale_[0], dtype=torch.float32, device=device)
+
+        pred_iv = pred_scaled * std + mean   # physical IV
+
+        # ---------------------------------------------------------
+        # 8) Reshape to surface
+        # ---------------------------------------------------------
+        nK = strikes.numel()
+        nT = maturities.numel()
+        return pred_iv.reshape(nT, nK)
+
+
 
 
 
@@ -1267,8 +1422,9 @@ class MLP(BaseModel):
         self.criterion = nn.MSELoss()
 
     def forward(self, x):
-        out = self.net(x)
-        return out.view(-1, *self.output_shape)
+        out = self.net(x)                    # (batch, 121)
+        batch = out.shape[0]
+        return out.reshape(batch, *self.output_shape)
 
     # --------------------------------------------------------
     @staticmethod
@@ -1360,7 +1516,6 @@ class MLP(BaseModel):
         return model, train_loader, val_loader, strikes, maturities
 
     # --------------------------------------------------------
-
     def train_model(
         self,
         train_loader,
@@ -1369,28 +1524,14 @@ class MLP(BaseModel):
         lr_schedule=[(0, 1e-3), (30, 5e-4), (60, 1e-4)],
     ):
         """
-        Train the MLP model with optional learning rate schedule, timing, and ETA display.
-
-        Parameters
-        ----------
-        train_loader : DataLoader
-            Training data loader.
-        val_loader : DataLoader, optional
-            Validation data loader.
-        epochs : int, default=50
-            Total number of training epochs.
-        lr_schedule : list of (int, float), optional
-            List of (epoch, lr) tuples defining when to update the learning rate.
-            Example: [(0, 1e-3), (30, 5e-4), (60, 1e-4)]
-            Learning rate changes at each specified epoch (>= threshold).
+        Train MLP in scaled output space, but report both
+        scaled RMSE and true IV-space RMSE.
         """
         lr_schedule = sorted(lr_schedule, key=lambda x: x[0])
         schedule_index = 0
 
-        # Initialize to first LR
-        base_lr = lr_schedule[0][1]
         for g in self.optimizer.param_groups:
-            g["lr"] = base_lr
+            g["lr"] = lr_schedule[0][1]
 
         start_time = time.time()
         epoch_durations = []
@@ -1398,7 +1539,7 @@ class MLP(BaseModel):
         for epoch in range(epochs):
             epoch_start = time.time()
 
-            # --- Learning rate schedule update ---
+            # --- LR update ---
             if (
                 schedule_index + 1 < len(lr_schedule)
                 and epoch >= lr_schedule[schedule_index + 1][0]
@@ -1407,54 +1548,120 @@ class MLP(BaseModel):
                 new_lr = lr_schedule[schedule_index][1]
                 for g in self.optimizer.param_groups:
                     g["lr"] = new_lr
-                print(f"→ Adjusted learning rate to {new_lr:.2e} at epoch {epoch}")
+                sys.stdout.write(f"\n→ Adjusted learning rate to {new_lr:.2e} at epoch {epoch}\n")
 
-            # --- Training ---
+            # --- TRAIN ---
             self.train()
-            total = 0.0
-            for x, y in tqdm(train_loader, desc=f"Train {epoch+1}", leave=False):
+            total_scaled = 0.0
+            total_iv = 0.0
+            n = len(train_loader.dataset)
+
+            for x, y in train_loader:
                 x, y = x.to(self.device), y.to(self.device)
+
                 pred = self.forward(x)
                 loss = self.criterion(pred, y)
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-                total += loss.item() * len(y)
 
-            train_rmse = float(np.sqrt(total / len(train_loader.dataset)))
+                batch = len(y)
+                total_scaled += loss.item() * batch
+                
+                # IV RMSE
+                pred_np = pred.detach().cpu().numpy()     # (batch, 11,11)
+                y_np    = y.detach().cpu().numpy()        # (batch, 11,11)
 
-            # --- Validation ---
+                batch = pred_np.shape[0]
+
+                rmse_iv_list = []
+                for i in range(batch):
+                    # einzelne Oberfläche extrahieren
+                    pred_surf = pred_np[i]      # (11,11)
+                    y_surf    = y_np[i]         # (11,11)
+
+                    # inverse transform auf EIN surface
+                    pred_iv  = self.inverse_transform_surface(pred_surf)
+                    y_iv     = self.inverse_transform_surface(y_surf)
+
+                    rmse_iv_list.append( np.sqrt(np.mean((pred_iv - y_iv)**2)) )
+                rmse_iv = float(np.mean(rmse_iv_list))
+                total_iv += rmse_iv * batch
+
+            train_scaled = float(np.sqrt(total_scaled / n))
+            train_iv     = float(total_iv / n)
+
+            # --- VAL ---
             if val_loader is not None:
-                val_rmse = float(np.sqrt(self.validate(val_loader)))
+                val_scaled, val_iv = self._validate_dual(val_loader)
                 msg = (f"Epoch {epoch+1:03d} | "
-                    f"train_rmse={train_rmse:.6f}, val_rmse={val_rmse:.6f}, "
+                    f"train_scaled={train_scaled:.6f}, val_scaled={val_scaled:.6f}, "
+                    f"train_iv={train_iv:.6f}, val_iv={val_iv:.6f}, "
                     f"lr={self.optimizer.param_groups[0]['lr']:.1e}")
             else:
                 msg = (f"Epoch {epoch+1:03d} | "
-                    f"train_rmse={train_rmse:.6f}, "
+                    f"train_scaled={train_scaled:.6f}, train_iv={train_iv:.6f}, "
                     f"lr={self.optimizer.param_groups[0]['lr']:.1e}")
 
-            # --- Timing and ETA ---
             epoch_time = time.time() - epoch_start
             epoch_durations.append(epoch_time)
-            avg_time = np.mean(epoch_durations)
-            remaining_epochs = epochs - (epoch + 1)
-            eta = remaining_epochs * avg_time
+            eta = (epochs - (epoch + 1)) * np.mean(epoch_durations)
+            msg += f", time={epoch_time:.2f}s, ETA={eta/60:.1f} min"
 
-            msg += f", time={epoch_time:.2f}s, ETA={eta/60:.2f} min"
-            print(msg)
+            sys.stdout.write("\r\033[K" + msg)
+            sys.stdout.flush()
 
+        print()
         total_time = time.time() - start_time
-        print(f"\n✅ Training completed in {total_time/60:.2f} min "
-            f"(avg {total_time/epochs:.2f}s per epoch)")
-        
-        # --- Automatic export after training ---
-        self.export_to_numpy(
-            out_dir="exports",
-            filename=f"{self.__class__.__name__.lower()}_final.json"
+        print(f"\n✅ Training completed in {total_time/60:.2f} min")
+
+
+    def _validate_dual(self, val_loader):
+        """
+        Compute BOTH:
+        - RMSE in scaled output space
+        - RMSE in ORIGINAL IV space
+        """
+        self.eval()
+        total_scaled = 0.0
+        total_iv = 0.0
+        n = len(val_loader.dataset)
+
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(self.device), y.to(self.device)
+                pred = self.forward(x)
+
+                # --- scaled RMSE accumulation ---
+                scaled_loss = self.criterion(pred, y).item()
+                batch = y.shape[0]
+                total_scaled += scaled_loss * batch
+
+                # -----------------------------------------
+                # TRUE IV RMSE: EINE SURFACE NACH DER ANDEREN
+                # -----------------------------------------
+                pred_np = pred.detach().cpu().numpy()   # (batch, nT, nK)
+                y_np    = y.detach().cpu().numpy()      # (batch, nT, nK)
+
+                rmse_list = []
+                for i in range(batch):
+                    pred_surf = pred_np[i]        # (nT, nK)
+                    y_surf    = y_np[i]           # (nT, nK)
+
+                    pred_iv = self.inverse_transform_surface(pred_surf)
+                    y_iv    = self.inverse_transform_surface(y_surf)
+
+                    rmse_list.append(np.sqrt(np.mean((pred_iv - y_iv)**2)))
+
+                rmse_iv = float(np.mean(rmse_list))
+                total_iv += rmse_iv * batch
+
+
+        return (
+            float(np.sqrt(total_scaled / n)),   # scaled RMSE
+            float(total_iv / n)                 # IV-RMSE
         )
-
-
 
 
     def validate(self, val_loader):
@@ -1465,345 +1672,143 @@ class MLP(BaseModel):
                 total += self.criterion(self.forward(x), y).item() * len(y)
         return total / len(val_loader.dataset)   
 
-    # --------------------------------------------------------
-    def predict_surface(self, params, grid=None, interp_method="spline"):
+    # --------------------------------------------------------###########################################################
+    #   Fully Torch-Based predict_surface() for MLP models
+    #   Drop-in replacement: autograd-friendly, numpy-free
+    ###########################################################
+
+
+    def interp_surface_torch(surface, base_Ts, base_Ks, target_Ts, target_Ks, mode="bicubic"):
         """
-        Predict implied volatility surface for given parameters, optionally interpolated
-        onto a custom (strike, maturity) grid.
+        Differentiable interpolation of a surface using torch.grid_sample.
 
         Parameters
         ----------
-        params : dict
-            {"eta", "rho", "H", "xi0_knots"} defining the parameter vector.
-        grid : dict, optional
-            If provided, must contain "strikes" and "maturities" arrays defining
-            the target evaluation grid.
-            If None, uses the model's own self.strikes / self.maturities grid.
-        interp_method : {"spline", "linear", "nearest"}, default="spline"
-            Interpolation method used when transforming to a custom grid.
+        surface : torch.Tensor
+            Shape (nT_base, nK_base)
+        base_Ts, base_Ks : torch.Tensor
+            1D grids of base maturities / strikes
+        target_Ts, target_Ks : torch.Tensor
+            1D grids of target maturities / strikes
+        mode : "bilinear" | "bicubic" | "nearest"
 
         Returns
         -------
-        surface : np.ndarray
-            Predicted IV surface in ORIGINAL (unscaled) space,
-            shape (len(grid["maturities"]), len(grid["strikes"])).
+        out : torch.Tensor of shape (nT_target, nK_target)
         """
-        assert self.output_shape is not None, "MLP needs output_shape set."
-        assert self.strikes is not None and self.maturities is not None, \
-            "MLP needs self.strikes/self.maturities set; call set_grid or train/prepare first."
-        assert self.param_bounds is not None, "param_bounds must be set for scaling"
-        assert self.output_scaler is not None, "output_scaler must be fitted"
 
-        # 1️⃣ Prepare scaled parameter vector
-        xi0_knots = np.array(params["xi0_knots"], dtype=np.float32).flatten()
-        x = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots]).astype(np.float32)
-        x_scaled = self.scale_params(x)
+        device = surface.device
 
-        # 2️⃣ Predict on the model's native base grid
-        with torch.no_grad():
-            x_t = torch.tensor(x_scaled, dtype=torch.float32, device=self.device).unsqueeze(0)
-            pred_scaled = self.forward(x_t)  # (1, nT, nK)
-        pred_scaled_np = pred_scaled.squeeze(0).detach().cpu().numpy()
-        base_surface = self.inverse_transform_surface(pred_scaled_np)  # (nT, nK)
-        base_Ks, base_Ts = self.strikes, self.maturities
+        # grid_sample expects shape (N, C, H, W)
+        img = surface.unsqueeze(0).unsqueeze(0)  # (1,1,nT_base,nK_base)
 
-        # 3️⃣ If no grid given → return base surface directly
+        # normalize base grid ranges → [-1, 1]
+        T_min, T_max = base_Ts.min(), base_Ts.max()
+        K_min, K_max = base_Ks.min(), base_Ks.max()
+
+        # build normalized coordinates
+        TT, KK = torch.meshgrid(target_Ts, target_Ks, indexing="ij")
+        TTn = 2.0 * (TT - T_min) / (T_max - T_min) - 1.0
+        KKn = 2.0 * (KK - K_min) / (K_max - K_min) - 1.0
+
+        # grid_sample expects coords as (N,H,W,2): last dimension is (x, y)
+        # NOTE: grid ordering is (K_normalized, T_normalized)
+        grid = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)  # (1,nT_target,nK_target,2)
+
+        # perform differentiable interpolation
+        out = F.grid_sample(
+            img,
+            grid,
+            mode=mode,
+            padding_mode="border",
+            align_corners=True
+        )
+
+        return out.squeeze(0).squeeze(0)
+
+    def predict_surface(self, params, grid=None):
+        """
+        Fully torch-based surface prediction for MLP models.
+        Autograd-safe and GPU-accelerated.
+        """
+
+        device = self.device
+
+        # -------------------------------------------
+        # 1) Convert parameters to Torch
+        # -------------------------------------------
+        eta = torch.as_tensor(params["eta"], dtype=torch.float32, device=device)
+        rho = torch.as_tensor(params["rho"], dtype=torch.float32, device=device)
+        H   = torch.as_tensor(params["H"],  dtype=torch.float32, device=device)
+        xi0 = torch.as_tensor(params["xi0_knots"], dtype=torch.float32, device=device).flatten()
+
+        x_vec = torch.cat([eta.unsqueeze(0), rho.unsqueeze(0), H.unsqueeze(0), xi0], dim=0)
+
+        # -------------------------------------------
+        # 2) Scale parameters
+        # -------------------------------------------
+        lb = torch.tensor(self.param_bounds[0], dtype=torch.float32, device=device)
+        ub = torch.tensor(self.param_bounds[1], dtype=torch.float32, device=device)
+
+        x_scaled = 2.0 * (x_vec - lb) / (ub - lb) - 1.0
+
+        # -------------------------------------------
+        # 3) Forward MLP → scaled IVs
+        # -------------------------------------------
+        pred_scaled = self.forward(x_scaled.unsqueeze(0)).squeeze(0)
+
+        # 4) Inverse output scaling – VOLLVEKTOR, nicht nur [0]
+        nT, nK = self.output_shape
+        nPts = nT * nK
+
+        # pred_scaled: shape (nPts,)
+        pred_flat = pred_scaled.view(-1)
+
+        mean = torch.as_tensor(self.output_scaler.mean_,  dtype=torch.float32, device=device)   # (nPts,)
+        std  = torch.as_tensor(self.output_scaler.scale_, dtype=torch.float32, device=device)   # (nPts,)
+
+        pred_iv_flat = pred_flat * std + mean              # (nPts,)
+        base_surface = pred_iv_flat.view(nT, nK)           # (nT, nK)
+
+
+        # ---- If no interpolation requested → return base surface
         if grid is None:
             return base_surface
 
-        # 4️⃣ Otherwise interpolate to the target grid
-        Ks_target = np.asarray(grid["strikes"], dtype=np.float32)
-        Ts_target = np.asarray(grid["maturities"], dtype=np.float32)
+        # -------------------------------------------
+        # 6) PyTorch interpolation using grid_sample
+        # -------------------------------------------
+        base_Ts = torch.tensor(self.maturities, dtype=torch.float32, device=device)
+        base_Ks = torch.tensor(self.strikes, dtype=torch.float32, device=device)
 
-        same_shape = (
-            base_Ks is not None
-            and base_Ts is not None
-            and len(base_Ks) == len(Ks_target)
-            and len(base_Ts) == len(Ts_target)
+        target_Ts = torch.tensor(grid["maturities"], dtype=torch.float32, device=device)
+        target_Ks = torch.tensor(grid["strikes"], dtype=torch.float32, device=device)
+
+        # --- Normalize base grid to [-1, 1]
+        T_min, T_max = base_Ts.min(), base_Ts.max()
+        K_min, K_max = base_Ks.min(), base_Ks.max()
+
+        TT, KK = torch.meshgrid(target_Ts, target_Ks, indexing="ij")
+
+        TTn = 2 * (TT - T_min) / (T_max - T_min) - 1
+        KKn = 2 * (KK - K_min) / (K_max - K_min) - 1
+
+        # grid_sample wants: (N, H, W, 2) with last dim = (x, y)
+        grid_torch = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)
+
+        # grid_sample input must be 4D: (N, C, H, W)
+        img = base_surface.unsqueeze(0).unsqueeze(0)
+
+        surface_interp = F.grid_sample(
+            img,
+            grid_torch,
+            mode="bicubic",
+            padding_mode="border",
+            align_corners=True
         )
-
-        if same_shape:
-            if np.allclose(Ks_target, base_Ks) and np.allclose(Ts_target, base_Ts):
-                # identical grid → no interpolation
-                return base_surface
-
-        # --- Interpolation ---
-        if interp_method == "spline":
-            interp = RectBivariateSpline(base_Ts, base_Ks, base_surface)
-            surface_interp = interp(Ts_target, Ks_target)
-        else:
-            from scipy.interpolate import RegularGridInterpolator
-            kind = interp_method  # "linear" or "nearest"
-            interp = RegularGridInterpolator(
-                (base_Ts, base_Ks), base_surface, method=kind, bounds_error=False, fill_value=None
-            )
-            TT, KK = np.meshgrid(Ts_target, Ks_target, indexing="ij")
-            coords = np.stack([TT.ravel(), KK.ravel()], axis=1)
-            surface_interp = interp(coords).reshape(len(Ts_target), len(Ks_target))
-
-        return surface_interp.astype(np.float32)
+        return surface_interp.squeeze(0).squeeze(0)
 
 
-class NumpyModel:
-    """
-    Lightweight NumPy-only model for inference from exported PyTorch MLP or DeepONet.
-    Reconstructs the architecture from exported weights, applies scaling, and predicts.
-    """
-
-    # ------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------
-    def __init__(self, export_dict):
-        self.model_type = export_dict["model_type"]
-        self.meta = export_dict["meta"]
-
-        # ---------------- Load layer weights ----------------
-        if self.model_type == "MLP":
-            self.layers = export_dict["layers"]
-        elif self.model_type == "DeepONet":
-            self.branch_layers = export_dict["branch_layers"]
-            self.trunk_layers = export_dict["trunk_layers"]
-        else:
-            raise ValueError(f"Unsupported model type {self.model_type}")
-
-        # ---------------- Load param bounds -----------------
-        pb = self.meta.get("param_bounds")
-        if pb and all(pb):
-            self.param_bounds = (
-                np.array(pb[0], dtype=np.float32),
-                np.array(pb[1], dtype=np.float32)
-            )
-        else:
-            self.param_bounds = None
-
-        # ---------------- Load output scaler ----------------
-        scaler = self.meta.get("output_scaler")
-        if scaler is not None:
-            self.out_mean = np.array(scaler["mean_"], dtype=np.float32)
-            self.out_scale = np.array(scaler["scale_"], dtype=np.float32)
-        else:
-            self.out_mean = None
-            self.out_scale = None
-
-        # Cached shape info
-        shape = self.meta.get("output_shape", None)
-        self.output_shape = tuple(shape) if isinstance(shape, (list, tuple)) else None
-        self.input_dim = self.meta.get("input_dim", None)
-
-        # Add base grid info
-        self.strikes = np.array(self.meta.get("strikes"), dtype=np.float32) if self.meta.get("strikes") is not None else None
-        self.maturities = np.array(self.meta.get("maturities"), dtype=np.float32) if self.meta.get("maturities") is not None else None
-
-
-    # ------------------------------------------------------------
-    # Loading
-    # ------------------------------------------------------------
-    @classmethod
-    def load(cls, path):
-        """Load a JSON export produced by BaseModel.export_to_numpy()."""
-        with open(path, "r") as f:
-            data = json.load(f)
-        print(f"Loaded NumPy model from {path} ({data['model_type']})")
-        return cls(data)
-
-    # ------------------------------------------------------------
-    # Scaling utilities
-    # ------------------------------------------------------------
-    def _scale_to_m1_p1(self, x, lb, ub):
-        mid = 0.5 * (ub + lb)
-        return (x - mid) * (2.0 / (ub - lb))
-
-    def _inverse_from_m1_p1(self, x_scaled, lb, ub):
-        mid = 0.5 * (ub + lb)
-        return x_scaled * (0.5 * (ub - lb)) + mid
-
-    def scale_params(self, x_raw):
-        """Scale raw physical params [eta, rho, H, xi0...] → [-1,1]."""
-        assert self.param_bounds is not None, "param_bounds missing in export"
-        lb, ub = self.param_bounds
-        x_raw = np.asarray(x_raw, dtype=np.float32)
-        return self._scale_to_m1_p1(x_raw, lb, ub)
-
-    def inverse_scale_params(self, x_scaled):
-        """Inverse of scale_params."""
-        assert self.param_bounds is not None, "param_bounds missing in export"
-        lb, ub = self.param_bounds
-        x_scaled = np.asarray(x_scaled, dtype=np.float32)
-        return self._inverse_from_m1_p1(x_scaled, lb, ub)
-
-    # ------------------------------------------------------------
-    # Output scaling (StandardScaler)
-    # ------------------------------------------------------------
-    def transform_output(self, Y):
-        """Apply StandardScaler normalization."""
-        if self.out_mean is None or self.out_scale is None:
-            return Y
-        return (Y - self.out_mean) / self.out_scale
-
-    def inverse_transform_output(self, Y_scaled):
-        """Revert StandardScaler normalization (scaled → original)."""
-        if self.out_mean is None or self.out_scale is None:
-            return Y_scaled
-        return Y_scaled * self.out_scale + self.out_mean
-
-    # ------------------------------------------------------------
-    # Activation functions
-    # ------------------------------------------------------------
-    def _activation(self, name, x):
-        if name is None:
-            return x
-        name = name.lower()
-        if name == "relu":
-            return np.maximum(x, 0)
-        elif name == "tanh":
-            return np.tanh(x)
-        elif name == "gelu":
-            return 0.5 * x * (1.0 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
-        elif name == "elu":
-            return np.where(x > 0, x, np.exp(x) - 1)
-        else:
-            raise ValueError(f"Unsupported activation: {name}")
-
-    # ------------------------------------------------------------
-    # Forward helpers
-    # ------------------------------------------------------------
-    def _forward_seq(self, x, layers):
-        """Forward through a serialized layer list (weights + activations)."""
-        a = np.array(x, dtype=np.float32)
-        for layer in layers:
-            W, b, act = layer["W"], layer["b"], layer["act"]
-            if W is not None and b is not None:
-                a = a @ np.array(W, dtype=np.float32) + np.array(b, dtype=np.float32)
-            if act:
-                a = self._activation(act, a)
-        return a
-
-    # ------------------------------------------------------------
-    # Predict (core)
-        # ------------------------------------------------------------
-
-    def predict_surface(self, params, grid=None, interp_method="spline", verbose=True):
-        """
-        Unified prediction interface for MLP and DeepONet NumPy models.
-        Measures per-step runtime if verbose=True.
-        """
-        # --- Scale branch/param inputs ---
-        x_raw = np.concatenate(
-            [[params["eta"], params["rho"], params["H"]], params["xi0_knots"]]
-        )[None, :]
-        x_scaled = self.scale_params(x_raw)
-
-        # =====================================================
-        # MLP case
-        # =====================================================
-        if self.model_type == "MLP":
-            assert self.output_shape is not None, "MLP export missing output_shape."
-
-            t0 = time.perf_counter()
-            y_scaled = self._forward_seq(x_scaled, self.layers)
-            t1 = time.perf_counter()
-
-            y = self.inverse_transform_output(y_scaled)
-            t2 = time.perf_counter()
-
-            nT, nK = self.output_shape
-            surface = y.reshape(-1, nT, nK)[0]
-            t3 = time.perf_counter()
-
-            base_Ks = self.strikes
-            base_Ts = self.maturities
-
-            # --- Optional interpolation to custom grid ---
-            if isinstance(grid, dict):
-                Ks_target = np.asarray(grid["strikes"], dtype=np.float32)
-                Ts_target = np.asarray(grid["maturities"], dtype=np.float32)
-
-                same_shape = (
-                    base_Ks is not None and base_Ts is not None
-                    and len(base_Ks) == len(Ks_target)
-                    and len(base_Ts) == len(Ts_target)
-                )
-
-                if same_shape and np.allclose(Ks_target, base_Ks) and np.allclose(Ts_target, base_Ts):
-                    if verbose:
-                        print(f"[MLP timing]")
-                        print(f"  Forward        : {t1 - t0:.4f} s")
-                        print(f"  Inverse scale  : {t2 - t1:.4f} s")
-                        print(f"  Reshape        : {t3 - t2:.4f} s")
-                        print(f"  Total          : {t3 - t0:.4f} s\n")
-                    return surface
-
-                # otherwise, perform interpolation
-                if interp_method == "spline":
-                    from scipy.interpolate import RectBivariateSpline
-                    interp = RectBivariateSpline(base_Ts, base_Ks, surface)
-                    surface_interp = interp(Ts_target, Ks_target)
-                else:
-                    from scipy.interpolate import RegularGridInterpolator
-                    interp = RegularGridInterpolator(
-                        (base_Ts, base_Ks),
-                        surface,
-                        method=interp_method,
-                        bounds_error=False,
-                        fill_value=None,
-                    )
-                    TT, KK = np.meshgrid(Ts_target, Ks_target, indexing="ij")
-                    coords = np.stack([TT.ravel(), KK.ravel()], axis=1)
-                    surface_interp = interp(coords).reshape(len(Ts_target), len(Ks_target))
-
-                t4 = time.perf_counter()
-                if verbose:
-                    print(f"[MLP timing]")
-                    print(f"  Forward        : {t1 - t0:.4f} s")
-                    print(f"  Inverse scale  : {t2 - t1:.4f} s")
-                    print(f"  Reshape        : {t3 - t2:.4f} s")
-                    print(f"  Interpolation  : {t4 - t3:.4f} s")
-                    print(f"  Total          : {t4 - t0:.4f} s\n")
-                return surface_interp.astype(np.float32)
-
-            if verbose:
-                print(f"[MLP timing]")
-                print(f"  Forward        : {t1 - t0:.4f} s")
-                print(f"  Inverse scale  : {t2 - t1:.4f} s")
-                print(f"  Reshape        : {t3 - t2:.4f} s")
-                print(f"  Total          : {t3 - t0:.4f} s\n")
-
-            return surface.astype(np.float32)
-
-        # =====================================================
-        # DeepONet case
-        # =====================================================
-        elif self.model_type == "DeepONet":
-            assert isinstance(grid, dict), \
-                "For DeepONet, provide grid={'strikes': ..., 'maturities': ...}"
-
-            Ks = np.asarray(grid["strikes"], dtype=np.float32)
-            Ts = np.asarray(grid["maturities"], dtype=np.float32)
-            K_mesh, T_mesh = np.meshgrid(Ks, Ts, indexing="xy")
-            trunk_coords = np.stack([K_mesh.ravel(), T_mesh.ravel()], axis=1)
-
-            t0 = time.perf_counter()
-            B = self._forward_seq(x_scaled, self.branch_layers)
-            t1 = time.perf_counter()
-            T = self._forward_seq(trunk_coords, self.trunk_layers)
-            t2 = time.perf_counter()
-            y_scaled = np.sum(B * T, axis=1, keepdims=True)
-            t3 = time.perf_counter()
-            y = self.inverse_transform_output(y_scaled).reshape(len(Ts), len(Ks))
-            t4 = time.perf_counter()
-
-            if verbose:
-                print(f"[DeepONet timing]")
-                print(f"  Branch forward : {t1 - t0:.4f} s")
-                print(f"  Trunk forward  : {t2 - t1:.4f} s")
-                print(f"  Fusion (B*T)   : {t3 - t2:.4f} s")
-                print(f"  Inverse scale  : {t4 - t3:.4f} s")
-                print(f"  Total          : {t4 - t0:.4f} s\n")
-
-            return y.astype(np.float32)
-
-        else:
-            raise ValueError(f"Unsupported model type {self.model_type}")
 
 
 

@@ -355,14 +355,36 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize, least_squares, differential_evolution
-
 import os, re, numpy as np, matplotlib.pyplot as plt
-def _natural_key(name: str):
-    """Sort helper: ensures xi0_2 < xi0_10, while keeping eta, rho, H first."""
-    m = re.match(r"^([A-Za-z_]+)(\d+)$", name)
-    if m:
-        return (m.group(1), int(m.group(2)))
-    return (name, -1)
+
+import os
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def _extract_param_names_consistent(results):
+    """
+    Determine a globally consistent parameter order across results.
+    Priority:
+      1) Use explicit order if provided in first result's dict.
+      2) Otherwise infer from all dicts and apply natural sorting.
+    """
+    # Try to get order from first result (keeps mapping to array columns)
+    for key in ["per_param_abs_errors", "per_param_rel_errors"]:
+        if key in results[0]:
+            return list(results[0][key].keys())
+
+    # Otherwise infer from all and natural-sort
+    all_keys = set()
+    for res in results:
+        for k in ["per_param_abs_errors", "per_param_rel_errors"]:
+            if k in res:
+                all_keys.update(res[k].keys())
+    return sorted(
+        list(all_keys),
+        key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split(r"([0-9]+)", s)],
+    )
 
 
 def plot_param_true_vs_est(results, labels, out_dir="calibration_plots", alpha=0.6):
@@ -370,23 +392,8 @@ def plot_param_true_vs_est(results, labels, out_dir="calibration_plots", alpha=0
     os.makedirs(out_dir, exist_ok=True)
     colors = plt.cm.tab10.colors
 
-    all_param_names = None
-    for res in results:
-        for key in ["per_param_abs_errors", "per_param_rel_errors"]:
-            if key in res:
-                all_param_names = list(res[key].keys())
-                break
-        if all_param_names:
-            break
-
-    if all_param_names is None:
-        max_dim = max(r["true_params"].shape[1] for r in results)
-        all_param_names = [f"param_{i}" for i in range(max_dim)]
-
-    all_param_names = sorted(
-        all_param_names,
-        key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", s)],
-    )
+    # unified parameter order across all plots
+    all_param_names = _extract_param_names_consistent(results)
 
     n_params = len(all_param_names)
     ncols = min(4, n_params)
@@ -414,6 +421,7 @@ def plot_param_true_vs_est(results, labels, out_dir="calibration_plots", alpha=0
         if i == 0:
             ax.legend(frameon=True, loc="upper left")
 
+    # deactivate empty subplots
     for j in range(i + 1, nrows * ncols):
         axes[j // ncols, j % ncols].axis("off")
 
@@ -422,7 +430,6 @@ def plot_param_true_vs_est(results, labels, out_dir="calibration_plots", alpha=0
     plt.savefig(path, dpi=200)
     plt.close(fig)
     print(f"Saved scatter comparison to {path}")
-
 
 
 def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="relative"):
@@ -440,17 +447,8 @@ def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="r
                     param_sets.append(r[key])
                     break
 
-    first_dict = param_sets[0]
-    if not first_dict or isinstance(first_dict, dict) and not hasattr(first_dict, "__iter__"):
-        all_param_names = sorted(
-            {k for d in param_sets for k in d.keys()},
-            key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", s)],
-        )
-    else:
-        all_param_names = sorted(
-            list(first_dict.keys()),
-            key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", s)],
-        )
+    # use same consistent order as scatter plot
+    all_param_names = _extract_param_names_consistent(results)
 
     ncols = min(4, len(all_param_names))
     nrows = int(np.ceil(len(all_param_names) / ncols))
@@ -464,6 +462,8 @@ def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="r
     for i, param in enumerate(all_param_names):
         ax = axes[i // ncols, i % ncols]
         for data, label in zip(param_sets, labels):
+            if param not in data:
+                continue
             xs, ys = ecdf(data[param])
             ax.plot(ys, xs * (100 if kind == "relative" else 1), label=label)
         ax.set_title(param, fontsize=14)
@@ -485,6 +485,8 @@ def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="r
     # RMSE ECDF
     fig, ax = plt.subplots(figsize=(5, 4))
     for rmses, label in zip(rmses_sets, labels):
+        if len(rmses) == 0:
+            continue
         xs, ys = ecdf(rmses)
         ax.plot(ys, xs, label=label)
     ax.set_xlabel("Quantiles")
@@ -599,3 +601,78 @@ def compare_model_robustness(
     print(f"Saved comparison plot to {path}")
 
     return stats
+
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+def plot_param_histograms(surface_samples, out_dir="param_histograms"):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ---- Extract all parameter arrays ----
+    etas = []
+    rhos = []
+    Hs   = []
+    xi0_knots = []   # list of lists: xi0_knots[i] = [] of values
+
+    # First determine number of knots
+    first = surface_samples[0]["params"]
+    num_knots = len(first["xi0_knots"])
+    for _ in range(num_knots):
+        xi0_knots.append([])
+
+    # Extract data
+    for s in surface_samples:
+        p = s["params"]
+        etas.append(p["eta"])
+        rhos.append(p["rho"])
+        Hs.append(p["H"])
+        for i, v in enumerate(p["xi0_knots"]):
+            xi0_knots[i].append(v)
+
+    etas = np.array(etas)
+    rhos = np.array(rhos)
+    Hs   = np.array(Hs)
+    xi0_knots = [np.array(v) for v in xi0_knots]
+
+    # ---- Construct list of (name, data) for easy plotting ----
+    all_params = [
+        ("eta", etas),
+        ("rho", rhos),
+        ("H",   Hs),
+    ]
+    for i, arr in enumerate(xi0_knots):
+        all_params.append((f"xi0_knot_{i}", arr))
+
+    # ---- Plot each histogram individually ----
+    for name, data in all_params:
+        plt.figure(figsize=(6,4))
+        plt.hist(data, bins=40, alpha=0.8)
+        plt.title(f"Histogram of {name}")
+        plt.xlabel(name)
+        plt.ylabel("Count")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"hist_{name}.png"), dpi=200)
+        plt.close()
+
+    # ---- Also create a large multi-panel grid ----
+    cols = 3
+    rows = int(np.ceil(len(all_params) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
+
+    axes = axes.flatten()
+    for ax, (name, data) in zip(axes, all_params):
+        ax.hist(data, bins=40, alpha=0.8)
+        ax.set_title(name)
+        ax.set_xlabel(name)
+        ax.set_ylabel("Count")
+
+    # turn off empty axes if parameter count not divisible by grid
+    for j in range(len(all_params), len(axes)):
+        axes[j].axis("off")
+
+    plt.tight_layout()
+    fig.savefig(os.path.join(out_dir, "all_parameters_hist.png"), dpi=200)
+    plt.close(fig)
+
+    print(f"Saved {len(all_params)} histograms to: {out_dir}")

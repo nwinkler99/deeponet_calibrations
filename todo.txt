@@ -158,3 +158,30 @@ Mean relative errors per parameter:
    xi0_8    | mean=37.635% | median=16.504% | std=81.325%
    xi0_9    | mean=39.414% | median=19.812% | std=76.140%
    xi0_10   | mean=50.788% | median=23.641% | std=84.292%
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
