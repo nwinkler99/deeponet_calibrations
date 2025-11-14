@@ -432,9 +432,26 @@ def plot_param_true_vs_est(results, labels, out_dir="calibration_plots", alpha=0
     print(f"Saved scatter comparison to {path}")
 
 
-def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="relative"):
-    """Compare ECDFs of per-parameter errors and RMSEs across multiple models."""
+def plot_param_error_ecdfs(
+    results,
+    labels,
+    out_dir="calibration_plots",
+    kind="relative",
+    cut_quantile=None,          # <-- NEW OPTION
+):
+    """Compare ECDFs of per-parameter errors and RMSEs across multiple models.
+    
+    Parameters
+    ----------
+    cut_quantile : float or None
+        If given (e.g. 0.99), truncate the plotted ECDF curves at the given
+        percentile of x-values. Useful to hide extreme outliers.
+        Must satisfy 0 < cut_quantile <= 1.
+    """
     os.makedirs(out_dir, exist_ok=True)
+
+    if cut_quantile is not None:
+        assert 0 < cut_quantile <= 1, "cut_quantile must be in (0,1]."
 
     param_sets, rmses_sets = [], []
     for r in results:
@@ -447,31 +464,44 @@ def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="r
                     param_sets.append(r[key])
                     break
 
-    # use same consistent order as scatter plot
     all_param_names = _extract_param_names_consistent(results)
 
     ncols = min(4, len(all_param_names))
     nrows = int(np.ceil(len(all_param_names) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.2 * nrows), squeeze=False)
 
-    def ecdf(x):
+    def ecdf_cut(x):
+        """Return (xs, ys) with optional quantile cutoff."""
         xs = np.sort(np.asarray(x))
         ys = np.linspace(0, 1, len(xs))
+
+        if cut_quantile is not None:
+            # Find index corresponding to quantile cutoff
+            cutoff_idx = int(cut_quantile * len(xs))
+            # Keep only up to cutoff index
+            xs = xs[:cutoff_idx]
+            ys = ys[:cutoff_idx]
+
         return xs, ys
 
+    # --------------------------
+    # Parameter ECDFs
+    # --------------------------
     for i, param in enumerate(all_param_names):
         ax = axes[i // ncols, i % ncols]
         for data, label in zip(param_sets, labels):
             if param not in data:
                 continue
-            xs, ys = ecdf(data[param])
+            xs, ys = ecdf_cut(data[param])
             ax.plot(ys, xs * (100 if kind == "relative" else 1), label=label)
+
         ax.set_title(param, fontsize=14)
-        ax.set_xlabel("Quantiles")
+        ax.set_xlabel("Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else ""))
         ax.set_ylabel(f"{kind.title()} Error" + (" [%]" if kind == "relative" else ""))
         if i == 0:
             ax.legend(frameon=True, loc="upper left")
 
+    # empty subplots off
     for j in range(i + 1, nrows * ncols):
         axes[j // ncols, j % ncols].axis("off")
 
@@ -482,21 +512,26 @@ def plot_param_error_ecdfs(results, labels, out_dir="calibration_plots", kind="r
     plt.close(fig)
     print(f"Saved {kind} error ECDF comparison to {path_params}")
 
+    # --------------------------
     # RMSE ECDF
+    # --------------------------
     fig, ax = plt.subplots(figsize=(5, 4))
     for rmses, label in zip(rmses_sets, labels):
         if len(rmses) == 0:
             continue
-        xs, ys = ecdf(rmses)
+        xs, ys = ecdf_cut(rmses)
         ax.plot(ys, xs, label=label)
-    ax.set_xlabel("Quantiles")
+
+    ax.set_xlabel("Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else ""))
     ax.set_ylabel("RMSE")
     ax.legend(frameon=True, loc="upper left")
+
     _tight_suptitle(fig, "Calibration RMSE ECDFs")
     path_rmse = os.path.join(out_dir, "rmse_ecdf.png")
     plt.savefig(path_rmse, dpi=200)
     plt.close(fig)
     print(f"Saved RMSE ECDF comparison to {path_rmse}")
+
 
 
 import os, numpy as np, matplotlib.pyplot as plt, copy
