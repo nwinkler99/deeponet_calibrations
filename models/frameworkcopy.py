@@ -549,46 +549,8 @@ class BaseModel(nn.Module):
     # ============================================================
     # Calibration utilities
     # ============================================================
-    import torch
 
-    def residuals_autograd(self, x_phys, true_surface, Ks, Ts):
-        """
-        Returns (residuals, jacobian) using PyTorch autograd.
-        residuals: numpy array of shape (N,)
-        jac: numpy array of shape (N, n_params)
-        """
-        # 1. torch parameter vector with grad
-        x = torch.tensor(x_phys, dtype=torch.float32, requires_grad=True)
-
-        # 2. build param dict
-        params = {
-            "eta": x[0],
-            "rho": x[1],
-            "H": x[2],
-            "xi0_knots": x[3:]
-        }
-
-        # 3. predict surface in torch
-        pred = torch.tensor(
-            self.predict_surface(params, {"strikes": Ks, "maturities": Ts}),
-            dtype=torch.float32
-        )
-
-        # 4. compute residual vector
-        true_torch = torch.tensor(true_surface, dtype=torch.float32)
-        res = (pred - true_torch).reshape(-1)
-
-        # 5. compute Jacobian row-wise
-        J = []
-        for r in res:
-            grad = torch.autograd.grad(r, x, retain_graph=True)[0]
-            J.append(grad.detach().cpu().numpy())
-
-        return res.detach().cpu().numpy(), np.stack(J, axis=0)
-
-
-
-    def calibrate(self, target_surface, optimiser="L-BFGS-B", bounds=None, maxiter=1000, verbose=False):
+    def calibrate(self, target_surface, optimiser="L-BFGS-B", bounds=None, maxiter=500, verbose=False):
         """
         Calibrate model parameters θ̂ to a given implied-volatility surface by minimizing RMSE.
 
@@ -654,9 +616,7 @@ class BaseModel(nn.Module):
                 x0,
                 method="trf",             # boundaries → trf ist ideal
                 bounds=(lb, ub),
-                ftol=1e-12,               # very strict tolerance on cost function
-                xtol=1e-12,               # strict tolerance on parameter change
-                gtol=1e-12,               # stop only when gradient is nearly zero
+              # stop only when gradient is nearly zero
                 max_nfev=maxiter,
                 verbose=2 if verbose else 0
             )
@@ -1253,7 +1213,7 @@ class DeepONet(BaseModel):
 
             # per-epoch metrics
             train_rmse_scaled = float(np.sqrt(total_scaled_loss / n_samples))
-            train_rmse_iv = float(np.sqrt(total_iv_rmse / (n_samples * pred_iv.shape[1])))
+            train_rmse_iv = float(np.sqrt(total_iv_rmse / (n_samples)))
 
             # --- VALIDATION ---
             if val_loader is not None:
@@ -1312,7 +1272,7 @@ class DeepONet(BaseModel):
 
         return (
             float(np.sqrt(total_scaled / n)),
-            float(np.sqrt(total_iv / (n * pred_iv.shape[1])))
+            float(np.sqrt(total_iv / (n)))
         )
 
     def validate(self, val_loader):

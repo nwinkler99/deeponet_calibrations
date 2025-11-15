@@ -44,23 +44,35 @@ class RBergomiParams:
 class SimulationConfig:
     M: int = 20000
     n: int = 1200
-    T_max: float = 2.0
+    T_min: float = 25/365         # 1 Woche
+    T_max: float = 2.0           # 2 Jahre
     S0: float = 1.0
     strikes: np.ndarray = None
     maturities: np.ndarray = None
     batch_size: int = 5000
     G: int = 10
-    dtype: np.dtype = np.float32  # <--- global dtype control
+    dtype: np.dtype = np.float32  # global dtype control
+
+
 
     def __post_init__(self):
+        # Default strikes = log-moneyness values
         if self.strikes is None:
-            self.strikes = np.array(
-                [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+            self.logstrikes = np.array(
+                [-0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4],
+                dtype=self.dtype
             )
+            self.strikes = np.exp(self.logstrikes)*self.S0
+
+        # Default maturities = log-spaced between T_min and T_max
         if self.maturities is None:
-            self.maturities = np.array(
-                [0.1, 0.3, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1]
+            self.logmaturities = np.linspace(
+                np.log(self.T_min),
+                np.log(self.T_max),
+                9
             )
+            self.maturities = np.exp(self.logmaturities)
+
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -71,60 +83,6 @@ import gc
 import numpy as np
 from numpy.random import SeedSequence, default_rng
 from typing import List, Dict
-
-# ============================================================
-# Helper 1️⃣: jitter_grid with explicit RNG
-# ============================================================
-def jitter_grid(x, grid_jitter=0.5, min_spacing=0.02, rng=None):
-    """
-    Apply small random jitter to grid points while preserving spacing.
-    Deterministic if rng is provided.
-    """
-    rng = rng or default_rng()
-    x = np.array(x, dtype=float, copy=True)
-    n = len(x)
-    if n < 2:
-        return x
-
-    step = np.median(np.diff(x))
-    jitter = rng.normal(0.0, grid_jitter * step, size=n)
-    y = np.clip(x + jitter, x.min(), x.max())
-    y.sort()
-
-    # enforce minimal spacing
-    for i in range(1, n):
-        if y[i] - y[i - 1] < min_spacing:
-            y[i] = y[i - 1] + min_spacing
-    return y
-
-
-# ============================================================
-# Helper 2️⃣: LHS parameter sampling with RNG injection
-# ============================================================
-from scipy.stats import qmc
-
-class RBergomiParams:
-    def __init__(self, eta, rho, H):
-        self.eta = eta
-        self.rho = rho
-        self.H = H
-
-
-def sample_param_sets_lhs(num_sets: int, rng) -> List[RBergomiParams]:
-    """Latin Hypercube sampling for (eta, rho, H) with explicit RNG control."""
-    sampler_seed = rng.integers(0, 2**31 - 1)
-    sampler = qmc.LatinHypercube(d=3, seed=sampler_seed)
-    sample = sampler.random(num_sets)
-
-    lower = np.array([0.5, -0.95, 0.025])
-    upper = np.array([4.0, -0.1, 0.5])
-    scaled = qmc.scale(sample, lower, upper)
-
-    return [
-        RBergomiParams(float(scaled[i, 0]), float(scaled[i, 1]), float(scaled[i, 2]))
-        for i in range(num_sets)
-    ]
-
 
 # ============================================================
 #  Main generator: fully reproducible
@@ -180,11 +138,30 @@ def generate_surfaces(
 
         # --- 4️⃣ Forward variance curve generation ---
         for j in range(forward_curves_per_set):
-            strikes_base = cfg.strikes.astype(cfg.dtype)
-            maturities_base = cfg.maturities.astype(cfg.dtype)
 
-            forward_points = np.array([0.1, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.1])
+            # --------------------------------------------------------------
+            # Forward variance knots derived from log-maturity grid
+            # Guaranteed to include T_max
+            # --------------------------------------------------------------
+
+            # 1) jedes zweite log-T nehmen
+            log_forward_points = cfg.logmaturities[::2].copy()
+
+            # 2) sicherstellen, dass T_max (als log(T_max)) enthalten ist
+            log_T_max = np.log(cfg.T_max)
+
+            if not np.isclose(log_forward_points[-1], log_T_max):
+                log_forward_points = np.concatenate([log_forward_points, [log_T_max]])
+
+            # 3) Aufräumen: sortieren & Duplikate entfernen
+            log_forward_points = np.unique(np.sort(log_forward_points))
+
+            # 4) zurück zu physischer Zeit
+            forward_points = np.exp(log_forward_points)
+
+            # 5) xi0-Knoten generieren
             xi0_knots = rng_xi.uniform(0.01, 0.16, size=len(forward_points)).astype(cfg.dtype)
+
 
             # map xi0_knots to sim grid
             base_edges = np.concatenate([[0.0], forward_points.astype(float)])
@@ -207,18 +184,63 @@ def generate_surfaces(
 
             # --- 5️⃣ Grid generation & IV computation ---
             for g_id in range(cfg.G):
+
+                # --- Base grids (linear + log) ---
+                strikes_base        = cfg.strikes.astype(cfg.dtype)
+                logstrikes_base     = cfg.logstrikes.astype(cfg.dtype)
+
+                maturities_base     = cfg.maturities.astype(cfg.dtype)
+                logmaturities_base  = cfg.logmaturities.astype(cfg.dtype)
+
+                # --- Relative jitter scaling (log-space ranges) ---
+                L_strikes    = float(logstrikes_base.max()     - logstrikes_base.min())
+                L_maturities = float(logmaturities_base.max()  - logmaturities_base.min())
+
+                jitter_scale      = 0.3   # 5% of total log-range
+                spacing_scale     = 0.02   # 2% minimal spacing
+
+                grid_jitter_strikes = jitter_scale * L_strikes
+                min_spacing_strikes = spacing_scale * L_strikes
+
+                grid_jitter_mats    = jitter_scale * L_maturities
+                min_spacing_mats    = spacing_scale * L_maturities
+
+                # ----------------------------------------------------------
+                # Apply jitter (log-space) or use base grid
+                # ----------------------------------------------------------
                 if randomize_grid and g_id > 0:
-                    strikes_shifted = np.array(
-                        jitter_grid(strikes_base, grid_jitter=grid_jitter, min_spacing=0.02, rng=rng_jit),
+                    # --- log-strikes jitter ---
+                    logstrikes_shifted = np.array(
+                        jitter_grid(
+                            logstrikes_base,
+                            grid_jitter   = grid_jitter_strikes,
+                            min_spacing   = min_spacing_strikes,
+                            rng           = rng_jit,
+                        ),
                         dtype=cfg.dtype,
                     )
-                    maturities_shifted = np.array(
-                        jitter_grid(maturities_base, grid_jitter=grid_jitter, min_spacing=0.02, rng=rng_jit),
+                    strikes_shifted = np.exp(logstrikes_shifted) * cfg.S0
+
+                    # --- log-maturities jitter ---
+                    logmaturities_shifted = np.array(
+                        jitter_grid(
+                            logmaturities_base,
+                            grid_jitter   = grid_jitter_mats,
+                            min_spacing   = min_spacing_mats,
+                            rng           = rng_jit,
+                        ),
                         dtype=cfg.dtype,
                     )
+                    maturities_shifted = np.exp(logmaturities_shifted).astype(cfg.dtype)
+
                 else:
-                    strikes_shifted = strikes_base.copy()
-                    maturities_shifted = maturities_base.copy()
+                    # No jitter → use base grids
+                    logstrikes_shifted     = logstrikes_base.copy()
+                    strikes_shifted        = strikes_base.copy()
+
+                    logmaturities_shifted  = logmaturities_base.copy()
+                    maturities_shifted     = maturities_base.copy()
+                
 
                 nT, nK = len(maturities_shifted), len(strikes_shifted)
                 iv_surf = np.zeros((nT, nK), dtype=cfg.dtype)
@@ -284,8 +306,8 @@ def generate_surfaces(
                             "xi0_knots": xi0_knots.astype(cfg.dtype).tolist(),
                         },
                         "grid": {
-                            "strikes": strikes_shifted.astype(cfg.dtype),
-                            "maturities": maturities_shifted.astype(cfg.dtype),
+                            "strikes": logstrikes_shifted.astype(cfg.dtype),
+                            "maturities": logmaturities_shifted.astype(cfg.dtype),
                         },
                         "iv_surface": iv_surf,
                         "iv_rel_error": iv_relerr,

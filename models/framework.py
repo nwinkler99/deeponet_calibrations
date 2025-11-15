@@ -173,80 +173,6 @@ class BaseModel(nn.Module):
     # Shared evaluation utilities (no extra args needed)
     # ====================================================
 
-    def compute_grid_mse(self, surface_data, interp_method="spline"):
-        """
-        Compute MSE between predicted and true surfaces.
-        If the sample grid differs from the model grid, interpolate the true surface
-        onto the model's grid before comparison.
-
-        Parameters
-        ----------
-        surface_data : dict
-            {"iv_surface": 2D np.array, "grid": {"strikes","maturities"}, "params": dict}
-        interp_method : {"spline","linear","nearest"}, default="spline"
-            Interpolation method used if grids differ.
-
-        Returns
-        -------
-        mse_grid : np.ndarray
-            Elementwise squared error on the model grid.
-        stats : dict
-            Summary metrics (mean, std, max, RMSE, MAE, etc.)
-        """
-        assert self.strikes is not None and self.maturities is not None, \
-            "Model grid (strikes/maturities) not set; call set_grid or train/prepare first."
-
-        true_surface = np.asarray(surface_data["iv_surface"], dtype=np.float32)
-        grid = surface_data.get("grid", {"strikes": self.strikes, "maturities": self.maturities})
-        Ks_true = np.asarray(grid["strikes"], dtype=np.float32)
-        Ts_true = np.asarray(grid["maturities"], dtype=np.float32)
-        params = surface_data["params"]
-
-        # Predict surface on model's own grid
-        pred_surface = self.predict_surface(params)  # always on (self.maturities, self.strikes)
-        pred_surface = pred_surface.detach().cpu().numpy()
-
-        # If grids differ, interpolate true_surface onto model's grid
-        if not (np.allclose(Ks_true, self.strikes) and np.allclose(Ts_true, self.maturities)):
-            if interp_method == "spline":
-                interp = RectBivariateSpline(Ts_true, Ks_true, true_surface)
-                true_surface_interp = interp(self.maturities, self.strikes)
-            else:
-                interp = RegularGridInterpolator(
-                    (Ts_true, Ks_true), true_surface, method=interp_method,
-                    bounds_error=False, fill_value=None
-                )
-                TT, KK = np.meshgrid(self.maturities, self.strikes, indexing="ij")
-                coords = np.stack([TT.ravel(), KK.ravel()], axis=1)
-                true_surface_interp = interp(coords).reshape(len(self.maturities), len(self.strikes))
-            true_surface = true_surface_interp.astype(np.float32)
-
-        # Compute per-grid-point error
-        abs_err = np.abs(true_surface - pred_surface)
-        mse_grid = abs_err ** 2
-
-        # Locate largest absolute error
-        idx_flat = np.argmax(abs_err)
-        m_idx, k_idx = np.unravel_index(idx_flat, abs_err.shape)
-        loc = {
-            'maturity_index': int(m_idx),
-            'strike_index': int(k_idx),
-            'strike': float(self.strikes[k_idx]),
-            'maturity': float(self.maturities[m_idx])
-        }
-
-        stats = {
-            'mse_mean': float(np.mean(mse_grid)),
-            'mse_std': float(np.std(mse_grid)),
-            'mse_max': float(np.max(mse_grid)),
-            'rmse': float(np.sqrt(np.mean(mse_grid))),
-            'mae': float(np.mean(abs_err)),
-            'max_abs_error': float(np.max(abs_err)),
-            'max_error_location': loc
-        }
-        return mse_grid, stats
-
-
     def plot_evaluation(self, surface_data, figsize=(15, 5), levels=30, interp_method="spline"):
         """
         Compare true vs predicted IV surfaces using contour plots.
@@ -582,7 +508,7 @@ class BaseModel(nn.Module):
 
         return res.detach().cpu().numpy(), J.detach().cpu().numpy()
 
-    def calibrate(self, target_surface, optimiser="L-BFGS-B", bounds=None, maxiter=1000, verbose=False):
+    def calibrate(self, target_surface, optimiser="L-BFGS-B", bounds=None, maxiter=500, verbose=False):
         """
         Calibrate model parameters θ̂ to a given implied-volatility surface by minimizing RMSE.
 
@@ -1678,54 +1604,6 @@ class MLP(BaseModel):
     ###########################################################
 
 
-    def interp_surface_torch(surface, base_Ts, base_Ks, target_Ts, target_Ks, mode="bicubic"):
-        """
-        Differentiable interpolation of a surface using torch.grid_sample.
-
-        Parameters
-        ----------
-        surface : torch.Tensor
-            Shape (nT_base, nK_base)
-        base_Ts, base_Ks : torch.Tensor
-            1D grids of base maturities / strikes
-        target_Ts, target_Ks : torch.Tensor
-            1D grids of target maturities / strikes
-        mode : "bilinear" | "bicubic" | "nearest"
-
-        Returns
-        -------
-        out : torch.Tensor of shape (nT_target, nK_target)
-        """
-
-        device = surface.device
-
-        # grid_sample expects shape (N, C, H, W)
-        img = surface.unsqueeze(0).unsqueeze(0)  # (1,1,nT_base,nK_base)
-
-        # normalize base grid ranges → [-1, 1]
-        T_min, T_max = base_Ts.min(), base_Ts.max()
-        K_min, K_max = base_Ks.min(), base_Ks.max()
-
-        # build normalized coordinates
-        TT, KK = torch.meshgrid(target_Ts, target_Ks, indexing="ij")
-        TTn = 2.0 * (TT - T_min) / (T_max - T_min) - 1.0
-        KKn = 2.0 * (KK - K_min) / (K_max - K_min) - 1.0
-
-        # grid_sample expects coords as (N,H,W,2): last dimension is (x, y)
-        # NOTE: grid ordering is (K_normalized, T_normalized)
-        grid = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)  # (1,nT_target,nK_target,2)
-
-        # perform differentiable interpolation
-        out = F.grid_sample(
-            img,
-            grid,
-            mode=mode,
-            padding_mode="border",
-            align_corners=True
-        )
-
-        return out.squeeze(0).squeeze(0)
-
     def predict_surface(self, params, grid=None):
         """
         Fully torch-based surface prediction for MLP models.
@@ -1802,8 +1680,8 @@ class MLP(BaseModel):
         surface_interp = F.grid_sample(
             img,
             grid_torch,
-            mode="bicubic",
-            padding_mode="border",
+            mode="bilinear",
+            padding_mode="reflection",
             align_corners=True
         )
         return surface_interp.squeeze(0).squeeze(0)

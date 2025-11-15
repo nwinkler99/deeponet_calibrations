@@ -46,7 +46,7 @@ CHUNK_SIZE = args.chunk or int(BATCH_SIZE // MAX_WORKERS)
 START_BATCH = args.startbatch
 
 if randomize_grid:             # number of parameter sets per batch
-    SAVE_ROOT = "data/new_longrun" # root directory for all runs
+    SAVE_ROOT = "data/new_log_longrun" # root directory for all runs
 else:
     SAVE_ROOT = "data/new_fixed_longrun"  # root directory for all runs
 os.makedirs(SAVE_ROOT, exist_ok=True)

@@ -160,7 +160,7 @@ class RBergomiParams:
 
 def sample_param_sets_lhs(num_sets: int, rng: np.random.RandomState) -> List[RBergomiParams]:
     """Sample (eta, rho, H) via Latin Hypercube, fully tied to rng."""
-    sampler_seed = rng.randint(0, 2**31 - 1)
+    sampler_seed = rng.integers(0, 2**31 - 1)
     sampler = qmc.LatinHypercube(d=3, seed=sampler_seed)
     sample = sampler.random(num_sets)
 
@@ -290,22 +290,22 @@ def plot_iv_surface(
 
 import numpy as np
 from scipy.ndimage import convolve
-def repair_edges_local_directional(iv_surface: np.ndarray,
-                                   maturities: np.ndarray,
-                                   strikes: np.ndarray,
-                                   t_threshold: float = 0.35,
-                                   dtype: np.dtype = np.float32,
-                                   min_floor: float = 0.05) -> np.ndarray:
+def repair_edges_local_directional(
+        iv_surface: np.ndarray,
+        maturities: np.ndarray,
+        strikes: np.ndarray,
+        t_threshold: float = 0.25,
+        dtype=np.float32,
+        min_floor: float = 0.015,
+        protect_wings: int = 2
+    ) -> np.ndarray:
     """
-    Lightweight, local edge stabilization for short maturities.
-    - Fills NaNs row/col-wise.
-    - Lifts left/right edges of short-maturity rows toward neighbors.
-    - Smoothly replaces values < min_floor with weighted 3×3 Gaussian-style local mean.
+    Robust, wing-safe edge correction for short maturities.
     """
     iv = np.array(iv_surface, dtype=dtype, copy=True)
     nT, nK = iv.shape
 
-    # --- Row-wise NaN fill
+    # ---------- 1) Row-wise fill ----------
     for i in range(nT):
         row = iv[i]
         if np.any(np.isnan(row)):
@@ -321,7 +321,7 @@ def repair_edges_local_directional(iv_surface: np.ndarray,
             else:
                 iv[i] = np.nan
 
-    # --- Column-wise fill
+    # ---------- 2) Column-wise fill ----------
     if np.isnan(iv).any():
         col_means = np.nanmean(iv, axis=0)
         for j in range(nK):
@@ -330,25 +330,35 @@ def repair_edges_local_directional(iv_surface: np.ndarray,
                 iv[nan_idx, j] = col_means[j]
     iv = np.nan_to_num(iv, nan=np.nanmean(iv)).astype(dtype)
 
+    # ---------- Convert maturities from log(T) if needed ----------
+    T_phys = np.exp(maturities) if np.max(maturities) < 1 else maturities
 
-    # --- Weighted local-mean correction for values < min_floor
-    mask_rows = maturities <= 1000
-    if np.any(mask_rows):
-        iv_short = iv[mask_rows]
+    # Which rows are short-dated?
+    short_mask = T_phys <= t_threshold
+    if not np.any(short_mask):
+        return iv
 
-        # Gaussian-like kernel (center-heavy)
-        kernel = np.array([[1, 2, 1],
-                           [2, 4, 2],
-                           [1, 2, 1]], dtype=np.float32)
-        kernel /= kernel.sum()
+    short_iv = iv[short_mask]
 
-        local_mean = convolve(iv_short, kernel, mode="reflect")
+    # ---------- 3) local smoothing kernel ----------
+    kernel = np.array([[1, 2, 1],
+                       [2, 4, 2],
+                       [1, 2, 1]], dtype=np.float32)
+    kernel /= kernel.sum()
 
-        mask_low = iv_short < min_floor
-        iv_short[mask_low] = local_mean[mask_low]
-        iv[mask_rows] = iv_short
+    # Full convolution
+    blurred = convolve(short_iv, kernel, mode="reflect")
 
+    # ---------- 4) protect wings ----------
+    core = slice(protect_wings, nK - protect_wings)
+
+    low_vals = short_iv < min_floor
+    short_iv[low_vals] = blurred[low_vals]
+
+    # wings untouched
+    iv[short_mask] = short_iv
     return iv.astype(dtype)
+
 
 
 import os
