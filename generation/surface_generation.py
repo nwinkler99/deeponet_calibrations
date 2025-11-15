@@ -196,8 +196,8 @@ def generate_surfaces(
                 L_strikes    = float(logstrikes_base.max()     - logstrikes_base.min())
                 L_maturities = float(logmaturities_base.max()  - logmaturities_base.min())
 
-                jitter_scale      = 0.3   # 5% of total log-range
-                spacing_scale     = 0.02   # 2% minimal spacing
+                jitter_scale      = 0.25   # 5% of total log-range
+                spacing_scale     = 0.05   # 2% minimal spacing
 
                 grid_jitter_strikes = jitter_scale * L_strikes
                 min_spacing_strikes = spacing_scale * L_strikes

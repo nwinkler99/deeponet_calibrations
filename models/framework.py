@@ -342,7 +342,7 @@ class BaseModel(nn.Module):
         # ------------------------------------------------------------
         # plotting infra
         # ------------------------------------------------------------
-        Ks_mesh, Ts_mesh = np.meshgrid(self.strikes, self.maturities, indexing="xy")
+        Ks_mesh, Ts_mesh = np.meshgrid(self.strikes, np.exp(self.maturities), indexing="xy")
 
         def plot_set(data_triplet, titles, fname, label):
             fig, axes = plt.subplots(1, 3, figsize=(15, 4))
@@ -603,13 +603,8 @@ class BaseModel(nn.Module):
             "optimizer": optimiser
         }
 
-    def evaluate_calibrate(self, surfaces, optimiser="L-BFGS-B", maxiter=500,
+    def evaluate_calibrate(self, surfaces, optimiser="lm", maxiter=500,
                         out_dir="calibration_eval", verbose=False):
-        """
-        Run calibration across multiple surfaces using a single optimizer,
-        producing per-parameter error statistics (mean/median/std + RMSE for absolute),
-        and returning true/estimated parameter arrays.
-        """
 
         os.makedirs(out_dir, exist_ok=True)
         print(f"\nEvaluating calibration using {optimiser} on {len(surfaces)} surfaces...")
@@ -618,12 +613,48 @@ class BaseModel(nn.Module):
         per_param_rel_errors, per_param_abs_errors = {}, {}
         true_params_all, est_params_all = [], []
 
+        # new: detect how MLP should be used
+        interp_mode = getattr(self, "interp_mode", "model_to_market")
+
         for i, s in enumerate(surfaces, start=1):
-            r = self.calibrate(s, optimiser=optimiser, maxiter=maxiter, verbose=verbose)
+
+            # ----------------------------------------------
+            # MARKET → MODEL preprocessing
+            # ----------------------------------------------
+            if interp_mode == "market_to_model":
+                # get model-grid IVs
+                iv_on_model = self._interpolate_market_to_model(
+                    market_surface=s["iv_surface"],
+                    Ks_market=s["grid"]["strikes"],
+                    Ts_market=s["grid"]["maturities"],
+                )
+
+                # overwrite target surface with model-grid version
+                s_proc = {
+                    "params": s["params"],
+                    "grid": {       # IMPORTANT: now model grid!
+                        "strikes": self.strikes,
+                        "maturities": self.maturities,
+                    },
+                    "iv_surface": iv_on_model,
+                }
+
+                # calibration → predict_surface(params)  (grid=None!)
+                r = self.calibrate(s_proc, optimiser=optimiser, maxiter=maxiter, verbose=verbose)
+
+            # ----------------------------------------------
+            # MODEL → MARKET (normal academic pipeline)
+            # ----------------------------------------------
+            else:
+                # calibration happens on the market grid directly
+                r = self.calibrate(s, optimiser=optimiser, maxiter=maxiter, verbose=verbose)
+
+            # store results
             runtimes.append(r["runtime_ms"])
             rmses.append(r["rmse"])
             est_params_all.append(r["theta_hat"])
 
+            # true parameter vector
             tp = s.get("params", None)
             if tp is not None:
                 tvec = np.concatenate([
@@ -1310,51 +1341,88 @@ class DeepONet(BaseModel):
 
 
 
+import time
+import sys
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from torch.utils.data import DataLoader, TensorDataset
 
 
-# ============================================================
-# MLP (self-contained)
-# ============================================================
 
 class MLP(BaseModel):
     """
     Simple MLP mapping parameter vector -> implied volatility surface.
     Output is the full (nT, nK) surface predicted in one shot.
+
+    interp_mode:
+        "base"            -> keine Interpolation, immer Modellgrid zurückgeben
+        "model_to_market" -> MLP auf Modellgrid, dann Modell->Market Grid Interpolation
+        "market_to_model" -> Market-IVs auf Modellgrid interpolieren (für Daten/Analyse)
     """
-    def __init__(self, input_dim=None, output_shape=None, hidden_dims=(256, 256, 256),
-                 activation="elu", lr=1e-3):
+
+    def __init__(
+        self,
+        input_dim=None,
+        output_shape=None,
+        hidden_dims=(256, 256, 256),
+        activation="elu",
+        lr=1e-3,
+        interp_mode="base",
+    ):
         super().__init__()
         self.input_dim = input_dim
         self.output_shape = output_shape  # (nT, nK)
-        self.output_dim = None if output_shape is None else int(output_shape[0] * output_shape[1])
+        self.output_dim = (
+            None if output_shape is None else int(output_shape[0] * output_shape[1])
+        )
         self.hidden_dims = hidden_dims
         self.activation = activation
         self.lr = lr
+        self.interp_mode = interp_mode  # global default for predict_surface
 
         if (input_dim is not None) and (output_shape is not None):
             self._build_network()
         self.to(self.device)
 
+    # ------------------------------------------------------------------
+    # Network construction
+    # ------------------------------------------------------------------
     def _build_network(self):
-        act_fn = {"relu": nn.ReLU(), "gelu": nn.GELU(), "tanh": nn.Tanh(), "elu": nn.ELU()}[self.activation]
+        act_fn = {
+            "relu": nn.ReLU(),
+            "gelu": nn.GELU(),
+            "tanh": nn.Tanh(),
+            "elu": nn.ELU(),
+        }[self.activation]
+
         dims = [self.input_dim] + list(self.hidden_dims)
         layers = []
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
             layers.append(act_fn)
         layers.append(nn.Linear(dims[-1], self.output_dim))
+
         self.net = nn.Sequential(*layers).to(self.device)
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
         self.criterion = nn.MSELoss()
 
     def forward(self, x):
-        out = self.net(x)                    # (batch, 121)
+        out = self.net(x)  # (batch, output_dim)
         batch = out.shape[0]
         return out.reshape(batch, *self.output_shape)
 
-    # --------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Data stacking
+    # ------------------------------------------------------------------
     @staticmethod
     def _stack_XY(surfaces, sanity_check_grids=True):
+        """
+        Build X (params) and Y (IV surfaces) from a list of surfaces.
+        All grids must be identical if sanity_check_grids=True.
+        """
         X_list, Y_list = [], []
         Ks_ref, Ts_ref = None, None
 
@@ -1369,25 +1437,49 @@ class MLP(BaseModel):
                     Ks_ref, Ts_ref = Ks, Ts
                 else:
                     if not (np.allclose(Ks_ref, Ks) and np.allclose(Ts_ref, Ts)):
-                        raise ValueError("All surfaces must share the same (K, T) grid for the MLP output shape.")
+                        raise ValueError(
+                            "All surfaces must share the same (K, T) grid for the MLP output shape."
+                        )
 
             xi0_knots = np.array(params["xi0_knots"]).flatten()
-            param_vec = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots]).astype(np.float32)
+            param_vec = np.concatenate(
+                [[params["eta"], params["rho"], params["H"]], xi0_knots]
+            ).astype(np.float32)
             X_list.append(param_vec)
             Y_list.append(iv_surface)
 
-        X = np.stack(X_list, axis=0)   # (N, d)
-        Y = np.stack(Y_list, axis=0)   # (N, nT, nK)
-        strikes = Ks_ref if Ks_ref is not None else np.array(surfaces[0]["grid"]["strikes"], dtype=np.float32)
-        maturities = Ts_ref if Ts_ref is not None else np.array(surfaces[0]["grid"]["maturities"], dtype=np.float32)
+        X = np.stack(X_list, axis=0)  # (N, d)
+        Y = np.stack(Y_list, axis=0)  # (N, nT, nK)
+        strikes = (
+            Ks_ref
+            if Ks_ref is not None
+            else np.array(surfaces[0]["grid"]["strikes"], dtype=np.float32)
+        )
+        maturities = (
+            Ts_ref
+            if Ts_ref is not None
+            else np.array(surfaces[0]["grid"]["maturities"], dtype=np.float32)
+        )
         return X, Y, strikes, maturities
 
+    # ------------------------------------------------------------------
+    # Factory from_surfaces
+    # ------------------------------------------------------------------
     @classmethod
-    def from_surfaces(cls, surfaces, batch_size=32, val_split=0.2, shuffle=True,
-                    hidden_dims=(256, 256, 256), activation="gelu", lr=1e-3):
+    def from_surfaces(
+        cls,
+        surfaces,
+        batch_size=32,
+        val_split=0.2,
+        shuffle=True,
+        hidden_dims=(256, 256, 256),
+        activation="gelu",
+        lr=1e-3,
+        interp_mode="base",
+    ):
         """
         Build an MLP model + loaders with internal, leakage-safe scaling:
-        - Param vector scaled to [-1, 1] using empirical min/max (+5% margin)
+        - Param vector scaled to [-1, 1] using empirical min/max (+1% margin)
         - Output (IV) scaled via StandardScaler fit on train only
 
         Returns
@@ -1400,7 +1492,7 @@ class MLP(BaseModel):
         input_dim = X.shape[1]
         output_shape = (nT, nK)
 
-        # --- Empirical parameter bounds (+5% margin) ---
+        # --- Empirical parameter bounds (+1% margin) ---
         lb = np.min(X, axis=0)
         ub = np.max(X, axis=0)
         margin = 0.01 * (ub - lb)
@@ -1417,15 +1509,21 @@ class MLP(BaseModel):
             np.random.shuffle(idx)
         tr, va = idx[:n_train], idx[n_train:]
 
-        # Fit output scaler on train only
-        model = cls(input_dim=input_dim, output_shape=output_shape, hidden_dims=hidden_dims,
-                    activation=activation, lr=lr)
+        # Build model
+        model = cls(
+            input_dim=input_dim,
+            output_shape=output_shape,
+            hidden_dims=hidden_dims,
+            activation=activation,
+            lr=lr,
+            interp_mode=interp_mode,
+        )
         model.set_grid(strikes, maturities)
         model.set_io_dims(input_dim=input_dim, output_shape=output_shape)
         model.set_param_bounds(lb, ub)
         model.fit_output_scaler(Y[tr])
 
-        # Transform outputs
+        # Transform outputs (scaled IV space)
         Y_tr_scaled = model.transform_output(Y[tr])
         Y_va_scaled = model.transform_output(Y[va])
 
@@ -1435,13 +1533,18 @@ class MLP(BaseModel):
         Xva = torch.tensor(X_scaled[va], dtype=torch.float32)
         Yva = torch.tensor(Y_va_scaled, dtype=torch.float32)
 
-        train_loader = DataLoader(TensorDataset(Xtr, Ytr), batch_size=batch_size, shuffle=True)
-        val_loader   = DataLoader(TensorDataset(Xva, Yva), batch_size=2 * batch_size, shuffle=False)
+        train_loader = DataLoader(
+            TensorDataset(Xtr, Ytr), batch_size=batch_size, shuffle=True
+        )
+        val_loader = DataLoader(
+            TensorDataset(Xva, Yva), batch_size=2 * batch_size, shuffle=False
+        )
 
-        # Ensure network is built (already in __init__)
         return model, train_loader, val_loader, strikes, maturities
 
-    # --------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
     def train_model(
         self,
         train_loader,
@@ -1450,14 +1553,14 @@ class MLP(BaseModel):
         lr_schedule=[(0, 1e-3), (30, 5e-4), (60, 1e-4)],
     ):
         """
-        Train MLP in scaled output space, but report both
-        scaled RMSE and true IV-space RMSE.
+        Standard MLP training. Tracks both scaled-RMSE and true-IV-RMSE.
         """
+
         lr_schedule = sorted(lr_schedule, key=lambda x: x[0])
         schedule_index = 0
-
+        base_lr = lr_schedule[0][1]
         for g in self.optimizer.param_groups:
-            g["lr"] = lr_schedule[0][1]
+            g["lr"] = base_lr
 
         start_time = time.time()
         epoch_durations = []
@@ -1474,13 +1577,15 @@ class MLP(BaseModel):
                 new_lr = lr_schedule[schedule_index][1]
                 for g in self.optimizer.param_groups:
                     g["lr"] = new_lr
-                sys.stdout.write(f"\n→ Adjusted learning rate to {new_lr:.2e} at epoch {epoch}\n")
+                sys.stdout.write(
+                    f"\n→ Adjusted learning rate to {new_lr:.2e} at epoch {epoch}\n"
+                )
 
-            # --- TRAIN ---
+            # --- TRAINING ---
             self.train()
-            total_scaled = 0.0
-            total_iv = 0.0
-            n = len(train_loader.dataset)
+            total_scaled_loss = 0.0
+            total_iv_rmse = 0.0
+            n_samples = len(train_loader.dataset)
 
             for x, y in train_loader:
                 x, y = x.to(self.device), y.to(self.device)
@@ -1492,47 +1597,47 @@ class MLP(BaseModel):
                 loss.backward()
                 self.optimizer.step()
 
-                batch = len(y)
-                total_scaled += loss.item() * batch
-                
-                # IV RMSE
-                pred_np = pred.detach().cpu().numpy()     # (batch, 11,11)
-                y_np    = y.detach().cpu().numpy()        # (batch, 11,11)
+                batch_size = len(y)
+                total_scaled_loss += loss.item() * batch_size
 
-                batch = pred_np.shape[0]
+                # --- true IV RMSE ---
+                pred_np = pred.detach().cpu().numpy()
+                y_np = y.detach().cpu().numpy()
 
-                rmse_iv_list = []
-                for i in range(batch):
-                    # einzelne Oberfläche extrahieren
-                    pred_surf = pred_np[i]      # (11,11)
-                    y_surf    = y_np[i]         # (11,11)
+                batch_rmse = []
+                for i in range(batch_size):
+                    pi = self.inverse_transform_surface(pred_np[i])
+                    yi = self.inverse_transform_surface(y_np[i])
+                    batch_rmse.append(
+                        np.sqrt(np.mean((pi - yi) ** 2, dtype=np.float64))
+                    )
 
-                    # inverse transform auf EIN surface
-                    pred_iv  = self.inverse_transform_surface(pred_surf)
-                    y_iv     = self.inverse_transform_surface(y_surf)
+                total_iv_rmse += float(np.mean(batch_rmse)) * batch_size
 
-                    rmse_iv_list.append( np.sqrt(np.mean((pred_iv - y_iv)**2)) )
-                rmse_iv = float(np.mean(rmse_iv_list))
-                total_iv += rmse_iv * batch
+            train_rmse_scaled = float(np.sqrt(total_scaled_loss / n_samples))
+            train_rmse_iv = float(total_iv_rmse / n_samples)
 
-            train_scaled = float(np.sqrt(total_scaled / n))
-            train_iv     = float(total_iv / n)
-
-            # --- VAL ---
+            # --- VALIDATION ---
             if val_loader is not None:
-                val_scaled, val_iv = self._validate_dual(val_loader)
-                msg = (f"Epoch {epoch+1:03d} | "
-                    f"train_scaled={train_scaled:.6f}, val_scaled={val_scaled:.6f}, "
-                    f"train_iv={train_iv:.6f}, val_iv={val_iv:.6f}, "
-                    f"lr={self.optimizer.param_groups[0]['lr']:.1e}")
+                val_rmse_scaled, val_rmse_iv = self._validate_dual(val_loader)
+                msg = (
+                    f"Epoch {epoch+1:03d} | "
+                    f"train_scaled={train_rmse_scaled:.6f}, val_scaled={val_rmse_scaled:.6f}, "
+                    f"train_iv={train_rmse_iv:.6f}, val_iv={val_rmse_iv:.6f}, "
+                    f"lr={self.optimizer.param_groups[0]['lr']:.1e}"
+                )
             else:
-                msg = (f"Epoch {epoch+1:03d} | "
-                    f"train_scaled={train_scaled:.6f}, train_iv={train_iv:.6f}, "
-                    f"lr={self.optimizer.param_groups[0]['lr']:.1e}")
+                msg = (
+                    f"Epoch {epoch+1:03d} | "
+                    f"train_scaled={train_rmse_scaled:.6f}, train_iv={train_rmse_iv:.6f}, "
+                    f"lr={self.optimizer.param_groups[0]['lr']:.1e}"
+                )
 
+            # ETA & timing
             epoch_time = time.time() - epoch_start
             epoch_durations.append(epoch_time)
-            eta = (epochs - (epoch + 1)) * np.mean(epoch_durations)
+            avg_time = np.mean(epoch_durations)
+            eta = (epochs - (epoch + 1)) * avg_time
             msg += f", time={epoch_time:.2f}s, ETA={eta/60:.1f} min"
 
             sys.stdout.write("\r\033[K" + msg)
@@ -1541,7 +1646,6 @@ class MLP(BaseModel):
         print()
         total_time = time.time() - start_time
         print(f"\n✅ Training completed in {total_time/60:.2f} min")
-
 
     def _validate_dual(self, val_loader):
         """
@@ -1559,132 +1663,177 @@ class MLP(BaseModel):
                 x, y = x.to(self.device), y.to(self.device)
                 pred = self.forward(x)
 
-                # --- scaled RMSE accumulation ---
+                # scaled loss
                 scaled_loss = self.criterion(pred, y).item()
                 batch = y.shape[0]
                 total_scaled += scaled_loss * batch
 
-                # -----------------------------------------
-                # TRUE IV RMSE: EINE SURFACE NACH DER ANDEREN
-                # -----------------------------------------
-                pred_np = pred.detach().cpu().numpy()   # (batch, nT, nK)
-                y_np    = y.detach().cpu().numpy()      # (batch, nT, nK)
+                pred_np = pred.detach().cpu().numpy()
+                y_np = y.detach().cpu().numpy()
 
                 rmse_list = []
                 for i in range(batch):
-                    pred_surf = pred_np[i]        # (nT, nK)
-                    y_surf    = y_np[i]           # (nT, nK)
+                    pred_iv = self.inverse_transform_surface(pred_np[i])
+                    y_iv = self.inverse_transform_surface(y_np[i])
+                    rmse_list.append(np.sqrt(np.mean((pred_iv - y_iv) ** 2)))
 
-                    pred_iv = self.inverse_transform_surface(pred_surf)
-                    y_iv    = self.inverse_transform_surface(y_surf)
-
-                    rmse_list.append(np.sqrt(np.mean((pred_iv - y_iv)**2)))
-
-                rmse_iv = float(np.mean(rmse_list))
-                total_iv += rmse_iv * batch
-
+                total_iv += float(np.mean(rmse_list)) * batch
 
         return (
-            float(np.sqrt(total_scaled / n)),   # scaled RMSE
-            float(total_iv / n)                 # IV-RMSE
+            float(np.sqrt(total_scaled / n)),  # scaled RMSE
+            float(total_iv / n),  # IV-RMSE
         )
 
-
     def validate(self, val_loader):
-        self.eval(); total = 0.0
+        self.eval()
+        total = 0.0
         with torch.no_grad():
             for x, y in val_loader:
                 x, y = x.to(self.device), y.to(self.device)
                 total += self.criterion(self.forward(x), y).item() * len(y)
-        return total / len(val_loader.dataset)   
+        return total / len(val_loader.dataset)
 
-    # --------------------------------------------------------###########################################################
-    #   Fully Torch-Based predict_surface() for MLP models
-    #   Drop-in replacement: autograd-friendly, numpy-free
-    ###########################################################
-
-
-    def predict_surface(self, params, grid=None):
+    def _interpolate_market_to_model(self, market_surface, Ks_market, Ts_market):
         """
-        Fully torch-based surface prediction for MLP models.
-        Autograd-safe and GPU-accelerated.
+        Bilinear interpolation: market IVs -> model-grid IVs.
+        Everything stays in torch (differentiable but no gradients needed here).
         """
-
         device = self.device
 
-        # -------------------------------------------
-        # 1) Convert parameters to Torch
-        # -------------------------------------------
-        eta = torch.as_tensor(params["eta"], dtype=torch.float32, device=device)
-        rho = torch.as_tensor(params["rho"], dtype=torch.float32, device=device)
-        H   = torch.as_tensor(params["H"],  dtype=torch.float32, device=device)
-        xi0 = torch.as_tensor(params["xi0_knots"], dtype=torch.float32, device=device).flatten()
+        # model grid (log-space)
+        base_Ts = torch.exp(
+            torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
+        )
+        base_Ks = torch.exp(
+            torch.as_tensor(self.strikes, dtype=torch.float32, device=device)
+        )
 
-        x_vec = torch.cat([eta.unsqueeze(0), rho.unsqueeze(0), H.unsqueeze(0), xi0], dim=0)
+        # market grid
+        mTs = torch.exp(torch.as_tensor(Ts_market, dtype=torch.float32, device=device))
+        mKs = torch.exp(torch.as_tensor(Ks_market, dtype=torch.float32, device=device))
+        mIV = torch.as_tensor(market_surface, dtype=torch.float32, device=device)
 
-        # -------------------------------------------
-        # 2) Scale parameters
-        # -------------------------------------------
-        lb = torch.tensor(self.param_bounds[0], dtype=torch.float32, device=device)
-        ub = torch.tensor(self.param_bounds[1], dtype=torch.float32, device=device)
+        T_min, T_max = mTs.min(), mTs.max()
+        K_min, K_max = mKs.min(), mKs.max()
 
-        x_scaled = 2.0 * (x_vec - lb) / (ub - lb) - 1.0
-
-        # -------------------------------------------
-        # 3) Forward MLP → scaled IVs
-        # -------------------------------------------
-        pred_scaled = self.forward(x_scaled.unsqueeze(0)).squeeze(0)
-
-        # 4) Inverse output scaling – VOLLVEKTOR, nicht nur [0]
-        nT, nK = self.output_shape
-        nPts = nT * nK
-
-        # pred_scaled: shape (nPts,)
-        pred_flat = pred_scaled.view(-1)
-
-        mean = torch.as_tensor(self.output_scaler.mean_,  dtype=torch.float32, device=device)   # (nPts,)
-        std  = torch.as_tensor(self.output_scaler.scale_, dtype=torch.float32, device=device)   # (nPts,)
-
-        pred_iv_flat = pred_flat * std + mean              # (nPts,)
-        base_surface = pred_iv_flat.view(nT, nK)           # (nT, nK)
-
-
-        # ---- If no interpolation requested → return base surface
-        if grid is None:
-            return base_surface
-
-        # -------------------------------------------
-        # 6) PyTorch interpolation using grid_sample
-        # -------------------------------------------
-        base_Ts = torch.tensor(self.maturities, dtype=torch.float32, device=device)
-        base_Ks = torch.tensor(self.strikes, dtype=torch.float32, device=device)
-
-        target_Ts = torch.tensor(grid["maturities"], dtype=torch.float32, device=device)
-        target_Ks = torch.tensor(grid["strikes"], dtype=torch.float32, device=device)
-
-        # --- Normalize base grid to [-1, 1]
-        T_min, T_max = base_Ts.min(), base_Ts.max()
-        K_min, K_max = base_Ks.min(), base_Ks.max()
-
-        TT, KK = torch.meshgrid(target_Ts, target_Ks, indexing="ij")
-
+        TT, KK = torch.meshgrid(base_Ts, base_Ks, indexing="ij")
         TTn = 2 * (TT - T_min) / (T_max - T_min) - 1
         KKn = 2 * (KK - K_min) / (K_max - K_min) - 1
 
-        # grid_sample wants: (N, H, W, 2) with last dim = (x, y)
         grid_torch = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)
+        img = mIV.unsqueeze(0).unsqueeze(0)
 
-        # grid_sample input must be 4D: (N, C, H, W)
-        img = base_surface.unsqueeze(0).unsqueeze(0)
-
-        surface_interp = F.grid_sample(
+        interp = torch.nn.functional.grid_sample(
             img,
             grid_torch,
             mode="bilinear",
             padding_mode="reflection",
-            align_corners=True
+            align_corners=True,
+        ).squeeze(0).squeeze(0)
+
+        return interp.detach().cpu().numpy()   # calibration needs NumPy
+
+    # ------------------------------------------------------------------
+    # predict_surface with interpolation modes
+    # ------------------------------------------------------------------
+    def predict_surface(self, params, grid=None):
+        """
+        Predict surface on model-grid, or interpolate model→market.
+
+        Parameters
+        ----------
+        params : dict
+            {"eta", "rho", "H", "xi0_knots"}; values can be floats or torch.Tensors.
+        grid : dict or None
+            For interpolation (model_to_market):
+                {"strikes": logK, "maturities": logT}
+        mode : str or None
+            "base" or "model_to_market".
+            If None, falls back to self.interp_mode (e.g. "model_to_market" or "base").
+        """
+
+
+        device = self.device
+
+        # ---------- helper: keep tensors as tensors (important for autograd) ----------
+        def _to_param_tensor(v):
+            if isinstance(v, torch.Tensor):
+                # keep graph, just move/cast
+                return v.to(device=device, dtype=torch.float32)
+            else:
+                return torch.as_tensor(v, dtype=torch.float32, device=device)
+
+        # ---------------------------------------------------------
+        # PARAM → MLP → base model-grid
+        # ---------------------------------------------------------
+        eta = _to_param_tensor(params["eta"])
+        rho = _to_param_tensor(params["rho"])
+        H   = _to_param_tensor(params["H"])
+
+        xi_raw = params["xi0_knots"]
+        if isinstance(xi_raw, torch.Tensor):
+            xi0 = xi_raw.to(device=device, dtype=torch.float32).flatten()
+        else:
+            xi0 = torch.as_tensor(xi_raw, dtype=torch.float32, device=device).flatten()
+
+        x_vec = torch.cat([eta.unsqueeze(0), rho.unsqueeze(0), H.unsqueeze(0), xi0], dim=0)
+
+        lb = torch.as_tensor(self.param_bounds[0], dtype=torch.float32, device=device)
+        ub = torch.as_tensor(self.param_bounds[1], dtype=torch.float32, device=device)
+
+        x_scaled = 2.0 * (x_vec - lb) / (ub - lb) - 1.0
+        pred_scaled = self.forward(x_scaled.unsqueeze(0)).squeeze(0)  # (nT, nK) im scaled space
+
+        # inverse output scaling
+        pred_flat = pred_scaled.view(-1)
+        mean = torch.as_tensor(self.output_scaler.mean_,  dtype=torch.float32, device=device)
+        std  = torch.as_tensor(self.output_scaler.scale_, dtype=torch.float32, device=device)
+
+        base_surface = (pred_flat * std + mean).view(*self.output_shape)  # (nT, nK), physische IVs
+
+        # --------- MODE "base": direkt Modellgrid zurückgeben ---------
+        if grid is None:
+            return base_surface
+
+        base_Ts = torch.exp(
+            torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
         )
-        return surface_interp.squeeze(0).squeeze(0)
+        base_Ks = torch.exp(
+            torch.as_tensor(self.strikes, dtype=torch.float32, device=device)
+        )
+
+        # target grid (log-space arrays)
+        tgt_Ts = torch.exp(
+            torch.as_tensor(grid["maturities"], dtype=torch.float32, device=device)
+        )
+        tgt_Ks = torch.exp(
+            torch.as_tensor(grid["strikes"], dtype=torch.float32, device=device)
+        )
+
+        T_min, T_max = base_Ts.min(), base_Ts.max()
+        K_min, K_max = base_Ks.min(), base_Ks.max()
+
+        TT, KK = torch.meshgrid(tgt_Ts, tgt_Ks, indexing="ij")
+        TTn = 2.0 * (TT - T_min) / (T_max - T_min) - 1.0
+        KKn = 2.0 * (KK - K_min) / (K_max - K_min) - 1.0
+
+        grid_torch = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)    # (1, H, W, 2)
+        img = base_surface.unsqueeze(0).unsqueeze(0)                  # (1, 1, H0, W0)
+
+        interp = torch.nn.functional.grid_sample(
+            img,
+            grid_torch,
+            mode="bilinear",
+            padding_mode="reflection",
+            align_corners=True,
+        )
+        return interp.squeeze(0).squeeze(0)  # (H, W) = target grid
+
+
+
+
+
+
 
 
 
