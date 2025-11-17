@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 import matplotlib.pyplot as plt
 from numpy.random import SeedSequence, default_rng
+import pandas as pd
 
 plt.rcParams.update({
     "font.size": 10,
@@ -181,32 +182,227 @@ def sample_param_sets_lhs(num_sets: int, rng: np.random.RandomState) -> List[RBe
 
 
 
-def jitter_grid(x, grid_jitter=0.5, min_spacing=0.02, rng=None):
+from scipy.stats import qmc
+import numpy as np
+
+def lhs_grid(start, end, n, rng, min_spacing=0.02):
     """
-    Apply small random jitter to grid points while preserving spacing.
-    Deterministic if rng is provided.
+    Generate a sorted 1D grid in [start, end] with:
+    - first point fixed at start
+    - last point fixed at end
+    - (n-2) internal points sampled via LHS
+    - minimal spacing between adjacent points enforced
+
+    Works in log-space (recommended) and is monotone + deterministic.
     """
-    rng = rng or default_rng()
-    x = np.array(x, dtype=float, copy=True)
-    n = len(x)
+    start = float(start)
+    end = float(end)
+
     if n < 2:
-        return x
+        return np.array([start], dtype=float)
+    if n == 2:
+        return np.array([start, end], dtype=float)
 
-    step = np.median(np.diff(x))
-    jitter = rng.normal(0.0, grid_jitter * step, size=n)
-    y = np.clip(x + jitter, x.min(), x.max())
-    y.sort()
+    # ---- 1) LHS internal points ----
+    sampler = qmc.LatinHypercube(d=1, seed=rng.integers(1_000_000))
+    internal = sampler.random(n - 2).flatten()   # uniform in [0,1]
+    internal = start + internal * (end - start)
+    internal.sort()
 
-    # enforce minimal spacing
-    for i in range(1, n):
-        if y[i] - y[i - 1] < min_spacing:
-            y[i] = y[i - 1] + min_spacing
-    return y
+    # ---- 2) Combine with anchors ----
+    grid = np.concatenate(([start], internal, [end]))
+
+    # ---- 3) Enforce minimal spacing ----
+    if min_spacing > 0:
+        for i in range(1, n):
+            if grid[i] - grid[i - 1] < min_spacing:
+                grid[i] = grid[i - 1] + min_spacing
+
+        # Ensure we do not push beyond the end anchor
+        if grid[-1] > end:
+            grid[-1] = end*0.95
+        # Re-sort to maintain monotonicity
+        grid.sort()
+
+    return grid
+
+
+def preprocess_and_filter_otm(df):
+    # --- Datum parsen
+    df["date"] = pd.to_datetime(df["date"])
+    df["expiration"] = pd.to_datetime(df["expiration"])
+
+    # --- Maturity in Jahren
+    df["maturity"] = (df["expiration"] - df["date"]).dt.days / 365.0
+
+    # --- Spot, der für die IV verwendet wurde
+    df["S0"] = df["stock price for iv"].astype(float)
+
+    # --- Strike als float
+    df["strike"] = df["strike"].astype(float)
+
+    # --- IV als float
+    df["iv"] = df["iv"].astype(float)
+
+    # --------------------------------------------------
+    # --- OTM FILTER
+    # --------------------------------------------------
+    # OTM Call: strike > S0  AND call/put == "C"
+    otm_calls = (df["call/put"] == "C") & (df["strike"] > df["S0"])
+
+    # OTM Put: strike < S0  AND call/put == "P"
+    otm_puts = (df["call/put"] == "P") & (df["strike"] < df["S0"])
+
+    df = df[otm_calls | otm_puts].copy()
+
+    # --------------------------------------------------
+    # --- Log-Moneyness
+    # --------------------------------------------------
+    df["log_moneyness"] = np.log(df["strike"] / df["S0"])
+    df["log_maturity"] = np.log(df["maturity"] )
+    # --------------------------------------------------
+    # --- Ungültige Werte entfernen
+    # --------------------------------------------------
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["iv", "maturity", "log_moneyness"])
+    df = df[(df["volume"]>100) & (df["maturity"]>25/365) & (df["maturity"]<2)&(df["log_moneyness"]>-0.4)&(df["log_moneyness"]<0.4)]
+    # --------------------------------------------------
+    # --- Output
+    # --------------------------------------------------
+    return df[["symbol","exchange","date","expiration","iv", "maturity","log_maturity", "log_moneyness", "volume", "strike", "S0"]]
+
+
+def build_market_surfaces(df):
+    """
+    Create one IV surface per (symbol, expiration) pair.
+
+    Each output element has:
+    {
+        "symbol": str,
+        "expiration": pd.Timestamp,
+        "grid": {
+            "strikes": np.array(... log-moneyness ...)
+            "maturities": np.array(... log-maturities ...)
+        },
+        "iv_surface": 2D array (nT x nK),
+        "volume": 2D array (nT x nK),
+        "weights": 2D array (nT x nK)
+    }
+    """
+
+    output = []
+
+    # -----------------------------------------
+    # GROUP DATA BY (symbol, expiration)
+    # -----------------------------------------
+    grouped = df.groupby(["symbol", "date"])
+
+    for (symbol, date), g in grouped:
+
+        # sort maturities + log-moneyness
+        maturities = np.sort(g["maturity"].unique())
+        strikes = np.sort(g["log_moneyness"].unique())
+
+        nT = len(maturities)
+        nK = len(strikes)
+
+        iv_surface = np.full((nT, nK), np.nan, dtype=np.float32)
+        vol_surface = np.full((nT, nK), np.nan, dtype=np.float32)
+
+        # fill surface
+        for i, T in enumerate(maturities):
+            sub = g[g["maturity"] == T]
+            for _, row in sub.iterrows():
+                K = row["log_moneyness"]
+                iv = row["iv"]
+                vol = row["volume"]
+                j = np.searchsorted(strikes, K)
+                if 0 <= j < nK:
+                    iv_surface[i, j] = iv
+                    vol_surface[i, j] = vol
+
+        # log-domain grid (consistent with synthetic data)
+        log_maturities = np.log(maturities).astype(np.float32)
+        log_strikes = strikes.astype(np.float32)
+
+        # volume weights (NaNs preserved!)
+        weights = np.sqrt(vol_surface).astype(np.float32)
+
+        output.append({
+            "symbol": symbol,
+            "date": date,
+            "grid": {
+                "strikes": log_strikes,
+                "maturities": log_maturities
+            },
+            "iv_surface": iv_surface,
+            "volume": vol_surface,
+            "weights": weights
+        })
+
+    return output
+
+
 
 
 # --------------------------------------------------------------------------------------------------------
 # Plotting utilities
 # --------------------------------------------------------------------------------------------------------
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Tuple
+
+def plot_iv_surface_scatter(
+    iv_surface: np.ndarray,
+    strikes: np.ndarray,
+    maturities: np.ndarray,
+    cmap: str = "plasma",
+    figsize: Tuple[int, int] = (10, 6),
+    title: str = "IV Surface (Scatter Only)",
+    log_maturity: bool = True,
+):
+    """
+    Scatter-Plot einer IV-Surface.
+
+    Erwartete Konvention:
+    - iv_surface.shape == (len(maturities), len(strikes))
+    - Erste Zeile: kürzeste Maturity
+    - Spalten: von kleinem Strike (log-moneyness) zu großem
+    """
+    iv_surface = np.asarray(iv_surface, float)
+    strikes = np.asarray(strikes, float)
+    maturities = np.asarray(maturities, float)
+
+    assert iv_surface.shape == (len(maturities), len(strikes)), (
+        f"Shape mismatch: iv_surface {iv_surface.shape} vs "
+        f"(nT={len(maturities)}, nK={len(strikes)})"
+    )
+
+    # Grid der Punkte bauen (gleiche Indizierung wie iv_surface!)
+    Kgrid, Tgrid = np.meshgrid(strikes, maturities, indexing="xy")
+
+    # Nur valide Punkte plotten (keine NaNs)
+    mask = np.isfinite(iv_surface)
+    K_plot = Kgrid[mask]
+    T_plot = Tgrid[mask]
+    Z_plot = iv_surface[mask]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    sc = ax.scatter(K_plot, T_plot, c=Z_plot, cmap=cmap, s=35)
+
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("Implied Volatility")
+
+    ax.set_xlabel("Strike (log-moneyness)")
+    ax.set_ylabel("Maturity (Years)")
+    ax.set_title(title)
+
+    if log_maturity:
+        ax.set_yscale("log")
+
+    plt.tight_layout()
+    plt.show()
+
+
 
 def plot_iv_surface(
     iv_surface: np.ndarray,

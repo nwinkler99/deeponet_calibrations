@@ -25,7 +25,7 @@ from .utils import (
     bs_call_vec_pathwise,
     bs_put_vec_pathwise,
     sample_param_sets_lhs,
-    jitter_grid,
+    lhs_grid,
 )
 
 
@@ -58,9 +58,10 @@ class SimulationConfig:
     def __post_init__(self):
         # Default strikes = log-moneyness values
         if self.strikes is None:
-            self.logstrikes = np.array(
-                [-0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4],
-                dtype=self.dtype
+            self.logstrikes = np.linspace(
+                -0.4,
+                0.4,
+                15
             )
             self.strikes = np.exp(self.logstrikes)*self.S0
 
@@ -69,7 +70,7 @@ class SimulationConfig:
             self.logmaturities = np.linspace(
                 np.log(self.T_min),
                 np.log(self.T_max),
-                9
+                15
             )
             self.maturities = np.exp(self.logmaturities)
 
@@ -92,8 +93,7 @@ def generate_surfaces(
     forward_curves_per_set: int = 1,
     cfg=None,
     seed: int = 42,
-    randomize_grid: bool = False,
-    grid_jitter: float = 0.5,
+    randomize_grid: bool = False
 ) -> List[Dict]:
     """
     Deterministic generation of implied-volatility surfaces from rBergomi model.
@@ -145,13 +145,13 @@ def generate_surfaces(
             # --------------------------------------------------------------
 
             # 1) jedes zweite log-T nehmen
-            log_forward_points = cfg.logmaturities[::2].copy()
+            log_forward_points = cfg.logmaturities[::3].copy()
 
             # 2) sicherstellen, dass T_max (als log(T_max)) enthalten ist
             log_T_max = np.log(cfg.T_max)
 
             if not np.isclose(log_forward_points[-1], log_T_max):
-                log_forward_points = np.concatenate([log_forward_points, [log_T_max]])
+                log_forward_points[-1] = log_T_max
 
             # 3) Aufräumen: sortieren & Duplikate entfernen
             log_forward_points = np.unique(np.sort(log_forward_points))
@@ -192,30 +192,17 @@ def generate_surfaces(
                 maturities_base     = cfg.maturities.astype(cfg.dtype)
                 logmaturities_base  = cfg.logmaturities.astype(cfg.dtype)
 
-                # --- Relative jitter scaling (log-space ranges) ---
-                L_strikes    = float(logstrikes_base.max()     - logstrikes_base.min())
-                L_maturities = float(logmaturities_base.max()  - logmaturities_base.min())
-
-                jitter_scale      = 0.25   # 5% of total log-range
-                spacing_scale     = 0.05   # 2% minimal spacing
-
-                grid_jitter_strikes = jitter_scale * L_strikes
-                min_spacing_strikes = spacing_scale * L_strikes
-
-                grid_jitter_mats    = jitter_scale * L_maturities
-                min_spacing_mats    = spacing_scale * L_maturities
-
                 # ----------------------------------------------------------
                 # Apply jitter (log-space) or use base grid
                 # ----------------------------------------------------------
                 if randomize_grid and g_id > 0:
                     # --- log-strikes jitter ---
                     logstrikes_shifted = np.array(
-                        jitter_grid(
-                            logstrikes_base,
-                            grid_jitter   = grid_jitter_strikes,
-                            min_spacing   = min_spacing_strikes,
-                            rng           = rng_jit,
+                        lhs_grid(
+                            start=logstrikes_base.min(),
+                            end=logstrikes_base.max(),
+                            n=len(logstrikes_base),
+                            rng=rng_jit
                         ),
                         dtype=cfg.dtype,
                     )
@@ -223,11 +210,11 @@ def generate_surfaces(
 
                     # --- log-maturities jitter ---
                     logmaturities_shifted = np.array(
-                        jitter_grid(
-                            logmaturities_base,
-                            grid_jitter   = grid_jitter_mats,
-                            min_spacing   = min_spacing_mats,
-                            rng           = rng_jit,
+                        lhs_grid(
+                             start=logmaturities_base.min(),
+                            end=logmaturities_base.max(),    
+                            n=len(logmaturities_base),                 
+                            rng=rng_jit
                         ),
                         dtype=cfg.dtype,
                     )

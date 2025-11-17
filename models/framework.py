@@ -51,22 +51,161 @@ class BaseModel(nn.Module):
         super().__init__()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Stored context (set during data prep / init)
-        self.strikes = None          # np.ndarray (nK,)
-        self.maturities = None       # np.ndarray (nT,)
-        self.input_dim = None        # int for param vector (MLP) / branch dim (DeepONet)
-        self.output_shape = None     # (nT, nK) for MLP (helps reshape/check)
+        # -------------------------
+        # Shared contextual info
+        # -------------------------
+        self.strikes = None
+        self.maturities = None
+        self.input_dim = None
+        self.output_shape = None
 
-        # Scaling state
-        self.param_bounds = None     # (lb, ub) arrays for param vector scaling to [-1, 1]
-        self.output_scaler = None    # StandardScaler for IV outputs (fit on train only)
+        self.param_bounds = None      # (lb, ub)
+        self.output_scaler = None     # StandardScaler
 
-        # caches
+        # -------------------------
+        # Hyperparameter placeholders
+        # (covering MLP & DeepONet)
+        # -------------------------
+
+        # MLP
+        self.hidden_dims = None
+        self.activation = None
+        self.lr = None
+
+        # DeepONet
+        self.branch_in_dim = None
+        self.trunk_in_dim = None
+        self.latent_dim = None
+        self.branch_hidden_dims = None
+        self.trunk_hidden_dims = None
+        self.mask_type = None
+
+        # caches (not saved)
         self._last_pred = None
         self._last_true = None
         self._last_params = None
 
-    # -------------------- Shared helpers --------------------
+
+    # ============================================================
+    #   UNIVERSAL SAVE / LOAD FOR MLP + DEEPONET
+    # ============================================================
+
+    def save(self, path):
+        """
+        Save model architecture + weights + scaler + grid + bounds.
+        Automatically detects whether model is MLP or DeepONet.
+        """
+        import torch
+        from sklearn.preprocessing import StandardScaler
+        from models.framework import DeepONet, MLP
+
+        # --------------------------
+        # 1) Detect model type
+        # --------------------------
+        if isinstance(self, DeepONet):
+            init_kwargs = {
+                "branch_in_dim": self.branch_in_dim,
+                "trunk_in_dim": self.trunk_in_dim,
+                "latent_dim": self.latent_dim,
+                "branch_hidden_dims": self.branch_hidden_dims,
+                "trunk_hidden_dims": self.trunk_hidden_dims,
+                "activation": self.activation,
+                "lr": self.lr,
+                "mask_type": self.mask_type,
+            }
+            class_name = "DeepONet"
+
+        elif isinstance(self, MLP):
+            init_kwargs = {
+                "input_dim": self.input_dim,
+                "output_shape": self.output_shape,
+                "hidden_dims": self.hidden_dims,
+                "activation": self.activation,
+                "lr": self.lr,
+            }
+            class_name = "MLP"
+
+        else:
+            raise ValueError(f"Unsupported model type for saving: {self.__class__.__name__}")
+
+        # --------------------------
+        # 2) Build checkpoint dict
+        # --------------------------
+        payload = {
+            "class_name": class_name,
+            "state_dict": self.state_dict(),
+            "init_kwargs": init_kwargs,
+
+            # grid + normalisation
+            "strikes": self.strikes,
+            "maturities": self.maturities,
+            "param_bounds": self.param_bounds,
+
+            # scaler (if exists)
+            "scaler_mean": None if self.output_scaler is None else self.output_scaler.mean_,
+            "scaler_scale": None if self.output_scaler is None else self.output_scaler.scale_,
+        }
+
+        # --------------------------
+        # 3) SAVE
+        # --------------------------
+        torch.save(payload, path)
+        print(f"✅ Model saved to {path}")
+
+
+    @classmethod
+    def load(cls, path):
+        """
+        Auto-loads either DeepONet or MLP based on checkpoint metadata.
+        """
+        import torch
+        from sklearn.preprocessing import StandardScaler
+        from models.framework import DeepONet, MLP
+
+        # Important: allow full pickle loading (PyTorch 2.6!)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+
+        class_name = checkpoint["class_name"]
+        init_kwargs = checkpoint["init_kwargs"]
+
+        # --------------------------------------------------
+        # Instantiate correct class
+        # --------------------------------------------------
+        if class_name == "DeepONet":
+            model = DeepONet(**init_kwargs)
+        elif class_name == "MLP":
+            model = MLP(**init_kwargs)
+        else:
+            raise ValueError(f"Unknown class_name '{class_name}' in checkpoint")
+
+        # --------------------------------------------------
+        # Restore weights
+        # --------------------------------------------------
+        model.load_state_dict(checkpoint["state_dict"])
+
+        # --------------------------------------------------
+        # Restore grid + param bounds
+        # --------------------------------------------------
+        model.set_grid(checkpoint["strikes"], checkpoint["maturities"])
+
+        if checkpoint["param_bounds"] is not None:
+            lb, ub = checkpoint["param_bounds"]
+            model.set_param_bounds(lb, ub)
+
+        # --------------------------------------------------
+        # Restore scaler (if present)
+        # --------------------------------------------------
+        if checkpoint["scaler_mean"] is not None:
+            scaler = StandardScaler()
+            scaler.mean_  = checkpoint["scaler_mean"]
+            scaler.scale_ = checkpoint["scaler_scale"]
+            model.output_scaler = scaler
+
+        print(f"✅ Loaded {class_name} from {path}")
+        return model
+
+
+
 
     def set_grid(self, strikes, maturities):
         self.strikes = np.array(strikes, dtype=np.float32)
@@ -164,6 +303,46 @@ class BaseModel(nn.Module):
         nT, nK = Y2d.shape
         inv = self.inverse_transform_output_single(Y2d.reshape(-1))
         return inv.reshape(nT, nK)
+    
+    def _interpolate_market_to_model(self, market_surface, Ks_market, Ts_market):
+        """
+        Bilinear interpolation: market IVs -> model-grid IVs.
+        Everything stays in torch (differentiable but no gradients needed here).
+        """
+        device = self.device
+
+        # model grid (log-space)
+        base_Ts = torch.exp(
+            torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
+        )
+        base_Ks = torch.exp(
+            torch.as_tensor(self.strikes, dtype=torch.float32, device=device)
+        )
+
+        # market grid
+        mTs = torch.exp(torch.as_tensor(Ts_market, dtype=torch.float32, device=device))
+        mKs = torch.exp(torch.as_tensor(Ks_market, dtype=torch.float32, device=device))
+        mIV = torch.as_tensor(market_surface, dtype=torch.float32, device=device)
+
+        T_min, T_max = mTs.min(), mTs.max()
+        K_min, K_max = mKs.min(), mKs.max()
+
+        TT, KK = torch.meshgrid(base_Ts, base_Ks, indexing="ij")
+        TTn = 2 * (TT - T_min) / (T_max - T_min) - 1
+        KKn = 2 * (KK - K_min) / (K_max - K_min) - 1
+
+        grid_torch = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)
+        img = mIV.unsqueeze(0).unsqueeze(0)
+
+        interp = torch.nn.functional.grid_sample(
+            img,
+            grid_torch,
+            mode="bilinear",
+            padding_mode="reflection",
+            align_corners=True,
+        ).squeeze(0).squeeze(0)
+
+        return interp.detach().cpu().numpy()   # calibration needs NumPy
 
     # -------------------- Abstract API ----------------------
     # Each child model must implement:
@@ -484,9 +663,26 @@ class BaseModel(nn.Module):
     # ============================================================
 
 
-    def residuals_autograd(self, x_phys, true_surface, Ks, Ts):
+    def residuals_autograd(self, x_phys, true_surface, Ks, Ts, weights_full, mask_flat):
+        """
+        Computes masked & weighted residuals + Jacobian for LM.
+        Works with flat masks and flat weights.
+        """
         device = self.device
 
+        # --- flatten true surface & mask
+        true_flat = torch.as_tensor(true_surface, dtype=torch.float32, device=device).reshape(-1)
+        mask_flat_t = torch.as_tensor(mask_flat, dtype=torch.bool, device=device)
+        true_masked = true_flat[mask_flat_t]
+
+        # --- prepare weights
+        if weights_full is not None:
+            w_flat = torch.as_tensor(weights_full, dtype=torch.float32, device=device).reshape(-1)
+            weights_masked = w_flat[mask_flat_t]
+        else:
+            weights_masked = None
+
+        # --- parameter vector
         x = torch.tensor(x_phys, dtype=torch.float32, requires_grad=True, device=device)
 
         def f_single(x_vec):
@@ -496,27 +692,32 @@ class BaseModel(nn.Module):
                 "H":   x_vec[2],
                 "xi0_knots": x_vec[3:]
             }
+
+            # predict full surface (nT, nK)
             pred = self.predict_surface(params, {"strikes": Ks, "maturities": Ts})
-            true_t = torch.as_tensor(true_surface, dtype=torch.float32, device=device)
-            return (pred - true_t).reshape(-1)
+            pred_flat = pred.reshape(-1)
 
-        # jacrev returns Jacobian with efficient reuse of graph
+            res = pred_flat[mask_flat_t] - true_masked
+            if weights_masked is not None:
+                res = res * weights_masked
+            return res
+
+        # jacobian
         J_fn = jacrev(f_single)
-
-        J = J_fn(x)  # shape (N, n_params)
         res = f_single(x)
+        J = J_fn(x)
 
         return res.detach().cpu().numpy(), J.detach().cpu().numpy()
 
-    def calibrate(self, target_surface, optimiser="L-BFGS-B", bounds=None, maxiter=500, verbose=False):
-        """
-        Calibrate model parameters θ̂ to a given implied-volatility surface by minimizing RMSE.
 
-        Notes
-        -----
-        - Works purely in physical parameter and IV space.
-        - predict_surface() already returns physical implied volatilities.
-        - No scaling or normalization is done anywhere in this method.
+
+    def calibrate(self, target_surface, optimiser="lm", bounds=None, maxiter=500, verbose=False):
+        """
+        Calibrate model parameters θ̂ to a given implied-volatility surface by minimizing
+        a masked (optionally weighted) L2-error (RMSE up to normalization).
+
+        - Ignores NaNs in `iv_surface`.
+        - Supports optional `weights` on the same grid (e.g. sqrt(volume+1)).
         """
         import time
         import numpy as np
@@ -526,63 +727,129 @@ class BaseModel(nn.Module):
         lb, ub = self.param_bounds if bounds is None else np.array(list(zip(*bounds)))
         lb, ub = np.asarray(lb, dtype=np.float32), np.asarray(ub, dtype=np.float32)
 
-        true_surface = np.asarray(target_surface["iv_surface"], dtype=np.float32)
+        # --- Load grid + surface ---
+        true_surface = np.asarray(target_surface["iv_surface"], dtype=np.float32)  # (nT, nK)
         Ks = np.asarray(target_surface["grid"]["strikes"], dtype=np.float32)
         Ts = np.asarray(target_surface["grid"]["maturities"], dtype=np.float32)
+
         true_params = target_surface.get("params", None)
 
+        # --------------------------------------------------------------
+        # Mask for valid (finite) data points
+        # --------------------------------------------------------------
+        mask_np   = ~np.isnan(true_surface)          # (nT, nK) bool
+        mask_flat = mask_np.reshape(-1)              # (nT*nK,) bool
+
+        true_flat   = true_surface.reshape(-1)
+        true_masked = true_flat[mask_flat]          # (n_valid,)
+
+        # --------------------------------------------------------------
+        # Optional weights (must align with surface flattening)
+        # --------------------------------------------------------------
+        weights = target_surface.get("weights", None)
+        if weights is not None:
+            weights_full = np.asarray(weights, dtype=np.float32)      # (nT, nK)
+            weights_flat = weights_full.reshape(-1)                   # (nT*nK,)
+            weights_masked = weights_flat[mask_flat]                  # (n_valid,)
+        else:
+            weights_full = None
+            weights_masked = None
+
+        # --------------------------------------------------------------
+        # RMSE-like objective with masking + optional weighting
+        # --------------------------------------------------------------
         def rmse_objective(x_phys):
             params = {
                 "eta": x_phys[0],
                 "rho": x_phys[1],
-                "H": x_phys[2],
+                "H":   x_phys[2],
                 "xi0_knots": x_phys[3:]
             }
-            pred = self.predict_surface(params, grid={"strikes": Ks, "maturities": Ts})
-            pred = pred.detach().cpu().numpy()
 
-            # --- Dimension check ---
-            assert pred.shape == true_surface.shape, (
-                f"Shape mismatch: predicted surface {pred.shape} vs true surface {true_surface.shape}"
-            )
-            val = np.sqrt(np.sum((pred - true_surface)**2))
+            pred = self.predict_surface(params, grid={"strikes": Ks, "maturities": Ts})
+            pred = pred.detach().cpu().numpy()      # (nT, nK)
+
+            pred_flat = pred.reshape(-1)
+            diff = pred_flat[mask_flat] - true_masked  # (n_valid,)
+
+            #if weights_masked is not None:
+            #    diff = diff * weights_masked/np.sum(weights_masked)
+
+            val = np.sqrt(np.mean(diff**2))
             if not np.isfinite(val):
-                return 1e6  # penalize NaN region
+                return 1e6
             return val
 
+        # --------------------------------------------------------------
+        # Initial guess
+        # --------------------------------------------------------------
         x0 = 0.5 * (lb + ub)
         t0 = time.perf_counter()
 
+        # --------------------------------------------------------------
+        # Optimizer selection
+        # --------------------------------------------------------------
         opt_lower = optimiser.lower()
+
         if opt_lower == "differential evolution":
-            res = differential_evolution(rmse_objective, bounds=list(zip(lb, ub)), maxiter=maxiter, disp=verbose)
+            res = differential_evolution(
+                rmse_objective,
+                bounds=list(zip(lb, ub)),
+                maxiter=maxiter,
+                disp=verbose
+            )
+
         elif opt_lower in ["levenberg-marquardt", "lm"]:
-            
+            # least_squares expects residuals + Jacobian
             def fun_ls(x):
-                res_np, _ = self.residuals_autograd(x, true_surface, Ks, Ts)
-                return res_np
+                r_np, _ = self.residuals_autograd(
+                    x,
+                    true_surface,     # full 2D (nT, nK), masking inside residuals_autograd
+                    Ks,
+                    Ts,
+                    weights_full,
+                    mask_flat      # full 2D or None
+                )
+                return r_np
 
             def jac_ls(x):
-                _, J_np = self.residuals_autograd(x, true_surface, Ks, Ts)
+                _, J_np = self.residuals_autograd(
+                    x,
+                    true_surface,
+                    Ks,
+                    Ts,
+                    weights_full,
+                    mask_flat
+                )
                 return J_np
 
             res = least_squares(
                 fun_ls,
                 x0,
                 jac=jac_ls,
-                method="trf",                # LM braucht unconstrained, aber trf akzeptiert bounds.
+                method="trf",
                 bounds=(lb, ub),
                 max_nfev=maxiter,
                 verbose=2 if verbose else 0
             )
-        else:
-            res = minimize(rmse_objective, x0, method=optimiser, bounds=list(zip(lb, ub)),
-                        options={"maxiter": maxiter, "disp": verbose})
 
+        else:
+            res = minimize(
+                rmse_objective,
+                x0,
+                method=optimiser,
+                bounds=list(zip(lb, ub)),
+                options={"maxiter": maxiter, "disp": verbose}
+            )
+
+        # --------------------------------------------------------------
+        # Results
+        # --------------------------------------------------------------
         t1 = time.perf_counter()
         theta_hat = res.x
 
         param_names = ["eta", "rho", "H"] + [f"xi0_{i}" for i in range(len(theta_hat) - 3)]
+
         if true_params is not None:
             true_vec = np.concatenate([
                 [true_params["eta"], true_params["rho"], true_params["H"]],
@@ -596,17 +863,18 @@ class BaseModel(nn.Module):
         rmse = rmse_objective(theta_hat)
 
         return {
-            "theta_hat": theta_hat,
+            "theta_hat":      theta_hat,
             "error_rel_dict": rel_err_dict,
-            "rmse": float(rmse),
-            "runtime_ms": (t1 - t0) * 1000,
-            "optimizer": optimiser
+            "rmse":           float(rmse),
+            "runtime_ms":     (t1 - t0) * 1000,
+            "optimizer":      optimiser,
         }
 
-    def evaluate_calibrate(self, surfaces, optimiser="lm", maxiter=500,
-                        out_dir="calibration_eval", verbose=False):
 
-        os.makedirs(out_dir, exist_ok=True)
+
+    def evaluate_calibrate(self, surfaces, optimiser="lm", maxiter=500, verbose=False,interp_mode = "model_to_market"):
+
+        #os.makedirs(out_dir, exist_ok=True)
         print(f"\nEvaluating calibration using {optimiser} on {len(surfaces)} surfaces...")
 
         runtimes, rmses = [], []
@@ -614,7 +882,7 @@ class BaseModel(nn.Module):
         true_params_all, est_params_all = [], []
 
         # new: detect how MLP should be used
-        interp_mode = getattr(self, "interp_mode", "model_to_market")
+        
 
         for i, s in enumerate(surfaces, start=1):
 
@@ -1369,8 +1637,7 @@ class MLP(BaseModel):
         output_shape=None,
         hidden_dims=(256, 256, 256),
         activation="elu",
-        lr=1e-3,
-        interp_mode="base",
+        lr=1e-3
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -1381,7 +1648,6 @@ class MLP(BaseModel):
         self.hidden_dims = hidden_dims
         self.activation = activation
         self.lr = lr
-        self.interp_mode = interp_mode  # global default for predict_surface
 
         if (input_dim is not None) and (output_shape is not None):
             self._build_network()
@@ -1475,7 +1741,6 @@ class MLP(BaseModel):
         hidden_dims=(256, 256, 256),
         activation="gelu",
         lr=1e-3,
-        interp_mode="base",
     ):
         """
         Build an MLP model + loaders with internal, leakage-safe scaling:
@@ -1515,8 +1780,7 @@ class MLP(BaseModel):
             output_shape=output_shape,
             hidden_dims=hidden_dims,
             activation=activation,
-            lr=lr,
-            interp_mode=interp_mode,
+            lr=lr
         )
         model.set_grid(strikes, maturities)
         model.set_io_dims(input_dim=input_dim, output_shape=output_shape)
