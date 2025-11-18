@@ -695,11 +695,41 @@ def plot_param_error_ecdfs(
     # --------------------------
     for i, param in enumerate(all_param_names):
         ax = axes[i // ncols, i % ncols]
+# ---------- 1) Normale ECDFs + Cache ---------
+        curves = []      # list of (ys, xs_scaled) or None
         for data, label in zip(param_sets, labels):
             if param not in data:
+                curves.append(None)
                 continue
             xs, ys = ecdf_cut(data[param])
-            ax.plot(ys, xs * (100 if kind == "relative" else 1), label=label)
+            xs_scaled = xs * (100 if kind == "relative" else 1)
+            curves.append((ys, xs_scaled))
+            ax.plot(ys, xs_scaled, label=label)
+
+        # ---------- 2) ECDF-Differenzen auf gleicher Achse ---------
+        reference = curves[0]  # erstes Modell als baseline
+        if reference is not None:
+            ys_ref, xs_ref = reference
+
+            for (entry, label) in zip(curves, labels):
+                if entry is None or entry is reference:
+                    continue
+                ys_i, xs_i = entry
+
+                # Interp XS_i onto reference quantiles
+                xs_i_interp = np.interp(ys_ref, ys_i, xs_i)
+                diff = xs_i_interp - xs_ref
+
+                # Unterschiedskurve plotten (gleiche Achse!)
+                ax.plot(
+                    ys_ref,
+                    diff,
+                    linestyle="--",
+                    linewidth=1.0,
+                    alpha=0.8,
+                    label=f"{label} – {labels[0]}"
+                )
+
 
         ax.set_title(param, fontsize=14)
         ax.set_xlabel("Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else ""))
@@ -719,24 +749,54 @@ def plot_param_error_ecdfs(
     print(f"Saved {kind} error ECDF comparison to {path_params}")
 
     # --------------------------
-    # RMSE ECDF
+    # RMSE ECDF + DIFFERENCES
     # --------------------------
     fig, ax = plt.subplots(figsize=(5, 4))
+
+    # ----- 1) normale ECDFs + Cache -----
+    rmse_curves = []   # list of (ys, xs) or None
     for rmses, label in zip(rmses_sets, labels):
         if len(rmses) == 0:
+            rmse_curves.append(None)
             continue
+
         xs, ys = ecdf_cut(rmses)
-        ax.plot(ys, xs, label=label)
+        rmse_curves.append((ys, xs))
+        ax.plot(ys, xs, label=label)  # normal ECDF
+
+    # ----- 2) DIFFERENCES auf selber Achse -----
+    reference = rmse_curves[0]   # baseline ist erstes Modell
+    if reference is not None:
+        ys_ref, xs_ref = reference
+
+        for (entry, label) in zip(rmse_curves, labels):
+            if entry is None or entry is reference:
+                continue
+
+            ys_i, xs_i = entry
+            xs_i_interp = np.interp(ys_ref, ys_i, xs_i)
+            diff = xs_i_interp - xs_ref
+
+            # Diff-Curve in gleicher Achse
+            ax.plot(
+                ys_ref,
+                diff,
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.8,
+                label=f"{label} – {labels[0]}"
+            )
 
     ax.set_xlabel("Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else ""))
-    ax.set_ylabel("RMSE")
+    ax.set_ylabel("RMSE / Δ RMSE")
     ax.legend(frameon=True, loc="upper left")
 
-    _tight_suptitle(fig, "Calibration RMSE ECDFs")
+    _tight_suptitle(fig, "Calibration RMSE ECDFs (incl. Differences)")
     path_rmse = os.path.join(out_dir, "rmse_ecdf.png")
     plt.savefig(path_rmse, dpi=200)
     plt.close(fig)
     print(f"Saved RMSE ECDF comparison to {path_rmse}")
+
 
 
 

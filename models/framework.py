@@ -521,7 +521,7 @@ class BaseModel(nn.Module):
         # ------------------------------------------------------------
         # plotting infra
         # ------------------------------------------------------------
-        Ks_mesh, Ts_mesh = np.meshgrid(self.strikes, np.exp(self.maturities), indexing="xy")
+        Ks_mesh, Ts_mesh = np.meshgrid(self.strikes, self.maturities, indexing="xy")
 
         def plot_set(data_triplet, titles, fname, label):
             fig, axes = plt.subplots(1, 3, figsize=(15, 4))
@@ -1957,46 +1957,6 @@ class MLP(BaseModel):
                 total += self.criterion(self.forward(x), y).item() * len(y)
         return total / len(val_loader.dataset)
 
-    def _interpolate_market_to_model(self, market_surface, Ks_market, Ts_market):
-        """
-        Bilinear interpolation: market IVs -> model-grid IVs.
-        Everything stays in torch (differentiable but no gradients needed here).
-        """
-        device = self.device
-
-        # model grid (log-space)
-        base_Ts = torch.exp(
-            torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
-        )
-        base_Ks = torch.exp(
-            torch.as_tensor(self.strikes, dtype=torch.float32, device=device)
-        )
-
-        # market grid
-        mTs = torch.exp(torch.as_tensor(Ts_market, dtype=torch.float32, device=device))
-        mKs = torch.exp(torch.as_tensor(Ks_market, dtype=torch.float32, device=device))
-        mIV = torch.as_tensor(market_surface, dtype=torch.float32, device=device)
-
-        T_min, T_max = mTs.min(), mTs.max()
-        K_min, K_max = mKs.min(), mKs.max()
-
-        TT, KK = torch.meshgrid(base_Ts, base_Ks, indexing="ij")
-        TTn = 2 * (TT - T_min) / (T_max - T_min) - 1
-        KKn = 2 * (KK - K_min) / (K_max - K_min) - 1
-
-        grid_torch = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)
-        img = mIV.unsqueeze(0).unsqueeze(0)
-
-        interp = torch.nn.functional.grid_sample(
-            img,
-            grid_torch,
-            mode="bilinear",
-            padding_mode="reflection",
-            align_corners=True,
-        ).squeeze(0).squeeze(0)
-
-        return interp.detach().cpu().numpy()   # calibration needs NumPy
-
     # ------------------------------------------------------------------
     # predict_surface with interpolation modes
     # ------------------------------------------------------------------
@@ -2009,13 +1969,12 @@ class MLP(BaseModel):
         params : dict
             {"eta", "rho", "H", "xi0_knots"}; values can be floats or torch.Tensors.
         grid : dict or None
-            For interpolation (model_to_market):
-                {"strikes": logK, "maturities": logT}
-        mode : str or None
-            "base" or "model_to_market".
-            If None, falls back to self.interp_mode (e.g. "model_to_market" or "base").
+            If None:
+                return surface on the model's base grid (self.maturities, self.strikes)
+            If dict:
+                {"strikes": strikes, "maturities": maturities} in the SAME space
+                (e.g. physical or log) as self.strikes / self.maturities.
         """
-
 
         device = self.device
 
@@ -2046,7 +2005,7 @@ class MLP(BaseModel):
         ub = torch.as_tensor(self.param_bounds[1], dtype=torch.float32, device=device)
 
         x_scaled = 2.0 * (x_vec - lb) / (ub - lb) - 1.0
-        pred_scaled = self.forward(x_scaled.unsqueeze(0)).squeeze(0)  # (nT, nK) im scaled space
+        pred_scaled = self.forward(x_scaled.unsqueeze(0)).squeeze(0)  # (nT, nK) in scaled space
 
         # inverse output scaling
         pred_flat = pred_scaled.view(-1)
@@ -2059,20 +2018,15 @@ class MLP(BaseModel):
         if grid is None:
             return base_surface
 
-        base_Ts = torch.exp(
-            torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
-        )
-        base_Ks = torch.exp(
-            torch.as_tensor(self.strikes, dtype=torch.float32, device=device)
-        )
+        # ---------------------------------------------------------
+        # Interpolation model-grid → target grid
+        # ---------------------------------------------------------
+        # WICHTIG: kein zusätzliches exp mehr – gleiche "Koordinatenwelt" wie im Training
+        base_Ts = torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
+        base_Ks = torch.as_tensor(self.strikes, dtype=torch.float32, device=device)
 
-        # target grid (log-space arrays)
-        tgt_Ts = torch.exp(
-            torch.as_tensor(grid["maturities"], dtype=torch.float32, device=device)
-        )
-        tgt_Ks = torch.exp(
-            torch.as_tensor(grid["strikes"], dtype=torch.float32, device=device)
-        )
+        tgt_Ts = torch.as_tensor(grid["maturities"], dtype=torch.float32, device=device)
+        tgt_Ks = torch.as_tensor(grid["strikes"], dtype=torch.float32, device=device)
 
         T_min, T_max = base_Ts.min(), base_Ts.max()
         K_min, K_max = base_Ks.min(), base_Ks.max()
@@ -2081,6 +2035,7 @@ class MLP(BaseModel):
         TTn = 2.0 * (TT - T_min) / (T_max - T_min) - 1.0
         KKn = 2.0 * (KK - K_min) / (K_max - K_min) - 1.0
 
+        # grid_sample erwartet (N, H, W, 2) mit (x, y) = (K, T)
         grid_torch = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)    # (1, H, W, 2)
         img = base_surface.unsqueeze(0).unsqueeze(0)                  # (1, 1, H0, W0)
 
@@ -2092,6 +2047,7 @@ class MLP(BaseModel):
             align_corners=True,
         )
         return interp.squeeze(0).squeeze(0)  # (H, W) = target grid
+
 
 
 
