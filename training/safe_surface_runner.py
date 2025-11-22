@@ -14,6 +14,8 @@ import argparse
 
 parser = argparse.ArgumentParser(description="Parallel surface generation")
 
+parser.add_argument("--model", type=str, default="rbergomi",
+                    help="Choose between rbergomi or heston")
 parser.add_argument("--startbatch", type=int, default=0,
                     help="Index of first batch to start from")
 parser.add_argument("--numbatches", type=int, default=1000,
@@ -37,6 +39,7 @@ args = parser.parse_args()
 # CONFIGURATION
 # ==========================================
 randomize_grid = True #args.randomizegrid
+MODEL = args.model.lower()
 NUM_BATCHES = args.numbatches
 BATCH_SIZE = args.batchsize
 SLEEP_ON_ERROR = args.sleep
@@ -45,10 +48,7 @@ MAX_WORKERS = args.maxworkers
 CHUNK_SIZE = args.chunk or int(BATCH_SIZE // MAX_WORKERS)
 START_BATCH = args.startbatch
 
-if randomize_grid:             # number of parameter sets per batch
-    SAVE_ROOT = "data/log_longrun_2_0" # root directory for all runs
-else:
-    SAVE_ROOT = "data/new_fixed_longrun"  # root directory for all runs
+SAVE_ROOT = f"data/{MODEL}"
 os.makedirs(SAVE_ROOT, exist_ok=True)
 
 cfg = SimulationConfig(M=50000, n=int(2.1*252), T_max=2.1, S0=1.0, G=2, dtype=np.float32)
@@ -82,7 +82,9 @@ def save_checkpoint(batch_idx, data, randomized=randomize_grid):
 def worker_generate_surfaces(chunk_seeds,
                              forward_curves_per_set,
                              cfg,
-                             randomize_grid):
+                             randomize_grid,
+                             model
+                             ):
     """
     Top-level worker for multiprocessing.
     Each worker handles one chunk of seeds, processed in a single call to generate_surfaces().
@@ -97,7 +99,8 @@ def worker_generate_surfaces(chunk_seeds,
             forward_curves_per_set=forward_curves_per_set,
             cfg=cfg,
             seed=chunk_seed,
-            randomize_grid=randomize_grid
+            randomize_grid=randomize_grid,
+            model=model
         )
         return res
 
@@ -110,13 +113,16 @@ def worker_generate_surfaces(chunk_seeds,
 # PARALLEL WRAPPER
 # ==========================================
 
-def generate_surfaces_parallel(num_sets=1,
-                               forward_curves_per_set=1,
-                               cfg=None,
-                               seed=42,
-                               randomize_grid=randomize_grid,
-                               max_workers=None,
-                               chunk_size=None):
+def generate_surfaces_parallel(
+    num_sets=1,
+    forward_curves_per_set=1,
+    cfg=None,
+    seed=42,
+    randomize_grid=False,
+    max_workers=None,
+    chunk_size=None,
+    model="rbergomi",       # NEW
+):
     """
     Parallel wrapper around generate_surfaces().
 
@@ -151,7 +157,8 @@ def generate_surfaces_parallel(num_sets=1,
                 chunk,
                 forward_curves_per_set,
                 cfg,
-                randomize_grid
+                randomize_grid,
+                model
             )
             for chunk in chunks
         ]
@@ -179,7 +186,7 @@ if __name__ == "__main__":
     print(" Starting long-run data generation...\n")
 
     for batch_idx in range(START_BATCH, NUM_BATCHES):
-        print(f"\n--- Batch {batch_idx+1}/{NUM_BATCHES} | Mem={memory_usage_gb():.2f} GB ---")
+        print(f"\n--- Batch {batch_idx}/{NUM_BATCHES} | Mem={memory_usage_gb():.2f} GB ---")
 
         try:
             t0 = time.time()
@@ -193,14 +200,16 @@ if __name__ == "__main__":
                 randomize_grid=randomize_grid,
                 max_workers=MAX_WORKERS,
                 chunk_size=CHUNK_SIZE,
+                model=MODEL,               # NEW
             )
+
 
             save_checkpoint(batch_idx, surfaces)
             del surfaces
             gc.collect()
 
             t1 = time.time()
-            print(f" Batch {batch_idx+1} complete | Mem={memory_usage_gb():.2f} GB | "
+            print(f" Batch {batch_idx} complete | Mem={memory_usage_gb():.2f} GB | "
                   f"Time={(t1 - t0)/60:.1f} min")
 
         except Exception as e:

@@ -1204,13 +1204,15 @@ class DeepONet(BaseModel):
         """
         Convert list of surfaces into per-point tuples for DeepONet training.
 
-        Each element in `surfaces` is expected to have:
-            - surf["params"]: dict with eta, rho, H, xi0_knots
-            - surf["iv_surface"]: 2D array (nT, nK)
-            - surf["grid"]["strikes"], surf["grid"]["maturities"]
-
-        Unlike the earlier version, this version supports variable grids per surface.
+        Returns (old format):
+            X_branch  : (N, d)
+            X_trunk   : (N, 2)
+            Y         : (N,)      <-- NOT (N,1)
+            strikes   : 1D array
+            maturities: 1D array
         """
+        import numpy as np
+
         Xb_list, Xt_list, Y_list = [], [], []
         Ks_ref, Ts_ref = None, None
 
@@ -1220,36 +1222,45 @@ class DeepONet(BaseModel):
             Ks = np.asarray(surf["grid"]["strikes"], dtype=np.float32)
             Ts = np.asarray(surf["grid"]["maturities"], dtype=np.float32)
 
-            # Optional safety check if you want to enforce shared grid (for plotting consistency)
+            # enforce consistent grid
             if enforce_shared_grid:
                 if Ks_ref is None:
                     Ks_ref, Ts_ref = Ks, Ts
                 else:
                     if not (np.allclose(Ks_ref, Ks) and np.allclose(Ts_ref, Ts)):
-                        raise ValueError("All surfaces must share the same (K, T) grid when enforce_shared_grid=True")
+                        raise ValueError("All surfaces must share the same (K,T) grid")
 
-            xi0_knots = np.array(params["xi0_knots"], dtype=np.float32).flatten()
-            branch_vec = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots])
+            # --- AUTOMATIC PARAM VECTOR CREATION ---
+            branch_vec = []
+            for key, val in params.items():
+                if isinstance(val, (list, tuple, np.ndarray)):
+                    branch_vec.extend(list(val))
+                else:
+                    branch_vec.append(float(val))
+            branch_vec = np.asarray(branch_vec, dtype=np.float32)
 
-            # Build per-point training tuples
-            K_mesh, T_mesh = np.meshgrid(Ks, Ts)
-            trunk_coords = np.stack([K_mesh.ravel(), T_mesh.ravel()], axis=1).astype(np.float32)
-            branch_repeated = np.repeat(branch_vec[None, :], len(trunk_coords), axis=0)
-            Y_flat = iv_surface.ravel()[:, None].astype(np.float32)
+            # --- Trunk (K,T) coordinates ---
+            KK, TT = np.meshgrid(Ks, Ts, indexing="xy")
+            coords = np.stack([KK.reshape(-1), TT.reshape(-1)], axis=1).astype(np.float32)
 
-            Xb_list.append(branch_repeated)
-            Xt_list.append(trunk_coords)
+            # --- Repeat branch vector ---
+            Xb = np.repeat(branch_vec[None, :], len(coords), axis=0)
+            Y_flat = iv_surface.reshape(-1).astype(np.float32)   # (N,) not (N,1)
+
+            Xb_list.append(Xb)
+            Xt_list.append(coords)
             Y_list.append(Y_flat)
 
         X_branch = np.concatenate(Xb_list, axis=0)
-        X_trunk = np.concatenate(Xt_list, axis=0)
-        Y = np.concatenate(Y_list, axis=0)
+        X_trunk  = np.concatenate(Xt_list, axis=0)
+        Y        = np.concatenate(Y_list, axis=0)  # (N,)
 
-        # Only return the last surface's grid for convenience (used for plotting)
-        strikes = Ks_ref if Ks_ref is not None else Ks
+        # final grid
+        strikes   = Ks_ref if Ks_ref is not None else Ks
         maturities = Ts_ref if Ts_ref is not None else Ts
 
         return X_branch, X_trunk, Y, strikes, maturities
+
 
 
     @classmethod

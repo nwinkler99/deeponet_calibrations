@@ -159,23 +159,78 @@ class RBergomiParams:
     H: float
 
 
-def sample_param_sets_lhs( num_sets: int, rng: np.random.RandomState, lower = np.array([0.5, -1, 0.025]),upper = np.array([4.0, -0.1, 0.5])) -> List[RBergomiParams]:
-    """Sample (eta, rho, H) via Latin Hypercube, fully tied to rng."""
-    sampler_seed = rng.integers(0, 2**31 - 1)
-    sampler = qmc.LatinHypercube(d=3, seed=sampler_seed)
+def sample_param_sets_lhs(num_sets, rng, lower, upper):
+    assert lower.shape == upper.shape
+    d = len(lower)
+
+    sampler_seed = int(rng.integers(0, 2**31 - 1))
+    sampler = qmc.LatinHypercube(d=d, seed=sampler_seed)
+
     sample = sampler.random(num_sets)
     scaled = qmc.scale(sample, lower, upper)
+    return scaled
 
-    param_sets: List[RBergomiParams] = []
-    for i in range(num_sets):
-        param_sets.append(
-            RBergomiParams(
-                eta=float(scaled[i, 0]),
-                rho=float(scaled[i, 1]),
-                H=float(scaled[i, 2]),
-            )
-        )
-    return param_sets
+
+# ============================================================
+# HESTON PRICING (semi-close form, Gauss-Laguerre)
+# ============================================================
+
+# ----------------------------------------------------------
+# 1) Characteristic function (same as yours, but vectorized)
+# ----------------------------------------------------------
+def heston_cf(u, tau, kappa, theta, sigma, rho, v0, r=0.0):
+    alpha = kappa - rho * sigma * u * 1j
+    beta  = sigma**2
+    d = np.sqrt(alpha**2 + beta * (u**2 + 1j*u))
+    g = (alpha - d) / (alpha + d)
+
+    exp_dt = np.exp(-d * tau)
+    C = kappa * theta / (sigma**2) * ((alpha - d) * tau - 2 * np.log((1 - g * exp_dt) / (1 - g)))
+    D = (alpha - d) / (sigma**2) * ((1 - exp_dt) / (1 - g * exp_dt))
+
+    return np.exp(C + D * v0 + 1j * u * 0)  # forward measure: drift == 0
+
+def heston_call_price(S0, K, tau, params, r=0.0, n_laguerre=64):
+    """
+    Klassisches Heston-Pricing nach Fourier (P1/P2).
+    Nutzt DEINE heston_cf().
+    """
+    kappa, theta, v0, sigma, rho = params
+
+    # Laguerre-Knoten/Gewichte für ∫_0^∞
+    x, w = np.polynomial.laguerre.laggauss(n_laguerre)
+
+    logS0 = np.log(S0)
+    logK  = np.log(K)
+
+    # --- P1 Integrand ---
+    def integrand_P1(phi):
+        u = phi - 1j
+        term = heston_cf(u, tau, kappa, theta, sigma, rho, v0, r)
+        return np.real(np.exp(-1j * phi * logK) *
+                       np.exp(1j * phi * logS0) *
+                       term / (1j * phi))
+
+    # --- P2 Integrand ---
+    def integrand_P2(phi):
+        u = phi
+        term = heston_cf(u, tau, kappa, theta, sigma, rho, v0, r)
+        return np.real(np.exp(-1j * phi * logK) *
+                       np.exp(1j * phi * logS0) *
+                       term / (1j * phi))
+
+    # Fourier-Integrale via Gauss-Laguerre
+    P1 = 0.5 + (1 / np.pi) * np.sum(w * np.exp(x) * integrand_P1(x))
+    P2 = 0.5 + (1 / np.pi) * np.sum(w * np.exp(x) * integrand_P2(x))
+
+    # Klassischer Heston-Preis
+    call = S0 * P1 - K * np.exp(-r * tau) * P2
+
+    # numerische Safeguards
+    call = np.clip(call, 0.0, S0)
+    return call
+
+
 
 
 

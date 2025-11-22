@@ -62,6 +62,9 @@ class BaseModel(nn.Module):
         self.param_bounds = None      # (lb, ub)
         self.output_scaler = None     # StandardScaler
 
+        self.param_names = None      # list[str]
+        self.param_slices = None     # dict[str, slice|int]
+
         # -------------------------
         # Hyperparameter placeholders
         # (covering MLP & DeepONet)
@@ -84,7 +87,6 @@ class BaseModel(nn.Module):
         self._last_pred = None
         self._last_true = None
         self._last_params = None
-
 
     # ============================================================
     #   UNIVERSAL SAVE / LOAD FOR MLP + DEEPONET
@@ -141,6 +143,10 @@ class BaseModel(nn.Module):
             "maturities": self.maturities,
             "param_bounds": self.param_bounds,
 
+            # parameter layout
+            "param_names": self.param_names,
+            "param_slices": self.param_slices,
+            
             # scaler (if exists)
             "scaler_mean": None if self.output_scaler is None else self.output_scaler.mean_,
             "scaler_scale": None if self.output_scaler is None else self.output_scaler.scale_,
@@ -150,8 +156,7 @@ class BaseModel(nn.Module):
         # 3) SAVE
         # --------------------------
         torch.save(payload, path)
-        print(f"✅ Model saved to {path}")
-
+        print(f"Model saved to {path}")
 
     @classmethod
     def load(cls, path):
@@ -193,6 +198,15 @@ class BaseModel(nn.Module):
             model.set_param_bounds(lb, ub)
 
         # --------------------------------------------------
+        # Restore parameter layout (if present)
+        # --------------------------------------------------
+        param_names  = checkpoint.get("param_names", None)
+        param_slices = checkpoint.get("param_slices", None)
+        if param_names is not None and param_slices is not None:
+            model.set_param_structure(param_names, param_slices)
+
+
+        # --------------------------------------------------
         # Restore scaler (if present)
         # --------------------------------------------------
         if checkpoint["scaler_mean"] is not None:
@@ -201,8 +215,9 @@ class BaseModel(nn.Module):
             scaler.scale_ = checkpoint["scaler_scale"]
             model.output_scaler = scaler
 
-        print(f"✅ Loaded {class_name} from {path}")
+        print(f"Loaded {class_name} from {path}")
         return model
+
 
 
 
@@ -218,20 +233,135 @@ class BaseModel(nn.Module):
             assert len(output_shape) == 2, "output_shape must be (nT, nK)"
             self.output_shape = (int(output_shape[0]), int(output_shape[1]))
 
+
+    # -----------------------------------------------------------
+    # Parameter-Layout / Mapping (modellagnostisch)
+    # -----------------------------------------------------------
+    def set_param_structure(self, param_names, param_slices):
+        """
+        Speichert die vollständige Param-Layout-Struktur am Modell.
+        param_names : list[str] – geflattete Namen (für Plots etc.)
+        param_slices: dict[str, slice|int] – Mapping von originalen Keys zu Positionen.
+        """
+        self.param_names = list(param_names)
+        self.param_slices = dict(param_slices)
+
+    def _params_dict_to_vec_np(self, params_dict):
+        """
+        Mappe params_dict -> np.float32 Vektor gemäß self.param_names / self.param_slices.
+        Erwartet, dass self.param_slices alle Keys aus params_dict abdeckt, die wir benutzen.
+        """
+        import numpy as np
+        assert self.param_names is not None and self.param_slices is not None, \
+            "param_names / param_slices nicht gesetzt. Ruf infer_param_structure_from_surfaces + set_param_structure auf."
+
+        vec = np.zeros(len(self.param_names), dtype=np.float32)
+
+        for key, sl in self.param_slices.items():
+            if key not in params_dict:
+                raise KeyError(f"Missing parameter '{key}' in params dict.")
+            v = params_dict[key]
+            if isinstance(sl, slice):
+                vec[sl] = np.asarray(v, dtype=np.float32).ravel()
+            else:
+                vec[sl] = float(v)
+
+        return vec
+
+    def _params_dict_to_vec_tensor(self, params_dict, requires_grad=False):
+        """
+        Wie _params_dict_to_vec_np, aber als 1D torch.Tensor auf self.device.
+        """
+        import torch
+        assert self.param_names is not None and self.param_slices is not None, \
+            "param_names / param_slices nicht gesetzt. Ruf infer_param_structure_from_surfaces + set_param_structure auf."
+
+        device = self.device
+        vec = torch.zeros(len(self.param_names), dtype=torch.float32, device=device)
+
+        for key, sl in self.param_slices.items():
+            if key not in params_dict:
+                raise KeyError(f"Missing parameter '{key}' in params dict.")
+            v = params_dict[key]
+            if isinstance(v, torch.Tensor):
+                v_t = v.to(device=device, dtype=torch.float32)
+            else:
+                v_t = torch.tensor(v, dtype=torch.float32, device=device)
+
+            if isinstance(sl, slice):
+                vec[sl] = v_t.flatten()
+            else:
+                vec[sl] = v_t.flatten()[0]
+
+        if requires_grad:
+            vec.requires_grad_(True)
+        return vec
+
+    def params_dict_to_vec(self, p):
+        """Komfort-Wrapper auf _params_dict_to_vec_np."""
+        return self._params_dict_to_vec_np(p)
+
+    def params_vec_to_dict(self, vec):
+        """
+        Inverse Mapping: Vektor -> dict mit denselben Keys wie self.param_slices.
+        """
+        import numpy as np
+        assert self.param_slices is not None, "param_slices nicht gesetzt."
+        vec = np.asarray(vec, dtype=np.float32)
+        out = {}
+        for key, sl in self.param_slices.items():
+            if isinstance(sl, slice):
+                out[key] = vec[sl].tolist()
+            else:
+                out[key] = float(vec[sl])
+        return out
+
+    
+    @staticmethod
+    def infer_param_structure_from_surfaces(surfaces):
+        """
+        Detects full parameter structure from surfaces[0]["params"].
+        Produces:
+            param_names: list of flattened parameter names in order
+            param_slices: dict mapping key -> slice or index
+        Works with:
+        - any number of scalar params
+        - any number of vector params
+        - any shapes of vectors (flattened)
+        """
+        import numpy as np
+
+        first = surfaces[0]["params"]
+
+        param_names = []
+        param_slices = {}
+
+        pos = 0
+        for key, val in first.items():
+            # vector parameter (list/np array/tuple)
+            if isinstance(val, (list, tuple, np.ndarray)):
+                length = len(val)
+                param_slices[key] = slice(pos, pos + length)
+                for i in range(length):
+                    param_names.append(f"{key}_{i}")
+                pos += length
+
+            # scalar parameter
+            else:
+                param_slices[key] = pos
+                param_names.append(key)
+                pos += 1
+
+        return param_names, param_slices
+
+
+
+
+
     def compute_loss(self, y_pred, y_true):
         return nn.MSELoss()(y_pred, y_true)
 
     # -------------------- Param scaling: bounds → [-1, 1] --------------------
-    @staticmethod
-    def _make_param_bounds(num_knots, eta=(0.5, 4.0), rho=(0.0, 1.0), H=(0.025, 0.5), knot=(0.01, 0.16)):
-        """
-        Build (lb, ub) arrays for a parameter vector shaped as:
-          [eta, rho, H, xi0_knots...]
-        Using user-specified borders.
-        """
-        lb = [eta[0], rho[0], H[0]] + [knot[0]] * num_knots
-        ub = [eta[1], rho[1], H[1]] + [knot[1]] * num_knots
-        return np.asarray(lb, dtype=np.float32), np.asarray(ub, dtype=np.float32)
 
     @staticmethod
     def _scale_to_m1_p1(x, lb, ub):
@@ -405,15 +535,43 @@ class BaseModel(nn.Module):
 
         # --- Predicted Surface ---
         c1 = axs[1].contourf(K, T, pred_surface, levels=levels, cmap="plasma")
-        eta, rho, H = params["eta"], params["rho"], params["H"]
-        axs[1].set_title(f"Predicted Surface (η={eta:.2f}, ρ={rho:.2f}, H={H:.2f})")
-        axs[1].set_xlabel("Strike")
-        axs[1].set_ylabel("Maturity")
-        plt.colorbar(c1, ax=axs[1])
+
+        title = "Predicted Surface"
+
+        if isinstance(params, dict) and self.param_names is not None:
+            parts = []
+            for name in self.param_names:
+                if "_" in name:
+                    base, idx = name.rsplit("_", 1)
+                    idx = int(idx)
+                    if base in params:
+                        try:
+                            parts.append(f"{name}={float(params[base][idx]):.3g}")
+                        except Exception:
+                            pass
+                else:
+                    if name in params:
+                        try:
+                            parts.append(f"{name}={float(params[name]):.3g}")
+                        except Exception:
+                            pass
+
+            # Optional: nur ein paar Parameter anzeigen, sonst wird Titel zu lang
+            if len(parts) > 6:
+                parts = parts[:6] + ["..."]
+
+            title += " (" + ", ".join(parts) + ")"
 
         # --- Difference ---
-        c2 = axs[2].contourf(K, T, diff, levels=levels, cmap="coolwarm",
-                            vmin=-vmax, vmax=vmax)
+        c2 = axs[2].contourf(
+            K,
+            T,
+            diff,
+            levels=levels,
+            cmap="coolwarm",
+            vmin=-vmax,
+            vmax=vmax,
+        )
         axs[2].set_title(f"Difference (Pred - True)\nMAE={mae:.3e}, RMSE={rmse:.3e}")
         axs[2].set_xlabel("Strike")
         axs[2].set_ylabel("Maturity")
@@ -421,17 +579,16 @@ class BaseModel(nn.Module):
 
         print(f"MAE = {mae:.6f}, RMSE = {rmse:.6f}")
         return fig
-    
+
+        
     def evaluate(self, surface_samples, out_dir):
         """
-        Evaluates model-predicted vs. true IV surfaces by binning errors
-        according to the model's base grid (self.strikes, self.maturities).
-
-        Adds:
+        Model-agnostic evaluation:
         - RMSE per surface
-        - RMSE ECDF/Quantile plot (axes swapped)
-        - RMSE heatmaps (mean/median/max)
-        - RMSE vs parameter plots (eta, H, rho)
+        - Error heatmaps
+        - MC error heatmaps (if provided)
+        - RMSE ECDF
+        - RMSE vs parameter scatterplots (for ALL param_names)
         """
         assert self.strikes is not None and self.maturities is not None, \
             "Model grid (strikes/maturities) not set; call set_grid first."
@@ -439,44 +596,59 @@ class BaseModel(nn.Module):
 
         nT, nK = len(self.maturities), len(self.strikes)
 
+        # ---------------------------------------
+        # Parameter-Name-Liste (modell-agnostisch)
+        # ---------------------------------------
+        if self.param_names is not None:
+            param_names = list(self.param_names)
+        else:
+            # fallback, sollte aber nie vorkommen
+            param_names = [f"theta_{i}" for i in range(len(surface_samples[0]["params"]))]
+
+        # Speichere Parameterwerte je Name
+        param_values = {name: [] for name in param_names}
+
         # Bins
         bin_errs_rel = [[[] for _ in range(nK)] for _ in range(nT)]
         bin_errs_abs = [[[] for _ in range(nK)] for _ in range(nT)]
         bin_errs_mc  = [[[] for _ in range(nK)] for _ in range(nT)]
         bin_sqerr    = [[[] for _ in range(nK)] for _ in range(nT)]
 
-        # Store surface-level RMSE and parameters
         rmses = []
-        etas  = []
-        Hs    = []
-        rhos  = []
 
+        # ==========================================================
+        # Loop über alle Surfaces
+        # ==========================================================
         for s in surface_samples:
             params = s["params"]
-            etas.append(params["eta"])
-            Hs.append(params["H"])
-            rhos.append(params["rho"])
 
-            true_surface = np.array(s["iv_surface"], dtype=np.float32)
+            # parameter mapping (modellagnostisch)
+            true_vec = self._params_dict_to_vec_np(params)
+            for name, val in zip(param_names, true_vec):
+                param_values[name].append(float(val))
+
+            true_surface = np.asarray(s["iv_surface"], dtype=np.float32)
 
             grid = s.get("grid", {"strikes": self.strikes, "maturities": self.maturities})
             Ks = np.asarray(grid["strikes"], dtype=np.float32)
             Ts = np.asarray(grid["maturities"], dtype=np.float32)
 
+            # PRED
             pred_surface = self.predict_surface(params, grid=grid)
-
-            # 🔥 safe conversion (outside of optimization)
             pred_surface = pred_surface.detach().cpu().numpy()
 
+            # Errors
             rel_err = np.abs(true_surface - pred_surface) / np.clip(true_surface, 1e-6, None) * 100.0
             abs_err = np.abs(true_surface - pred_surface)
             sq_err  = (true_surface - pred_surface)**2
-            # RMSE for this surface
+
             rmses.append(float(np.sqrt(np.mean(sq_err))))
 
+            # MC-Pseudo-Error
             mc_rel_err = np.array(s.get("iv_rel_error", np.zeros_like(true_surface)), dtype=np.float32) * 100.0
             mc_rel_err = np.nan_to_num(mc_rel_err, nan=0.0)
 
+            # Mapping market-grid Punkte → Modell-grid Indizes
             for ti, T in enumerate(Ts):
                 t_idx = np.argmin(np.abs(self.maturities - T))
                 for ki, K in enumerate(Ks):
@@ -487,40 +659,47 @@ class BaseModel(nn.Module):
                     bin_errs_mc[t_idx][k_idx].append(mc_rel_err[ti, ki])
                     bin_sqerr[t_idx][k_idx].append(sq_err[ti, ki])
 
-        # ---- aggregation helper ----
+        rmses = np.array(rmses, dtype=np.float32)
+
+        # ===============================
+        # Aggregation helper
+        # ===============================
         def aggregate_bins(bin_errs):
             mean = np.full((nT, nK), np.nan, dtype=np.float32)
             median = np.full((nT, nK), np.nan, dtype=np.float32)
             maxv = np.full((nT, nK), np.nan, dtype=np.float32)
+
             for t in range(nT):
                 for k in range(nK):
                     vals = bin_errs[t][k]
                     if vals:
-                        mean[t, k]   = np.mean(vals)
-                        median[t, k] = np.median(vals)
-                        maxv[t, k]   = np.max(vals)
-            global_mean = np.nanmean(mean)
+                        vals = np.asarray(vals, dtype=np.float32)
+                        mean[t, k]   = float(np.mean(vals))
+                        median[t, k] = float(np.median(vals))
+                        maxv[t, k]   = float(np.max(vals))
+
+            # missing → global mean
+            global_mean = float(np.nanmean(mean))
             for arr in (mean, median, maxv):
                 arr[np.isnan(arr)] = global_mean
             return mean, median, maxv, global_mean
 
-        # Rel error
+        # REL
         mean_rel, median_rel, max_rel, global_mean_rel = aggregate_bins(bin_errs_rel)
-        # Abs error
+        # ABS
         mean_abs, median_abs, max_abs, global_mean_abs = aggregate_bins(bin_errs_abs)
-        # MC error
+        # MC
         mean_mc, median_mc, max_mc, global_mean_mc = aggregate_bins(bin_errs_mc)
-
         # RMSE
         mean_sqerr, median_sqerr, max_sqerr, _ = aggregate_bins(bin_sqerr)
-        mean_rmse  = np.sqrt(mean_sqerr)
+        mean_rmse = np.sqrt(mean_sqerr)
         median_rmse = np.sqrt(median_sqerr)
-        max_rmse    = np.sqrt(max_sqerr)
+        max_rmse = np.sqrt(max_sqerr)
         global_mean_rmse = float(np.nanmean(mean_rmse))
 
-        # ------------------------------------------------------------
-        # plotting infra
-        # ------------------------------------------------------------
+        # ===============================
+        # Plotting helpers
+        # ===============================
         Ks_mesh, Ts_mesh = np.meshgrid(self.strikes, self.maturities, indexing="xy")
 
         def plot_set(data_triplet, titles, fname, label):
@@ -536,7 +715,7 @@ class BaseModel(nn.Module):
             plt.savefig(os.path.join(out_dir, fname), dpi=200)
             plt.close(fig)
 
-        # Rel error
+        # rel / abs / mc / rmse heatmaps
         plot_set(
             [mean_rel, median_rel, max_rel],
             ["Mean Rel Error (Pred)", "Median Rel Error (Pred)", "Max Rel Error (Pred)"],
@@ -544,7 +723,6 @@ class BaseModel(nn.Module):
             "%"
         )
 
-        # Abs error
         plot_set(
             [mean_abs, median_abs, max_abs],
             ["Mean Abs Error (Pred)", "Median Abs Error (Pred)", "Max Abs Error (Pred)"],
@@ -552,7 +730,6 @@ class BaseModel(nn.Module):
             "abs(IV diff)"
         )
 
-        # MC error
         plot_set(
             [mean_mc, median_mc, max_mc],
             ["Mean Rel Error (MC)", "Median Rel Error (MC)", "Max Rel Error (MC)"],
@@ -560,7 +737,6 @@ class BaseModel(nn.Module):
             "%"
         )
 
-        # RMSE heatmaps
         plot_set(
             [mean_rmse, median_rmse, max_rmse],
             ["Mean RMSE", "Median RMSE", "Max RMSE"],
@@ -568,16 +744,13 @@ class BaseModel(nn.Module):
             "RMSE"
         )
 
-        # ------------------------------------------------------------
-        # RMSE ECDF WITH AXES SWAPPED
-        # ------------------------------------------------------------
+        # ===============================
+        # RMSE ECDF
+        # ===============================
         fig, ax = plt.subplots(figsize=(6, 5))
         sorted_r = np.sort(rmses)
         p = np.linspace(0, 1, len(sorted_r))
-
-        # y = RMSE, x = quantile
         ax.plot(p, sorted_r, lw=2)
-
         ax.set_xlabel("Quantile")
         ax.set_ylabel("RMSE")
         ax.set_title("RMSE ECDF")
@@ -586,33 +759,25 @@ class BaseModel(nn.Module):
         plt.savefig(os.path.join(out_dir, "iv_rmse_quantiles.png"), dpi=200)
         plt.close(fig)
 
-        # ------------------------------------------------------------
-        # RMSE VS PARAMETER SCATTERPLOTS
-        # ------------------------------------------------------------
+        # ===============================
+        # RMSE vs parameter (für alle!)
+        # ===============================
         def scatter(x, y, name_x, fname):
             fig, ax = plt.subplots(figsize=(6,5))
             ax.scatter(x, y, s=12, alpha=0.7)
 
-            # ---- MOVING AVERAGE LINE (robust version) ----
-            import numpy as np
-
+            # moving average
             x = np.asarray(x)
             y = np.asarray(y)
             idx = np.argsort(x)
-            xs = x[idx]
-            ys = y[idx]
+            xs, ys = x[idx], y[idx]
 
             window = 100
             if len(ys) > window:
-                # Compute moving average
                 kernel = np.ones(window) / window
                 ma = np.convolve(ys, kernel, mode="valid")
-
-                # Create xs for MA with exact matching length
                 pad = (len(xs) - len(ma)) // 2
-                xs_ma = xs[pad: pad + len(ma)]   # guaranteed to match ma exactly
-
-                # Plot line
+                xs_ma = xs[pad: pad + len(ma)]
                 ax.plot(xs_ma, ma, linewidth=2.5, color="red", label=f"MA({window})")
 
             ax.set_xlabel(name_x)
@@ -625,20 +790,21 @@ class BaseModel(nn.Module):
             plt.savefig(os.path.join(out_dir, fname), dpi=200)
             plt.close(fig)
 
+        # Für alle param_names plotten
+        for name in param_names:
+            scatter(param_values[name], rmses, name, f"rmse_vs_{name}.png")
 
-        scatter(etas, rmses, "eta", "rmse_vs_eta.png")
-        scatter(Hs,   rmses, "H",   "rmse_vs_H.png")
-        scatter(rhos, rmses, "rho", "rmse_vs_rho.png")
-
-        # ------------------------------------------------------------
-        # worst surfaces
-        # ------------------------------------------------------------
+        # ===============================
+        # Worst 10 Surfaces
+        # ===============================
         worst_idx = np.argsort(rmses)[-10:][::-1]
-
         print("\nWorst 10 surfaces by RMSE:")
         for rank, idx in enumerate(worst_idx, 1):
             print(f"{rank:2d}. index={idx}, RMSE={rmses[idx]:.6f}")
 
+        # ===============================
+        # Rückgabe
+        # ===============================
         return {
             "pred_rel": {"mean": mean_rel, "median": median_rel, "max": max_rel},
             "pred_abs": {"mean": mean_abs, "median": median_abs, "max": max_abs},
@@ -646,7 +812,7 @@ class BaseModel(nn.Module):
             "rmse":    {"mean": mean_rmse, "median": median_rmse, "max": max_rmse},
             "rmses": rmses,
             "worst_indices": worst_idx.tolist(),
-            "parameters": {"eta": etas, "H": Hs, "rho": rhos},
+            "parameters": param_values,
             "global_mean": {
                 "pred_rel": float(global_mean_rel),
                 "pred_abs": float(global_mean_abs),
@@ -658,56 +824,72 @@ class BaseModel(nn.Module):
 
 
 
+
     # ============================================================
     # Calibration utilities
     # ============================================================
 
 
-    def residuals_autograd(self, x_phys, true_surface, Ks, Ts, weights_full, mask_flat):
+    def residuals_autograd(
+        self,
+        x_phys,
+        true_surface,
+        Ks,
+        Ts,
+        weights_full=None,
+        mask_flat=None,
+    ):
         """
-        Computes masked & weighted residuals + Jacobian for LM.
-        Works with flat masks and flat weights.
+        Compute residuals and Jacobian wrt param vector x_phys using autograd.
+
+        x_phys: 1D numpy array (physische Parameter, gleiche Reihenfolge wie param_bounds)
         """
+        import torch
+
         device = self.device
 
-        # --- flatten true surface & mask
-        true_flat = torch.as_tensor(true_surface, dtype=torch.float32, device=device).reshape(-1)
-        mask_flat_t = torch.as_tensor(mask_flat, dtype=torch.bool, device=device)
-        true_masked = true_flat[mask_flat_t]
+        true_np = np.asarray(true_surface, dtype=np.float32)
+        nT, nK = true_np.shape
+        true_flat = true_np.reshape(-1)
 
-        # --- prepare weights
+        if mask_flat is not None:
+            mask_flat = np.asarray(mask_flat, dtype=bool).reshape(-1)
+            true_masked = true_flat[mask_flat]
+        else:
+            true_masked = true_flat
+
         if weights_full is not None:
-            w_flat = torch.as_tensor(weights_full, dtype=torch.float32, device=device).reshape(-1)
-            weights_masked = w_flat[mask_flat_t]
+            w_flat = np.asarray(weights_full, dtype=np.float32).reshape(-1)
+            weights_masked = w_flat[mask_flat] if mask_flat is not None else w_flat
         else:
             weights_masked = None
 
-        # --- parameter vector
-        x = torch.tensor(x_phys, dtype=torch.float32, requires_grad=True, device=device)
+        Ks_t = torch.as_tensor(Ks, dtype=torch.float32, device=device)
+        Ts_t = torch.as_tensor(Ts, dtype=torch.float32, device=device)
 
-        def f_single(x_vec):
-            params = {
-                "eta": x_vec[0],
-                "rho": x_vec[1],
-                "H":   x_vec[2],
-                "xi0_knots": x_vec[3:]
-            }
-
-            # predict full surface (nT, nK)
-            pred = self.predict_surface(params, {"strikes": Ks, "maturities": Ts}, mask_flat=mask_flat)
+        def f_single(x_tensor):
+            # x_tensor: 1D tensor, physical param vector
+            pred = self.predict_surface(
+                x_tensor,
+                grid={"strikes": Ks_t, "maturities": Ts_t},
+                mask_flat=mask_flat,
+            )  # (n_valid,) or (nT, nK)
             pred_flat = pred.reshape(-1)
-
-            res = pred_flat[mask_flat_t] - true_masked
+            diff = pred_flat - torch.as_tensor(true_masked, dtype=torch.float32, device=device)
             if weights_masked is not None:
-                res = res * weights_masked
-            return res
+                w = torch.as_tensor(weights_masked, dtype=torch.float32, device=device)
+                diff = diff * w
+            return diff
 
-        # jacobian
+        x0_t = torch.tensor(x_phys, dtype=torch.float32, device=device, requires_grad=True)
+        res_t = f_single(x0_t)
         J_fn = jacrev(f_single)
-        res = f_single(x)
-        J = J_fn(x)
+        J_t = J_fn(x0_t)  # (n_res, n_params)
 
-        return res.detach().cpu().numpy(), J.detach().cpu().numpy()
+        r_np = res_t.detach().cpu().numpy()
+        J_np = J_t.detach().cpu().numpy()
+        return r_np, J_np
+
 
 
 
@@ -759,21 +941,16 @@ class BaseModel(nn.Module):
         # RMSE-like objective with masking + optional weighting
         # --------------------------------------------------------------
         def rmse_objective(x_phys):
-            params = {
-                "eta": x_phys[0],
-                "rho": x_phys[1],
-                "H":   x_phys[2],
-                "xi0_knots": x_phys[3:]
-            }
-
-            pred = self.predict_surface(params, grid={"strikes": Ks, "maturities": Ts})
-            pred = pred.detach().cpu().numpy()      # (nT, nK)
+            # x_phys: physical parameter vector
+            pred = self.predict_surface(
+                x_phys,
+                grid={"strikes": Ks, "maturities": Ts},
+                mask_flat=mask_flat,
+            )
+            pred = pred.detach().cpu().numpy()  # (nT, nK)
 
             pred_flat = pred.reshape(-1)
-            diff = pred_flat[mask_flat] - true_masked  # (n_valid,)
-
-            #if weights_masked is not None:
-            #    diff = diff * weights_masked/np.sum(weights_masked)
+            diff = pred_flat[mask_flat] - true_masked
 
             val = np.sqrt(np.mean(diff**2))
             if not np.isfinite(val):
@@ -848,165 +1025,179 @@ class BaseModel(nn.Module):
         t1 = time.perf_counter()
         theta_hat = res.x
 
-        param_names = ["eta", "rho", "H"] + [f"xi0_{i}" for i in range(len(theta_hat) - 3)]
-
-        if true_params is not None:
-            true_vec = np.concatenate([
-                [true_params["eta"], true_params["rho"], true_params["H"]],
-                np.array(true_params["xi0_knots"], dtype=np.float32).ravel()
-            ])
-            rel_errs = np.abs(theta_hat - true_vec) / np.clip(np.abs(true_vec), 1e-8, None)
-            rel_err_dict = dict(zip(param_names, rel_errs))
+        if self.param_names is not None:
+            param_names = list(self.param_names)
         else:
-            rel_err_dict = {k: 0.0 for k in param_names}
+            param_names = [f"theta_{i}" for i in range(len(theta_hat))]
+
+        # Optionale Fehlerauswertung vs true_params (falls vorhanden)
+        true_params = target_surface.get("params", None)
+        if true_params is not None:
+            true_vec = self._params_dict_to_vec_np(true_params)
+            abs_err = np.abs(theta_hat - true_vec)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rel_err = np.where(true_vec != 0, abs_err / np.abs(true_vec), np.nan)
+            error_rel_dict = {
+                name: float(err) for name, err in zip(param_names, rel_err)
+            }
+        else:
+            error_rel_dict = None
+
+        runtime_ms = (t1 - t0) * 1000.0
 
         rmse = rmse_objective(theta_hat)
 
         return {
             "theta_hat":      theta_hat,
-            "error_rel_dict": rel_err_dict,
+            "error_rel_dict": error_rel_dict,
             "rmse":           float(rmse),
-            "runtime_ms":     (t1 - t0) * 1000,
+            "runtime_ms":     runtime_ms,
             "optimizer":      optimiser,
         }
 
 
 
-    def evaluate_calibrate(self, surfaces, optimiser="lm", maxiter=500, verbose=False,interp_mode = "model_to_market"):
 
-        #os.makedirs(out_dir, exist_ok=True)
+    def evaluate_calibrate(
+        self,
+        surfaces,
+        optimiser="lm",
+        maxiter=500,
+        verbose=False,
+        interp_mode="model_to_market"
+    ):
         print(f"\nEvaluating calibration using {optimiser} on {len(surfaces)} surfaces...")
 
         runtimes, rmses = [], []
         per_param_rel_errors, per_param_abs_errors = {}, {}
         true_params_all, est_params_all = [], []
 
-        # new: detect how MLP should be used
-        
+        # globale Param-Reihenfolge des Modells
+        if self.param_names is not None:
+            param_names = list(self.param_names)
+        else:
+            # fallback
+            param_names = [f"theta_{j}" for j in range(len(surfaces[0]["params"]))]
 
         for i, s in enumerate(surfaces, start=1):
 
-            # ----------------------------------------------
+            # -------------------------------------------------------------
             # MARKET → MODEL preprocessing
-            # ----------------------------------------------
+            # -------------------------------------------------------------
             if interp_mode == "market_to_model":
-                # get model-grid IVs
                 iv_on_model = self._interpolate_market_to_model(
                     market_surface=s["iv_surface"],
                     Ks_market=s["grid"]["strikes"],
                     Ts_market=s["grid"]["maturities"],
                 )
 
-                # overwrite target surface with model-grid version
                 s_proc = {
                     "params": s["params"],
-                    "grid": {       # IMPORTANT: now model grid!
+                    "grid": {
                         "strikes": self.strikes,
                         "maturities": self.maturities,
                     },
                     "iv_surface": iv_on_model,
                 }
 
-                # calibration → predict_surface(params)  (grid=None!)
                 r = self.calibrate(s_proc, optimiser=optimiser, maxiter=maxiter, verbose=verbose)
 
-            # ----------------------------------------------
+            # -------------------------------------------------------------
             # MODEL → MARKET (normal academic pipeline)
-            # ----------------------------------------------
+            # -------------------------------------------------------------
             else:
-                # calibration happens on the market grid directly
                 r = self.calibrate(s, optimiser=optimiser, maxiter=maxiter, verbose=verbose)
 
-            # store results
+            # -------------------------------------------------------------
+            # Store results
+            # -------------------------------------------------------------
             runtimes.append(r["runtime_ms"])
             rmses.append(r["rmse"])
-            est_params_all.append(r["theta_hat"])
+            theta_hat = np.asarray(r["theta_hat"], dtype=np.float32)
+            est_params_all.append(theta_hat)
 
-            # true parameter vector
+            # ---- true phys. Parameter-Vektor (modellagnostisch)
             tp = s.get("params", None)
             if tp is not None:
-                tvec = np.concatenate([
-                    [tp["eta"], tp["rho"], tp["H"]],
-                    np.array(tp["xi0_knots"], dtype=np.float32).ravel()
-                ])
-                true_params_all.append(tvec)
+                true_vec = self._params_dict_to_vec_np(tp)
             else:
-                true_params_all.append(np.full_like(r["theta_hat"], np.nan))
+                true_vec = np.full_like(theta_hat, np.nan, dtype=np.float32)
 
-            theta_hat = np.array(r["theta_hat"], dtype=np.float32)
-            true_vec = np.array(true_params_all[-1], dtype=np.float32)
-            param_names = ["eta", "rho", "H"] + [f"xi0_{j}" for j in range(len(theta_hat) - 3)]
+            true_params_all.append(true_vec)
 
+            # Fehler
             abs_errs = np.abs(theta_hat - true_vec)
             rel_errs = abs_errs / np.clip(np.abs(true_vec), 1e-8, None)
 
             for k, aerr, rerr in zip(param_names, abs_errs, rel_errs):
-                per_param_abs_errors.setdefault(k, []).append(aerr)
-                per_param_rel_errors.setdefault(k, []).append(rerr)
+                per_param_abs_errors.setdefault(k, []).append(float(aerr))
+                per_param_rel_errors.setdefault(k, []).append(float(rerr))
 
-            # if verbose and (i % 50 == 0 or i == len(surfaces)):
-            #     mean_rmse = np.mean(rmses)
-            #     print(f"  [{i}/{len(surfaces)}] mean RMSE={mean_rmse:.5f}, "
-            #         f"avg time={np.mean(runtimes):.1f} ms")
-
+        # -------------------------------------------------------------
         # Convert lists to arrays
+        # -------------------------------------------------------------
         for d in (per_param_abs_errors, per_param_rel_errors):
             for k in d:
-                d[k] = np.array(d[k])
+                d[k] = np.array(d[k], dtype=np.float32)
 
-        runtimes, rmses = np.array(runtimes), np.array(rmses)
-        true_params_all, est_params_all = np.array(true_params_all), np.array(est_params_all)
-        avg_time = np.mean(runtimes)
+        runtimes = np.array(runtimes, dtype=np.float32)
+        rmses = np.array(rmses, dtype=np.float32)
+        true_params_all = np.array(true_params_all, dtype=np.float32)
+        est_params_all = np.array(est_params_all, dtype=np.float32)
+        avg_time = float(np.mean(runtimes))
 
-        # --- Helper for summary printing ---
+        # -------------------------------------------------------------
+        # Summary helper
+        # -------------------------------------------------------------
         def summarize(errors, kind):
             print(f"{kind.title()} Errors per Parameter:")
             for k, vals in errors.items():
                 scale = 100 if kind == "relative" else 1
-                mean = np.mean(vals)
-                median = np.median(vals)
-                std = np.std(vals)
-                q95 = np.quantile(vals, 0.95)
-                q99 = np.quantile(vals, 0.99)
+                mean = float(np.mean(vals))
+                median = float(np.median(vals))
+                std = float(np.std(vals))
+                q95 = float(np.quantile(vals, 0.95))
+                q99 = float(np.quantile(vals, 0.99))
                 unit = "%" if kind == "relative" else ""
 
                 if kind == "absolute":
-                    rmse = np.sqrt(np.mean(vals ** 2))
-                    print(f"   {k:<8s} | mean={mean*scale:.3f}{unit}"
+                    rmse = float(np.sqrt(np.mean(vals**2)))
+                    print(
+                        f"   {k:<10s} | mean={mean*scale:.3f}{unit}"
                         f" | median={median*scale:.3f}{unit}"
                         f" | std={std*scale:.3f}{unit}"
                         f" | q95={q95*scale:.3f}{unit}"
                         f" | q99={q99*scale:.3f}{unit}"
-                        f" | RMSE={rmse*scale:.3f}{unit}")
+                        f" | RMSE={rmse*scale:.3f}{unit}"
+                    )
                 else:
-                    print(f"   {k:<8s} | mean={mean*scale:.3f}{unit}"
+                    print(
+                        f"   {k:<10s} | mean={mean*scale:.3f}{unit}"
                         f" | median={median*scale:.3f}{unit}"
                         f" | std={std*scale:.3f}{unit}"
                         f" | q95={q95*scale:.3f}{unit}"
-                        f" | q99={q99*scale:.3f}{unit}")
+                        f" | q99={q99*scale:.3f}{unit}"
+                    )
 
-        # --- Output summary ---
+        # -------------------------------------------------------------
+        # Print summary
+        # -------------------------------------------------------------
         print(f"\n→ Final avg time: {avg_time:.1f} ms, mean RMSE={np.mean(rmses):.5f}\n")
         summarize(per_param_rel_errors, "relative")
         print()
         summarize(per_param_abs_errors, "absolute")
 
-        # --- Return data (only abs RMSEs computed) ---
-        per_param_abs_rmse = {k: np.sqrt(np.mean(v ** 2)) for k, v in per_param_abs_errors.items()}
-
-        # ------------------------------------------------------------
-        # Print top-5 highest absolute + relative errors per parameter
-        # ------------------------------------------------------------
+        # -------------------------------------------------------------
+        # Top-5 errors per parameter
+        # -------------------------------------------------------------
         print("\nTop-5 absolute & relative errors per parameter:")
-        for k in per_param_abs_errors.keys():
-            abs_vals = per_param_abs_errors[k]      # shape (n_surfaces,)
+        for k in param_names:
+            abs_vals = per_param_abs_errors[k]
             rel_vals = per_param_rel_errors[k]
 
-            # --- Top-5 absolute ---
             top5_abs_idx = np.argsort(abs_vals)[-5:][::-1]
             top5_abs_vals = abs_vals[top5_abs_idx]
 
-            # --- Top-5 relative ---
             top5_rel_idx = np.argsort(rel_vals)[-5:][::-1]
             top5_rel_vals = rel_vals[top5_rel_idx]
 
@@ -1025,10 +1216,13 @@ class BaseModel(nn.Module):
                     f"| surface_RMSE={float(rmses[idx]):.6f}"
                 )
 
+        per_param_abs_rmse = {
+            k: float(np.sqrt(np.mean(v**2))) for k, v in per_param_abs_errors.items()
+        }
 
         return {
             "optimizer": optimiser,
-            "avg_time_ms": float(avg_time),
+            "avg_time_ms": avg_time,
             "mean_rmse": float(np.mean(rmses)),
             "per_param_rel_errors": per_param_rel_errors,
             "per_param_abs_errors": per_param_abs_errors,
@@ -1038,6 +1232,7 @@ class BaseModel(nn.Module):
             "rmses": rmses,
             "runtimes": runtimes,
         }
+
 
     def count_parameters(self, trainable_only=True):
         """Return the number of (trainable) parameters."""
@@ -1182,35 +1377,42 @@ class DeepONet(BaseModel):
         t = self.trunk(xt)   # (batch, latent_dim)
 
         if self.mask_type == "none":
-            return torch.sum(b * t, dim=1, keepdim=True)
+            return torch.sum(b * t, dim=1, keepdim=True).squeeze(-1)
 
         elif self.mask_type == "spatial":
             mask = self.mask_net(xt)  # (batch, 1)
-            return torch.sum(b * t, dim=1, keepdim=True) * mask
+            return (torch.sum(b * t, dim=1, keepdim=True) * mask).squeeze(-1)
 
         elif self.mask_type == "channel":
             mask = self.mask_net(xt)  # (batch, latent_dim)
-            return torch.sum(b * t * mask, dim=1, keepdim=True)
+            return torch.sum(b * t * mask, dim=1, keepdim=True).squeeze(-1)
 
         elif self.mask_type == "contextual":
             mask_input = torch.cat([b, t], dim=1)
             mask = self.mask_net(mask_input)  # (batch, latent_dim)
-            return torch.sum(b * t * mask, dim=1, keepdim=True)
+            return torch.sum(b * t * mask, dim=1, keepdim=True).squeeze(-1)
 
     # --------------------------------------------------------
 
     @staticmethod
-    def _flatten_surfaces_for_deeponet(surfaces, enforce_shared_grid=False):
+    def _flatten_surfaces_for_deeponet(
+        surfaces,
+        param_names,
+        param_slices,
+    ):
         """
-        Convert list of surfaces into per-point tuples for DeepONet training.
+        Flatten surfaces using param_names/param_slices.
+        Dies ist die finale, model-agnostische Parameter-Flattung.
 
-        Each element in `surfaces` is expected to have:
-            - surf["params"]: dict with eta, rho, H, xi0_knots
-            - surf["iv_surface"]: 2D array (nT, nK)
-            - surf["grid"]["strikes"], surf["grid"]["maturities"]
-
-        Unlike the earlier version, this version supports variable grids per surface.
+        Rückgabe:
+            X_branch : (N, d)
+            X_trunk  : (N, 2)
+            Y        : (N,)
+            strikes  : 1D
+            maturities: 1D
         """
+        import numpy as np
+
         Xb_list, Xt_list, Y_list = [], [], []
         Ks_ref, Ts_ref = None, None
 
@@ -1220,64 +1422,80 @@ class DeepONet(BaseModel):
             Ks = np.asarray(surf["grid"]["strikes"], dtype=np.float32)
             Ts = np.asarray(surf["grid"]["maturities"], dtype=np.float32)
 
-            # Optional safety check if you want to enforce shared grid (for plotting consistency)
-            if enforce_shared_grid:
-                if Ks_ref is None:
-                    Ks_ref, Ts_ref = Ks, Ts
+            # Build parameter vector via param_slices
+            vec = np.zeros(len(param_names), dtype=np.float32)
+            for key, sl in param_slices.items():
+                v = params[key]
+                if isinstance(sl, slice):
+                    vec[sl] = np.asarray(v, dtype=np.float32).flatten()
                 else:
-                    if not (np.allclose(Ks_ref, Ks) and np.allclose(Ts_ref, Ts)):
-                        raise ValueError("All surfaces must share the same (K, T) grid when enforce_shared_grid=True")
+                    vec[sl] = float(v)
 
-            xi0_knots = np.array(params["xi0_knots"], dtype=np.float32).flatten()
-            branch_vec = np.concatenate([[params["eta"], params["rho"], params["H"]], xi0_knots])
+            KK, TT = np.meshgrid(Ks, Ts, indexing="xy")
+            coords = np.stack([KK.reshape(-1), TT.reshape(-1)], axis=1).astype(np.float32)
 
-            # Build per-point training tuples
-            K_mesh, T_mesh = np.meshgrid(Ks, Ts)
-            trunk_coords = np.stack([K_mesh.ravel(), T_mesh.ravel()], axis=1).astype(np.float32)
-            branch_repeated = np.repeat(branch_vec[None, :], len(trunk_coords), axis=0)
-            Y_flat = iv_surface.ravel()[:, None].astype(np.float32)
+            Xb_list.append(np.repeat(vec[None, :], len(coords), axis=0))
+            Xt_list.append(coords)
+            Y_list.append(iv_surface.reshape(-1))
 
-            Xb_list.append(branch_repeated)
-            Xt_list.append(trunk_coords)
-            Y_list.append(Y_flat)
+            Ks_ref, Ts_ref = Ks, Ts   # letzter Grid reicht
 
         X_branch = np.concatenate(Xb_list, axis=0)
-        X_trunk = np.concatenate(Xt_list, axis=0)
-        Y = np.concatenate(Y_list, axis=0)
+        X_trunk  = np.concatenate(Xt_list, axis=0)
+        Y        = np.concatenate(Y_list, axis=0)
 
-        # Only return the last surface's grid for convenience (used for plotting)
-        strikes = Ks_ref if Ks_ref is not None else Ks
-        maturities = Ts_ref if Ts_ref is not None else Ts
+        return X_branch, X_trunk, Y, Ks_ref, Ts_ref
 
-        return X_branch, X_trunk, Y, strikes, maturities
+
 
 
     @classmethod
-    def from_surfaces(cls,
-                      surfaces,
-                      *,
-                      mask_type="none",
-                      batch_size=256,
-                      val_split=0.2,
-                      shuffle=True,
-                      shuffle_training_batches=False,
-                      branch_hidden_dims=(64, 64),
-                      trunk_hidden_dims=(64, 64),
-                      activation="relu",
-                      lr=1e-3,
-                      latent_dim=64,
-                      ref_strikes=None,
-                      ref_maturities=None):
+    def from_surfaces(
+        cls,
+        surfaces,
+        batch_size=256,
+        val_split=0.2,
+        shuffle=True,
+        branch_hidden_dims=(256, 256),
+        trunk_hidden_dims=(256, 256),
+        latent_dim=128,
+        ref_strikes=None,
+        ref_maturities=None,
+        activation="gelu",
+        lr=1e-3,
+        mask_type="none",
+        shuffle_training_batches=True,
+    ):
+
         """
-        Build a DeepONet model + loaders with internal, leakage-safe scaling.
-        Includes learnable mask specified by `mask_type`.
+        Factory: build DeepONet + loaders from a list of surfaces.
+
         """
-        X_branch, X_trunk, Y, strikes, maturities = cls._flatten_surfaces_for_deeponet(surfaces)
+        # --- Flatten to per-point data ---
+    # ------------------------------------------------------------
+    # 0) AUTO-INFER PARAMETER STRUCTURE IF NOT PROVIDED
+    # ------------------------------------------------------------
+        # ------------------------------------------------------------
+        # 0) PARAM-STRUKTUR AUTOMATISCH AUS ERSTEM SURFACE INFERIEREN
+        # ------------------------------------------------------------
+        param_names, param_slices = BaseModel.infer_param_structure_from_surfaces(surfaces)
+
+        # ------------------------------------------------------------
+        # 1) Flatten Surfaces (per-point)
+        # ------------------------------------------------------------
+        X_branch, X_trunk, Y, strikes, maturities = cls._flatten_surfaces_for_deeponet(
+            surfaces,
+            param_names=param_names,
+            param_slices=param_slices,
+        )
+
         if ref_strikes is not None:
             strikes = np.asarray(ref_strikes, dtype=np.float32)
         if ref_maturities is not None:
             maturities = np.asarray(ref_maturities, dtype=np.float32)
 
+        input_dim = X_branch.shape[1]
+        
         # Empirical bounds for branch normalization
         lb = np.min(X_branch, axis=0)
         ub = np.max(X_branch, axis=0)
@@ -1286,6 +1504,7 @@ class DeepONet(BaseModel):
         ub += margin
         Xb_scaled = BaseModel._scale_to_m1_p1(X_branch, lb, ub)
 
+        
         n_total = len(Y)
         n_train = int((1 - val_split) * n_total)
         idx = np.arange(n_total)
@@ -1304,6 +1523,7 @@ class DeepONet(BaseModel):
         model.set_grid(strikes, maturities)
         model.set_io_dims(input_dim=Xb_scaled.shape[1])
         model.fit_output_scaler(Y[tr])
+        model.set_param_structure(param_names, param_slices)
         model.set_param_bounds(lb, ub)
 
         Y_tr_scaled = model.transform_output(Y[tr])
@@ -1315,7 +1535,8 @@ class DeepONet(BaseModel):
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle_training_batches)
         val_loader = DataLoader(val_ds, batch_size=2 * batch_size, shuffle=False)
 
-        return model, train_loader, val_loader, strikes, maturities
+        return model, train_loader, val_loader
+
 
     def test_mask_response(self, xb_sample, xt_grid, visualize=True, channels=None):
         """
@@ -1534,13 +1755,9 @@ class DeepONet(BaseModel):
                 pred = self.forward(xb, xt)
                 total += self.compute_loss(pred, y).item() * len(y)
         return total / len(val_loader.dataset)
-
-    # --------------------------------------------------------
     ###############################################
     #   Fully Torch-Based predict_surface()
-    #   Drop-in replacement for DeepONet models
     ###############################################
-
     def predict_surface(self, params, grid=None, mask_flat=None):
         """
         DeepONet prediction:
@@ -1548,27 +1765,31 @@ class DeepONet(BaseModel):
         - If mask_flat is given:
             → compute ONLY masked points
             → fill output matrix with NaNs at unmasked positions
+
         """
+        import torch
+
         device = self.device
 
         # ----- 1) Grid -----
         if grid is None:
-            strikes = torch.tensor(self.strikes, dtype=torch.float32, device=device)
-            maturities = torch.tensor(self.maturities, dtype=torch.float32, device=device)
+            strikes = torch.as_tensor(self.strikes, dtype=torch.float32, device=device)
+            maturities = torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
         else:
-            strikes = torch.tensor(grid["strikes"], dtype=torch.float32, device=device)
-            maturities = torch.tensor(grid["maturities"], dtype=torch.float32, device=device)
+            strikes = torch.as_tensor(grid["strikes"], dtype=torch.float32, device=device)
+            maturities = torch.as_tensor(grid["maturities"], dtype=torch.float32, device=device)
 
         nK = strikes.numel()
         nT = maturities.numel()
 
         # ----- 2) Parametervektor -----
-        eta = torch.as_tensor(params["eta"], dtype=torch.float32, device=device)
-        rho = torch.as_tensor(params["rho"], dtype=torch.float32, device=device)
-        H   = torch.as_tensor(params["H"],   dtype=torch.float32, device=device)
-        xi0 = torch.as_tensor(params["xi0_knots"], dtype=torch.float32, device=device).flatten()
-
-        x_phys = torch.cat([eta.unsqueeze(0), rho.unsqueeze(0), H.unsqueeze(0), xi0], dim=0)
+        if isinstance(params, dict):
+            x_phys = self._params_dict_to_vec_tensor(params)
+        else:
+            if isinstance(params, torch.Tensor):
+                x_phys = params.to(device=device, dtype=torch.float32).flatten()
+            else:
+                x_phys = torch.as_tensor(params, dtype=torch.float32, device=device).flatten()
 
         lb = torch.as_tensor(self.param_bounds[0], dtype=torch.float32, device=device)
         ub = torch.as_tensor(self.param_bounds[1], dtype=torch.float32, device=device)
@@ -1597,10 +1818,9 @@ class DeepONet(BaseModel):
         pred_iv = pred_scaled * std + mean
 
         # ----- 6) Reconstruct full (nT, nK) with NaNs -----
-        out = torch.full((nT*nK,), float('nan'), dtype=torch.float32, device=device)
+        out = torch.full((nT * nK,), float("nan"), dtype=torch.float32, device=device)
 
         if mask_flat is None:
-            # fill full grid
             out[:] = pred_iv
         else:
             out[mask_t] = pred_iv
@@ -1685,19 +1905,17 @@ class MLP(BaseModel):
     # Data stacking
     # ------------------------------------------------------------------
     @staticmethod
-    def _stack_XY(surfaces, sanity_check_grids=True):
-        """
-        Build X (params) and Y (IV surfaces) from a list of surfaces.
-        All grids must be identical if sanity_check_grids=True.
-        """
+    def _stack_XY(surfaces, param_names, param_slices, sanity_check_grids=True):
+        import numpy as np
+
         X_list, Y_list = [], []
         Ks_ref, Ts_ref = None, None
 
         for surf in surfaces:
             params = surf["params"]
-            iv_surface = np.array(surf["iv_surface"], dtype=np.float32)
-            Ks = np.array(surf["grid"]["strikes"], dtype=np.float32)
-            Ts = np.array(surf["grid"]["maturities"], dtype=np.float32)
+            iv_surface = np.asarray(surf["iv_surface"], dtype=np.float32)
+            Ks = np.asarray(surf["grid"]["strikes"], dtype=np.float32)
+            Ts = np.asarray(surf["grid"]["maturities"], dtype=np.float32)
 
             if sanity_check_grids:
                 if Ks_ref is None:
@@ -1705,29 +1923,31 @@ class MLP(BaseModel):
                 else:
                     if not (np.allclose(Ks_ref, Ks) and np.allclose(Ts_ref, Ts)):
                         raise ValueError(
-                            "All surfaces must share the same (K, T) grid for the MLP output shape."
+                            "All surfaces must share the same (K,T) grid for MLP output."
                         )
 
-            xi0_knots = np.array(params["xi0_knots"]).flatten()
-            param_vec = np.concatenate(
-                [[params["eta"], params["rho"], params["H"]], xi0_knots]
-            ).astype(np.float32)
-            X_list.append(param_vec)
+            # Paramvektor über param_slices
+            vec = np.zeros(len(param_names), dtype=np.float32)
+            for key, sl in param_slices.items():
+                v = params[key]
+                if isinstance(sl, slice):
+                    vec[sl] = np.asarray(v, dtype=np.float32).flatten()
+                else:
+                    vec[sl] = float(v)
+
+            X_list.append(vec)
             Y_list.append(iv_surface)
 
-        X = np.stack(X_list, axis=0)  # (N, d)
-        Y = np.stack(Y_list, axis=0)  # (N, nT, nK)
-        strikes = (
-            Ks_ref
-            if Ks_ref is not None
-            else np.array(surfaces[0]["grid"]["strikes"], dtype=np.float32)
-        )
-        maturities = (
-            Ts_ref
-            if Ts_ref is not None
-            else np.array(surfaces[0]["grid"]["maturities"], dtype=np.float32)
-        )
+        X = np.stack(X_list, axis=0)
+        Y = np.stack(Y_list, axis=0)
+
+        strikes   = Ks_ref if Ks_ref is not None else Ks
+        maturities = Ts_ref if Ts_ref is not None else Ts
+
         return X, Y, strikes, maturities
+
+
+
 
     # ------------------------------------------------------------------
     # Factory from_surfaces
@@ -1742,7 +1962,9 @@ class MLP(BaseModel):
         hidden_dims=(256, 256, 256),
         activation="gelu",
         lr=1e-3,
+        shuffle_training_batches=True,
     ):
+
         """
         Build an MLP model + loaders with internal, leakage-safe scaling:
         - Param vector scaled to [-1, 1] using empirical min/max (+1% margin)
@@ -1752,8 +1974,15 @@ class MLP(BaseModel):
         -------
         model, train_loader, val_loader, strikes, maturities
         """
+        # --- PARAM-STRUKTUR aus erstem Surface ziehen ---
+        param_names, param_slices = BaseModel.infer_param_structure_from_surfaces(surfaces)
+
         # --- Flatten all surfaces ---
-        X, Y, strikes, maturities = cls._stack_XY(surfaces)
+        X, Y, strikes, maturities = cls._stack_XY(
+            surfaces,
+            param_names=param_names,
+            param_slices=param_slices,
+        )
         nT, nK = Y.shape[1:]
         input_dim = X.shape[1]
         output_shape = (nT, nK)
@@ -1781,11 +2010,12 @@ class MLP(BaseModel):
             output_shape=output_shape,
             hidden_dims=hidden_dims,
             activation=activation,
-            lr=lr
+            lr=lr,
         )
         model.set_grid(strikes, maturities)
         model.set_io_dims(input_dim=input_dim, output_shape=output_shape)
         model.set_param_bounds(lb, ub)
+        model.set_param_structure(param_names, param_slices)
         model.fit_output_scaler(Y[tr])
 
         # Transform outputs (scaled IV space)
@@ -1799,13 +2029,14 @@ class MLP(BaseModel):
         Yva = torch.tensor(Y_va_scaled, dtype=torch.float32)
 
         train_loader = DataLoader(
-            TensorDataset(Xtr, Ytr), batch_size=batch_size, shuffle=True
+            TensorDataset(Xtr, Ytr), batch_size=batch_size, shuffle=shuffle_training_batches
         )
         val_loader = DataLoader(
             TensorDataset(Xva, Yva), batch_size=2 * batch_size, shuffle=False
         )
 
         return model, train_loader, val_loader, strikes, maturities
+
 
     # ------------------------------------------------------------------
     # Training
@@ -1961,46 +2192,40 @@ class MLP(BaseModel):
     # ------------------------------------------------------------------
     # predict_surface with interpolation modes
     # ------------------------------------------------------------------
-    def predict_surface(self, params, grid=None , mask_flat=None):
+    # ------------------------------------------------------------------
+    # predict_surface with interpolation modes (modellagnostisch)
+    # ------------------------------------------------------------------
+    def predict_surface(self, params, grid=None, mask_flat=None):
         """
         Predict surface on model-grid, or interpolate model→market.
 
         Parameters
         ----------
-        params : dict
-            {"eta", "rho", "H", "xi0_knots"}; values can be floats or torch.Tensors.
+
+        
+    
         grid : dict or None
             If None:
                 return surface on the model's base grid (self.maturities, self.strikes)
             If dict:
                 {"strikes": strikes, "maturities": maturities} in the SAME space
-                (e.g. physical or log) as self.strikes / self.maturities.
+                as self.strikes / self.maturities.
         """
+        import torch
 
         device = self.device
-
-        # ---------- helper: keep tensors as tensors (important for autograd) ----------
-        def _to_param_tensor(v):
-            if isinstance(v, torch.Tensor):
-                # keep graph, just move/cast
-                return v.to(device=device, dtype=torch.float32)
-            else:
-                return torch.as_tensor(v, dtype=torch.float32, device=device)
 
         # ---------------------------------------------------------
         # PARAM → MLP → base model-grid
         # ---------------------------------------------------------
-        eta = _to_param_tensor(params["eta"])
-        rho = _to_param_tensor(params["rho"])
-        H   = _to_param_tensor(params["H"])
-
-        xi_raw = params["xi0_knots"]
-        if isinstance(xi_raw, torch.Tensor):
-            xi0 = xi_raw.to(device=device, dtype=torch.float32).flatten()
+        if isinstance(params, dict):
+            x_vec = self._params_dict_to_vec_tensor(params)
         else:
-            xi0 = torch.as_tensor(xi_raw, dtype=torch.float32, device=device).flatten()
-
-        x_vec = torch.cat([eta.unsqueeze(0), rho.unsqueeze(0), H.unsqueeze(0), xi0], dim=0)
+            # assume iterable / tensor
+            if isinstance(params, torch.Tensor):
+                x_vec = params.to(device=device, dtype=torch.float32).flatten()
+            else:
+                x_vec = torch.tensor(params, dtype=torch.float32, device=device).flatten()
 
         lb = torch.as_tensor(self.param_bounds[0], dtype=torch.float32, device=device)
         ub = torch.as_tensor(self.param_bounds[1], dtype=torch.float32, device=device)
@@ -2022,7 +2247,6 @@ class MLP(BaseModel):
         # ---------------------------------------------------------
         # Interpolation model-grid → target grid
         # ---------------------------------------------------------
-        # WICHTIG: kein zusätzliches exp mehr – gleiche "Koordinatenwelt" wie im Training
         base_Ts = torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
         base_Ks = torch.as_tensor(self.strikes, dtype=torch.float32, device=device)
 
@@ -2036,7 +2260,6 @@ class MLP(BaseModel):
         TTn = 2.0 * (TT - T_min) / (T_max - T_min) - 1.0
         KKn = 2.0 * (KK - K_min) / (K_max - K_min) - 1.0
 
-        # grid_sample erwartet (N, H, W, 2) mit (x, y) = (K, T)
         grid_torch = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)    # (1, H, W, 2)
         img = base_surface.unsqueeze(0).unsqueeze(0)                  # (1, 1, H0, W0)
 

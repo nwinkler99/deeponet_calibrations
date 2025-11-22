@@ -26,6 +26,7 @@ from .utils import (
     bs_put_vec_pathwise,
     sample_param_sets_lhs,
     lhs_grid,
+    heston_call_price
 )
 
 
@@ -34,52 +35,65 @@ from .utils import (
 # -------------------------------------------------------------
 
 @dataclass
-class RBergomiParams:
-    eta: float
-    rho: float
-    H: float
-
-
-@dataclass
 class SimulationConfig:
+    # -----------------------------
+    # global simulation settings
+    # -----------------------------
     M: int = 20000
     n: int = 1200
-    T_min: float = 25/365         # 1 Woche
-    T_max: float = 2.0           # 2 Jahre
+    T_min: float = 25/365
+    T_max: float = 2.0
     S0: float = 1.0
-    strikes: np.ndarray = None
-    maturities: np.ndarray = None
     batch_size: int = 5000
     G: int = 10
-    dtype: np.dtype = np.float32  # global dtype control
-    max_xi0 : float = 0.25       # max initial variance level
-    min_xi0 : float = 0.01       # min initial variance level
-    min_eta : float = 0.5        # min vol-of-vol
-    max_eta : float = 4.0        # max vol-of-vol
-    min_rho : float = -1.0       # min correlation
-    max_rho : float = -0.1       # max correlation
-    min_H : float = 0.025       # min Hurst
-    max_H : float = 0.5         # max Hurst
+    dtype: np.dtype = np.float32
 
+    # -----------------------------
+    # RBergomi parameter ranges
+    # -----------------------------
+    min_xi0 : float = 0.01
+    max_xi0 : float = 0.25
+    min_eta : float = 0.5
+    max_eta : float = 4.0
+    min_rho : float = -1.0
+    max_rho : float = -0.1
+    min_H   : float = 0.025
+    max_H   : float = 0.5
+
+    # -----------------------------
+    # Heston parameter ranges
+    # -----------------------------
+    heston_min_kappa = 0.5
+    heston_max_kappa = 3.0
+
+    heston_min_theta = 0.01
+    heston_max_theta = 0.25
+
+    heston_min_v0 = 0.01
+    heston_max_v0 = 0.25
+
+    heston_min_sigma = 0.5
+    heston_max_sigma = 3
+
+    heston_min_rho = -1
+    heston_max_rho = -0.1
+
+    # -----------------------------
+    # grids
+    # -----------------------------
+    strikes: np.ndarray = None
+    maturities: np.ndarray = None
 
     def __post_init__(self):
-        # Default strikes = log-moneyness values
         if self.strikes is None:
-            self.logstrikes = np.linspace(
-                -0.4,
-                0.4,
-                15
-            )
-            self.strikes = np.exp(self.logstrikes)*self.S0
+            self.logstrikes = np.linspace(-0.4, 0.4, 15)
+            self.strikes = np.exp(self.logstrikes) * self.S0
 
-        # Default maturities = log-spaced between T_min and T_max
         if self.maturities is None:
-            self.logmaturities = np.linspace(
-                np.log(self.T_min),
-                np.log(self.T_max),
-                15
-            )
+            self.logmaturities = np.linspace(np.log(self.T_min),
+                                             np.log(self.T_max), 15)
             self.maturities = np.exp(self.logmaturities)
+
 
 
 
@@ -100,6 +114,39 @@ def generate_surfaces(
     forward_curves_per_set: int = 1,
     cfg=None,
     seed: int = 42,
+    randomize_grid: bool = False,
+    model: str = "rbergomi"
+):
+    model = model.lower()
+
+    if model == "rbergomi":
+        # --- dein bestehender Generator ---
+        return generate_surfaces_rbergomi(
+            num_sets=num_sets,
+            forward_curves_per_set=forward_curves_per_set,
+            cfg=cfg,
+            seed=seed,
+            randomize_grid=randomize_grid
+        )
+
+    elif model == "heston":
+        return generate_heston_surfaces(
+            num_sets=num_sets,
+            cfg=cfg,
+            seed=seed,
+            randomize_grid=randomize_grid
+        )
+
+    else:
+        raise ValueError(f"Unknown model '{model}'. Use 'rbergomi' or 'heston'.")
+
+
+
+def generate_surfaces_rbergomi(
+    num_sets: int = 1,
+    forward_curves_per_set: int = 1,
+    cfg=None,
+    seed: int = 42,
     randomize_grid: bool = False
 ) -> List[Dict]:
     """
@@ -115,13 +162,23 @@ def generate_surfaces(
     # --- 1️⃣ Central deterministic seed hierarchy ---
     root_seq = SeedSequence(seed)
     rng_params = default_rng(root_seq.spawn(1)[0])
-    param_sets = sample_param_sets_lhs(num_sets, rng_params, lower=np.array([cfg.min_eta, cfg.min_rho, cfg.min_H]), upper=np.array([cfg.max_eta, cfg.max_rho, cfg.max_H]))
+    param_sets = sample_param_sets_lhs(
+        num_sets,
+        rng_params,
+        lower=np.array([cfg.min_eta, cfg.min_rho, cfg.min_H]),
+        upper=np.array([cfg.max_eta, cfg.max_rho, cfg.max_H]),
+    )
+
     set_seqs = root_seq.spawn(num_sets)
 
     n, T_max = cfg.n, cfg.T_max
 
     # --- 2️⃣ Generate per param set ---
     for s, (params, set_seq) in enumerate(zip(param_sets, set_seqs)):
+        eta, rho, H = params   # <— Vektor unpacken
+        eta = float(eta)
+        rho = float(rho)
+        H   = float(H)
         subseqs = set_seq.spawn(3)
         rng_rb = default_rng(subseqs[0])     # for Brownian increments (rBergomi)
         rng_xi = default_rng(subseqs[1])     # for xi0 knots
@@ -312,6 +369,144 @@ def generate_surfaces(
                 )
 
     return results
+
+
+def generate_heston_surfaces(
+    num_sets: int = 1,
+    cfg=None,
+    seed: int = 42,
+    randomize_grid: bool = False,
+):
+    """
+    Heston IV-surface generator:
+        - LHS parameter sampling based on cfg.heston_min_* and cfg.heston_max_*
+        - deterministic SeedSequence hierarchy
+        - log-grid jitter (same style as rBergomi)
+        - identical output structure as rBergomi surfaces
+    """
+
+    root_seq = SeedSequence(seed)
+    rng_params = default_rng(root_seq.spawn(1)[0])
+
+    # LHS sampling
+    param_sets = sample_param_sets_lhs(
+        num_sets,
+        rng_params,
+        lower=np.array([
+            cfg.heston_min_kappa,
+            cfg.heston_min_theta,
+            cfg.heston_min_v0,
+            cfg.heston_min_sigma,
+            cfg.heston_min_rho,
+        ]),
+        upper=np.array([
+            cfg.heston_max_kappa,
+            cfg.heston_max_theta,
+            cfg.heston_max_v0,
+            cfg.heston_max_sigma,
+            cfg.heston_max_rho,
+        ]),
+    )
+
+    # independent jitter RNGs
+    set_seqs = root_seq.spawn(num_sets)
+    results = []
+
+    for s, (params, set_seq) in enumerate(zip(param_sets, set_seqs)):
+        kappa, theta, v0, sigma, rho = params
+        kappa = float(kappa)
+        theta = float(theta)
+        v0    = float(v0)
+        sigma = float(sigma)
+        rho   = float(rho)
+
+        rng_jit = default_rng(set_seq.spawn(1)[0])
+
+        base_logstrikes = cfg.logstrikes.astype(cfg.dtype)
+        base_logmaturities = cfg.logmaturities.astype(cfg.dtype)
+        base_strikes = cfg.strikes.astype(cfg.dtype)
+        base_maturities = cfg.maturities.astype(cfg.dtype)
+
+        for g_id in range(cfg.G):
+
+            if randomize_grid and g_id > 0:
+                logstrikes = np.array(
+                    lhs_grid(
+                        float(base_logstrikes.min()),
+                        float(base_logstrikes.max()),
+                        len(base_logstrikes),
+                        rng=rng_jit
+                    ),
+                    dtype=cfg.dtype
+                )
+                strikes = np.exp(logstrikes) * cfg.S0
+
+                logmaturities = np.array(
+                    lhs_grid(
+                        float(base_logmaturities.min()),
+                        float(base_logmaturities.max()),
+                        len(base_logmaturities),
+                        rng=rng_jit
+                    ),
+                    dtype=cfg.dtype
+                )
+                maturities = np.exp(logmaturities).astype(cfg.dtype)
+
+            else:
+                logstrikes = base_logstrikes.copy()
+                strikes = base_strikes.copy()
+
+                logmaturities = base_logmaturities.copy()
+                maturities = base_maturities.copy()
+
+            # Create IV surface
+            nT, nK = len(maturities), len(strikes)
+            iv_surf = np.zeros((nT, nK), dtype=cfg.dtype)
+
+            for ti, T in enumerate(maturities):
+                T_float = float(T)
+                for ki, K in enumerate(strikes):
+                    K_float = float(K)
+
+                    try:
+                        # Decide call or put based on moneyness:
+                        if K_float >= cfg.S0:
+                            price = heston_call_price(cfg.S0, K_float, T_float, params)
+                            iv = bsinv(price, cfg.S0, K_float, T_float, o="call")
+                        else:
+                            # Use put via put-call parity
+                            call_price = heston_call_price(cfg.S0, K_float, T_float, params)
+                            put_price  = call_price - cfg.S0 + K_float * np.exp(-0*T_float)
+                            iv = bsinv(put_price, cfg.S0, K_float, T_float, o="put")
+
+                    except:
+                        iv = np.nan
+
+                    iv_surf[ti, ki] = cfg.dtype(iv)
+
+            results.append(
+                {
+                    "set_id": s,
+                    "fwd_id": 0,
+                    "grid_id": g_id,
+                    "params": {
+                        "kappa": kappa,
+                        "theta": theta,
+                        "v0": v0,
+                        "sigma": sigma,
+                        "rho": rho,
+                    },
+                    "grid": {
+                        "strikes": logstrikes.astype(cfg.dtype),
+                        "maturities": logmaturities.astype(cfg.dtype),
+                    },
+                    "iv_surface": iv_surf,
+                    "iv_rel_error": np.zeros_like(iv_surf),
+                }
+            )
+
+    return results
+
 
 
 
