@@ -52,7 +52,14 @@ class SimulationConfig:
     batch_size: int = 5000
     G: int = 10
     dtype: np.dtype = np.float32  # global dtype control
-
+    max_xi0 : float = 0.25       # max initial variance level
+    min_xi0 : float = 0.01       # min initial variance level
+    min_eta : float = 0.5        # min vol-of-vol
+    max_eta : float = 4.0        # max vol-of-vol
+    min_rho : float = -1.0       # min correlation
+    max_rho : float = -0.1       # max correlation
+    min_H : float = 0.025       # min Hurst
+    max_H : float = 0.5         # max Hurst
 
 
     def __post_init__(self):
@@ -108,7 +115,7 @@ def generate_surfaces(
     # --- 1️⃣ Central deterministic seed hierarchy ---
     root_seq = SeedSequence(seed)
     rng_params = default_rng(root_seq.spawn(1)[0])
-    param_sets = sample_param_sets_lhs(num_sets, rng_params)
+    param_sets = sample_param_sets_lhs(num_sets, rng_params, lower=np.array([cfg.min_eta, cfg.min_rho, cfg.min_H]), upper=np.array([cfg.max_eta, cfg.max_rho, cfg.max_H]))
     set_seqs = root_seq.spawn(num_sets)
 
     n, T_max = cfg.n, cfg.T_max
@@ -160,7 +167,7 @@ def generate_surfaces(
             forward_points = np.exp(log_forward_points)
 
             # 5) xi0-Knoten generieren
-            xi0_knots = rng_xi.uniform(0.01, 0.16, size=len(forward_points)).astype(cfg.dtype)
+            xi0_knots = rng_xi.uniform(cfg.min_xi0, cfg.max_xi0, size=len(forward_points)).astype(cfg.dtype)
 
 
             # map xi0_knots to sim grid
@@ -257,27 +264,30 @@ def generate_surfaces(
 
                     for ki, K_ in enumerate(strikes_shifted):
                         K_abs = K_ * S0
-                        use_call = bool(float(K_abs) > float(S0))
-                        call_vals = bs_call_vec_pathwise(F_path, float(K_abs), T_float, sigma_path).astype(cfg.dtype)
-                        cond_vals = call_vals if use_call else (call_vals - (F_path - K_abs)).astype(cfg.dtype)
-                        price_cmc = cfg.dtype(np.mean(cond_vals))
-                        se_price = cfg.dtype(np.std(cond_vals, ddof=1)) / cfg.dtype(np.sqrt(cfg.M))
+                        is_call = K_abs >= float(S0)
+                        if is_call:
+                            cond_vals = bs_call_vec_pathwise(F_path, K_abs, T_float, sigma_path).astype( cfg.dtype)
+                            o_flag = "call"
+                        else:
+                            cond_vals = bs_put_vec_pathwise(F_path, K_abs, T_float, sigma_path).astype( cfg.dtype)
+                            o_flag = "put"
 
-                        if not np.isfinite(price_cmc) or price_cmc < cfg.dtype(1e-8):
-                            iv_surf[mi, ki], iv_relerr[mi, ki] = np.nan, np.nan
-                            continue
+                        price_cmc =  cfg.dtype(np.mean(cond_vals))
+                        se_price =  cfg.dtype(np.std(cond_vals, ddof=1)) /  cfg.dtype(np.sqrt(cfg.M))
 
+                        inv_t0 = time.perf_counter()
                         try:
-                            iv_val = bsinv(float(price_cmc), float(S0), float(K_abs), T_float, o="call" if use_call else "put")
-                            iv_surf[mi, ki] = cfg.dtype(iv_val)
-                            vega = bs_vega(float(S0), float(K_abs), T_float, float(iv_val))
+                            iv_val = bsinv(float(price_cmc), float(S0), float(K_abs), float(Tm), o=o_flag)
+                            iv_surf[mi, ki] =  cfg.dtype(iv_val)
+                            vega = bs_vega(float(S0), float(K_abs), float(Tm), float(iv_val))
                             if np.isfinite(vega) and vega > 1e-12 and iv_val > 1e-12:
-                                se_iv = se_price / cfg.dtype(vega)
-                                iv_relerr[mi, ki] = cfg.dtype(1.96) * se_iv / cfg.dtype(iv_val)
+                                se_iv = se_price /  cfg.dtype(vega)
+                                iv_relerr[mi, ki] =  cfg.dtype(1.96) * se_iv /  cfg.dtype(iv_val)
                             else:
                                 iv_relerr[mi, ki] = np.nan
                         except Exception:
-                            iv_surf[mi, ki], iv_relerr[mi, ki] = np.nan, np.nan
+                            iv_surf[mi, ki] = np.nan
+                            iv_relerr[mi, ki] = np.nan
 
                     iv_surf[mi, :] = np.clip(iv_surf[mi, :], cfg.dtype(1e-4), cfg.dtype(5.0))
 
@@ -440,7 +450,6 @@ def generate_fixed_surface(
 
             price_cmc = dtype(np.mean(cond_vals))
             se_price = dtype(np.std(cond_vals, ddof=1)) / dtype(np.sqrt(cfg.M))
-            price_surf[mi, ki] = price_cmc
 
             inv_t0 = time.perf_counter()
             try:
@@ -481,7 +490,6 @@ def generate_fixed_surface(
         os.makedirs(bad_dir, exist_ok=True)
         np.savez_compressed(
             os.path.join(bad_dir, f"bad_fixed_surface_seed{seed}.npz"),
-            price_surface=price_surf,
             iv_surface=iv_surf,
             iv_rel_error=iv_relerr,
             strikes=strikes,
@@ -495,7 +503,6 @@ def generate_fixed_surface(
         "params": {"eta": float(eta), "rho": float(rho), "H": float(H),
                    "xi0_knots": xi0_knots.astype(dtype).tolist()},
         "grid": {"strikes": strikes.astype(dtype), "maturities": maturities.astype(dtype)},
-        "price_surface": price_surf,
         "iv_surface": iv_surf,
         "iv_rel_error": iv_relerr,
     }

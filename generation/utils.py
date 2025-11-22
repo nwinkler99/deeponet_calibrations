@@ -159,14 +159,11 @@ class RBergomiParams:
     H: float
 
 
-def sample_param_sets_lhs(num_sets: int, rng: np.random.RandomState) -> List[RBergomiParams]:
+def sample_param_sets_lhs( num_sets: int, rng: np.random.RandomState, lower = np.array([0.5, -1, 0.025]),upper = np.array([4.0, -0.1, 0.5])) -> List[RBergomiParams]:
     """Sample (eta, rho, H) via Latin Hypercube, fully tied to rng."""
     sampler_seed = rng.integers(0, 2**31 - 1)
     sampler = qmc.LatinHypercube(d=3, seed=sampler_seed)
     sample = sampler.random(num_sets)
-
-    lower = np.array([0.5, -0.95, 0.025])
-    upper = np.array([4.0, -0.1, 0.5])
     scaled = qmc.scale(sample, lower, upper)
 
     param_sets: List[RBergomiParams] = []
@@ -546,7 +543,6 @@ def repair_edges_local_directional(
     blurred = convolve(short_iv, kernel, mode="reflect")
 
     # ---------- 4) protect wings ----------
-    core = slice(protect_wings, nK - protect_wings)
 
     low_vals = short_iv < min_floor
     short_iv[low_vals] = blurred[low_vals]
