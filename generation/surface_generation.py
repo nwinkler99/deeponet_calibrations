@@ -185,7 +185,6 @@ def generate_surfaces_rbergomi(
         rng_xi = default_rng(subseqs[1])     # for xi0 knots
         rng_jit = default_rng(subseqs[2])    # for jitter grids
 
-        eta, rho, H = float(params.eta), float(params.rho), float(params.H)
         a = H - 0.5
 
         # --- 3️⃣ rBergomi simulation (deterministic via rng_rb) ---
@@ -385,26 +384,6 @@ def generate_heston_surfaces(
         - log-grid jitter (same style as rBergomi)
         - identical output structure as rBergomi surfaces
     """
-
-
-    def clean_option_price(price, S0, K, T, o="call"):
-        # intrinsic value
-        if o == "call":
-            iv = max(S0 - K, 0.0)
-            upper = S0        # maximaler Callpreis (r=0)
-        else:
-            iv = max(K - S0, 0.0)
-            upper = K         # maximaler Putpreis (r=0)
-
-        # Clip untere Grenze (IV + epsilon)
-        eps = 1e-12
-        price = max(price, iv + eps)
-
-        # Clip obere Grenze
-        price = min(price, upper - eps)
-
-        return price
-    
     root_seq = SeedSequence(seed)
     rng_params = default_rng(root_seq.spawn(1)[0])
 

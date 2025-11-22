@@ -983,7 +983,7 @@ def plot_param_error_ecdfs(
     ax.set_ylabel("RMSE / Δ RMSE")
     ax.legend(frameon=True, loc="upper left")
 
-    _tight_suptitle(fig, "Calibration RMSE ECDFs (incl. Differences)")
+    _tight_suptitle(fig, "Calibration RMSE ECDFs")
     path_rmse = os.path.join(out_dir, "rmse_ecdf.png")
     plt.savefig(path_rmse, dpi=200)
     plt.close(fig)
@@ -1099,47 +1099,61 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+def flatten_params(params, prefix=""):
+    """
+    Recursively flattens a nested dict/list structure into
+    {flat_key: scalar_value}.
+    Example:
+        {"a":1, "b":[1,2], "c":{"x":3}}
+    ⇒ {
+        "a":1,
+        "b_0":1,
+        "b_1":2,
+        "c_x":3
+    }
+    """
+    flat = {}
+
+    if isinstance(params, dict):
+        for k, v in params.items():
+            new_prefix = f"{prefix}{k}" if prefix == "" else f"{prefix}_{k}"
+            flat.update(flatten_params(v, new_prefix))
+
+    elif isinstance(params, (list, tuple)):
+        for i, v in enumerate(params):
+            new_prefix = f"{prefix}_{i}"
+            flat.update(flatten_params(v, new_prefix))
+
+    else:
+        # assume scalar numeric value
+        flat[prefix] = params
+
+    return flat
+
+
+
 def plot_param_histograms(surface_samples, out_dir="param_histograms"):
     os.makedirs(out_dir, exist_ok=True)
 
-    # ---- Extract all parameter arrays ----
-    etas = []
-    rhos = []
-    Hs   = []
-    xi0_knots = []   # list of lists: xi0_knots[i] = [] of values
+    # ---- Collect all flattened params ----
+    collected = {}
 
-    # First determine number of knots
-    first = surface_samples[0]["params"]
-    num_knots = len(first["xi0_knots"])
-    for _ in range(num_knots):
-        xi0_knots.append([])
-
-    # Extract data
     for s in surface_samples:
-        p = s["params"]
-        etas.append(p["eta"])
-        rhos.append(p["rho"])
-        Hs.append(p["H"])
-        for i, v in enumerate(p["xi0_knots"]):
-            xi0_knots[i].append(v)
+        flat = flatten_params(s["params"])
+        for k, v in flat.items():
+            collected.setdefault(k, []).append(v)
 
-    etas = np.array(etas)
-    rhos = np.array(rhos)
-    Hs   = np.array(Hs)
-    xi0_knots = [np.array(v) for v in xi0_knots]
-
-    # ---- Construct list of (name, data) for easy plotting ----
-    all_params = [
-        ("eta", etas),
-        ("rho", rhos),
-        ("H",   Hs),
-    ]
-    for i, arr in enumerate(xi0_knots):
-        all_params.append((f"xi0_knot_{i}", arr))
+    # Convert to numpy arrays
+    for k in collected:
+        collected[k] = np.array(collected[k])
 
     # ---- Plot each histogram individually ----
-    for name, data in all_params:
-        plt.figure(figsize=(6,4))
+    for name, data in collected.items():
+        plt.figure(figsize=(6, 4))
         plt.hist(data, bins=40, alpha=0.8)
         plt.title(f"Histogram of {name}")
         plt.xlabel(name)
@@ -1148,19 +1162,21 @@ def plot_param_histograms(surface_samples, out_dir="param_histograms"):
         plt.savefig(os.path.join(out_dir, f"hist_{name}.png"), dpi=200)
         plt.close()
 
-    # ---- Also create a large multi-panel grid ----
+    # ---- Multi-grid summary plot ----
+    all_params = list(collected.items())
     cols = 3
     rows = int(np.ceil(len(all_params) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
 
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
     axes = axes.flatten()
+
     for ax, (name, data) in zip(axes, all_params):
         ax.hist(data, bins=40, alpha=0.8)
         ax.set_title(name)
         ax.set_xlabel(name)
         ax.set_ylabel("Count")
 
-    # turn off empty axes if parameter count not divisible by grid
+    # turn off empty axes
     for j in range(len(all_params), len(axes)):
         axes[j].axis("off")
 
@@ -1169,6 +1185,7 @@ def plot_param_histograms(surface_samples, out_dir="param_histograms"):
     plt.close(fig)
 
     print(f"Saved {len(all_params)} histograms to: {out_dir}")
+
 
 
 
