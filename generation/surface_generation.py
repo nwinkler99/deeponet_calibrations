@@ -26,7 +26,8 @@ from .utils import (
     bs_put_vec_pathwise,
     sample_param_sets_lhs,
     lhs_grid,
-    heston_call_price
+    heston_call_price,
+    heston_put_price
 )
 
 
@@ -63,7 +64,7 @@ class SimulationConfig:
     # -----------------------------
     # Heston parameter ranges
     # -----------------------------
-    heston_min_kappa = 0.5
+    heston_min_kappa = 1
     heston_max_kappa = 3.0
 
     heston_min_theta = 0.01
@@ -72,8 +73,8 @@ class SimulationConfig:
     heston_min_v0 = 0.01
     heston_max_v0 = 0.25
 
-    heston_min_sigma = 0.5
-    heston_max_sigma = 3
+    heston_min_sigma = 0.3
+    heston_max_sigma = 1
 
     heston_min_rho = -1
     heston_max_rho = -0.1
@@ -385,6 +386,25 @@ def generate_heston_surfaces(
         - identical output structure as rBergomi surfaces
     """
 
+
+    def clean_option_price(price, S0, K, T, o="call"):
+        # intrinsic value
+        if o == "call":
+            iv = max(S0 - K, 0.0)
+            upper = S0        # maximaler Callpreis (r=0)
+        else:
+            iv = max(K - S0, 0.0)
+            upper = K         # maximaler Putpreis (r=0)
+
+        # Clip untere Grenze (IV + epsilon)
+        eps = 1e-12
+        price = max(price, iv + eps)
+
+        # Clip obere Grenze
+        price = min(price, upper - eps)
+
+        return price
+    
     root_seq = SeedSequence(seed)
     rng_params = default_rng(root_seq.spawn(1)[0])
 
@@ -465,21 +485,37 @@ def generate_heston_surfaces(
 
             for ti, T in enumerate(maturities):
                 T_float = float(T)
-                for ki, K in enumerate(strikes):
-                    K_float = float(K)
+                if T_float <= 0:
+                    iv_surf[ti, :] = np.nan
+                    continue
 
+                # lineare Strikes (du hast sie vorher korrekt gebaut)
+                K_lin = strikes.astype(float)
+
+                # Masken
+                mask_call = K_lin >= cfg.S0
+                mask_put  = ~mask_call
+
+                # Preise vektorisieren
+                prices = np.empty_like(K_lin, dtype=float)
+                if mask_call.any():
+                    prices[mask_call] = heston_call_price(
+                        cfg.S0, K_lin[mask_call], T_float, params
+                    )
+                if mask_put.any():
+                    prices[mask_put] = heston_put_price(
+                        cfg.S0, K_lin[mask_put], T_float, params
+                    )
+
+                # Jetzt bsinv STRIKE-WEISE (kannst du später auch vektorisieren)
+                for ki, K_float in enumerate(K_lin):
+                    price = prices[ki]
                     try:
-                        # Decide call or put based on moneyness:
-                        if K_float >= cfg.S0:
-                            price = heston_call_price(cfg.S0, K_float, T_float, params)
+                        if mask_call[ki]:
                             iv = bsinv(price, cfg.S0, K_float, T_float, o="call")
                         else:
-                            # Use put via put-call parity
-                            call_price = heston_call_price(cfg.S0, K_float, T_float, params)
-                            put_price  = call_price - cfg.S0 + K_float * np.exp(-0*T_float)
-                            iv = bsinv(put_price, cfg.S0, K_float, T_float, o="put")
-
-                    except:
+                            iv = bsinv(price, cfg.S0, K_float, T_float, o="put")
+                    except Exception:
                         iv = np.nan
 
                     iv_surf[ti, ki] = cfg.dtype(iv)

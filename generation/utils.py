@@ -107,7 +107,7 @@ def bsinv(P: float, F: float, K: float, t: float, o: str = "call") -> float:
         return bs(F, K, sigma ** 2 * t, o) - P
 
     try:
-        return brentq(error, 1e-8, 5.0, xtol=1e-10, maxiter=100)
+        return brentq(error, 1e-8, 5.0, xtol=1e-8, maxiter=100)
     except ValueError:
         # Root not bracketed (e.g. price outside BS range)
         return np.nan
@@ -178,57 +178,198 @@ def sample_param_sets_lhs(num_sets, rng, lower, upper):
 # ----------------------------------------------------------
 # 1) Characteristic function (same as yours, but vectorized)
 # ----------------------------------------------------------
+# def heston_cf(u, tau, kappa, theta, sigma, rho, v0, r=0.0):
+#     """
+#     Vektorisierte CF: u kann array sein!
+#     """
+#     iu = 1j * u
+
+#     alpha = kappa - rho * sigma * iu
+#     beta  = sigma * sigma
+#     d = np.sqrt(alpha * alpha + beta * (u * u + iu))
+#     d = np.where(np.real(d) < 0, -d, d)
+#     g = (alpha - d) / (alpha + d)
+#     g = g / (1 + 1e-12)
+
+#     exp_dt = np.exp(-d * tau)
+#     one_minus_gexp = 1 - g * exp_dt
+
+#     C = (kappa * theta / beta) * ((alpha - d) * tau - 2 * np.log(one_minus_gexp / (1 - g)))
+#     D = ((alpha - d) / beta) * ((1 - exp_dt) / one_minus_gexp)
+
+#     return np.exp(C + D * v0 + iu * 0)   # Forward measure drift 0
+
+# LAGUERRE_X, LAGUERRE_W = np.polynomial.laguerre.laggauss(64)
+
+# def _fourier_probabilities(S0, K, tau, kappa, theta, v0, sigma, rho):
+#     """
+#     Vektorisierte Berechnung von P1 und P2.
+#     """
+#     x = LAGUERRE_X
+#     w = LAGUERRE_W
+
+#     phi = x          # Gauss-Laguerre-Knoten
+#     exp_x = np.exp(x)
+
+#     logS0 = np.log(S0)
+#     logK  = np.log(K)
+
+#     # -------- P1: u = phi - i ----------
+#     u1 = phi - 1j
+#     cf1 = heston_cf(u1, tau, kappa, theta, sigma, rho, v0)
+
+#     integrand1 = np.real(
+#         np.exp(1j * phi * (logS0 - logK)) * cf1 / (1j * phi)
+#     )
+#     P1 = 0.5 + (1/np.pi) * np.sum(w * exp_x * integrand1)
+
+#     # -------- P2: u = phi ----------
+#     u2 = phi
+#     cf2 = heston_cf(u2, tau, kappa, theta, sigma, rho, v0)
+
+#     integrand2 = np.real(
+#         np.exp(1j * phi * (logS0 - logK)) * cf2 / (1j * phi)
+#     )
+#     P2 = 0.5 + (1/np.pi) * np.sum(w * exp_x * integrand2)
+#     P1 = np.clip(P1, 0.0, 1.0)
+#     P2 = np.clip(P2, 0.0, 1.0)
+#     return P1, P2
+
+# def heston_call_price(S0, K, tau, params, r=0.0):
+#     kappa, theta, v0, sigma, rho = params
+
+#     if tau <= 0:
+#         return max(S0 - K, 0.0)
+
+#     P1, P2 = _fourier_probabilities(S0, K, tau, kappa, theta, v0, sigma, rho)
+
+#     call = S0 * P1 - K * np.exp(-r * tau) * P2
+
+#     # Preislogik
+#     call = np.clip(call, max(S0-K,0), S0)
+#     return call
+
+
+# def heston_put_price(S0, K, tau, params, r=0.0):
+#     kappa, theta, v0, sigma, rho = params
+
+#     if tau <= 0:
+#         return max(K - S0, 0.0)
+
+#     P1, P2 = _fourier_probabilities(S0, K, tau, kappa, theta, v0, sigma, rho)
+
+#     # Put-Formel (klassisch)
+#     put = K * np.exp(-r * tau) * (1 - P2) - S0 * (1 - P1)
+
+#     put = np.clip(put, max(K-S0, 0), K)
+#     return put
+
+
+import numpy as np
+import math
+
 def heston_cf(u, tau, kappa, theta, sigma, rho, v0, r=0.0):
-    alpha = kappa - rho * sigma * u * 1j
+    """
+    Standard-Heston-Charfunktion unter Forward/RN-Maß (drift = r - q, hier r).
+    u: array oder scalar (Reell, aber komplexe Auswertung)
+    """
+    u = np.asarray(u, dtype=complex)
+
+    alpha = kappa - rho * sigma * 1j * u
     beta  = sigma**2
+
     d = np.sqrt(alpha**2 + beta * (u**2 + 1j*u))
     g = (alpha - d) / (alpha + d)
 
     exp_dt = np.exp(-d * tau)
-    C = kappa * theta / (sigma**2) * ((alpha - d) * tau - 2 * np.log((1 - g * exp_dt) / (1 - g)))
-    D = (alpha - d) / (sigma**2) * ((1 - exp_dt) / (1 - g * exp_dt))
+    num = 1 - g * exp_dt
+    den = 1 - g
 
-    return np.exp(C + D * v0 + 1j * u * 0)  # forward measure: drift == 0
+    # Numerik-Safeguards
+    num = np.where(num == 0, 1e-16 + 0j, num)
+    den = np.where(den == 0, 1e-16 + 0j, den)
 
-def heston_call_price(S0, K, tau, params, r=0.0, n_laguerre=64):
+    C = (kappa * theta / sigma**2) * ((alpha - d) * tau - 2 * np.log(num / den))
+    D = (alpha - d) / sigma**2 * ((1 - exp_dt) / num)
+
+    return np.exp(C + D * v0 + 1j * u * 0.0)  # forward measure: drift ~ 0
+
+# Globale Laguerre-Knoten/Gewichte (64 reicht idR.)
+LAG_N = 64
+LAG_X, LAG_W = np.polynomial.laguerre.laggauss(LAG_N)
+
+def heston_call_price(S0, K, tau, params, r=0.0,
+                          x=LAG_X, w=LAG_W):
     """
-    Klassisches Heston-Pricing nach Fourier (P1/P2).
-    Nutzt DEINE heston_cf().
+    Vektorisierter Heston-Callpreis für EIN fixes tau, beliebig viele K.
+
+    S0: float
+    K:  float oder 1D-Array
+    tau: float (Maturity)
+    params: (kappa, theta, v0, sigma, rho)
     """
     kappa, theta, v0, sigma, rho = params
 
-    # Laguerre-Knoten/Gewichte für ∫_0^∞
-    x, w = np.polynomial.laguerre.laggauss(n_laguerre)
+    K = np.asarray(K, dtype=float)  # shape (m,)
+    tau = float(tau)
 
-    logS0 = np.log(S0)
-    logK  = np.log(K)
+    logS0 = math.log(S0)
+    logK  = np.log(K)               # (m,)
 
-    # --- P1 Integrand ---
-    def integrand_P1(phi):
-        u = phi - 1j
-        term = heston_cf(u, tau, kappa, theta, sigma, rho, v0, r)
-        return np.real(np.exp(-1j * phi * logK) *
-                       np.exp(1j * phi * logS0) *
-                       term / (1j * phi))
+    u = x                           # (n,)
+    weight = w * np.exp(x)          # (n,), Gauss–Laguerre-Korrektur
 
-    # --- P2 Integrand ---
-    def integrand_P2(phi):
-        u = phi
-        term = heston_cf(u, tau, kappa, theta, sigma, rho, v0, r)
-        return np.real(np.exp(-1j * phi * logK) *
-                       np.exp(1j * phi * logS0) *
-                       term / (1j * phi))
+    # ---------- P1 ----------
+    u1 = u - 1j
+    cf1 = heston_cf(u1, tau, kappa, theta, sigma, rho, v0, r)  # (n,)
 
-    # Fourier-Integrale via Gauss-Laguerre
-    P1 = 0.5 + (1 / np.pi) * np.sum(w * np.exp(x) * integrand_P1(x))
-    P2 = 0.5 + (1 / np.pi) * np.sum(w * np.exp(x) * integrand_P2(x))
+    # broadcast: (m,1) × (1,n)
+    u_col     = u[None, :]         # (1,n)
+    logK_col  = logK[:, None]      # (m,1)
 
-    # Klassischer Heston-Preis
-    call = S0 * P1 - K * np.exp(-r * tau) * P2
+    f1 = np.real(
+        np.exp(1j * u_col * (logS0 - logK_col)) *
+        cf1[None, :] / (1j * u_col)
+    )                               # (m,n)
 
-    # numerische Safeguards
+    P1 = 0.5 + (weight * f1).sum(axis=1) / math.pi  # (m,)
+
+    # ---------- P2 ----------
+    u2  = u
+    cf2 = heston_cf(u2, tau, kappa, theta, sigma, rho, v0, r)  # (n,)
+
+    f2 = np.real(
+        np.exp(1j * u_col * (logS0 - logK_col)) *
+        cf2[None, :] / (1j * u_col)
+    )                               # (m,n)
+
+    P2 = 0.5 + (weight * f2).sum(axis=1) / math.pi  # (m,)
+
+    # ---------- Callpreis ----------
+    disc = math.exp(-r * tau)
+    call = S0 * P1 - K * disc * P2
+
+    # Numerische Safeguards
     call = np.clip(call, 0.0, S0)
+
     return call
+
+def heston_put_price(S0, K, tau, params, r=0.0,
+                         x=LAG_X, w=LAG_W):
+    """
+    Getrennte Put-Funktion, aber basierend auf Call via Put-Call-Parität.
+    """
+    K = np.asarray(K, dtype=float)
+    tau = float(tau)
+
+    call = heston_call_price(S0, K, tau, params, r, x, w)
+    disc = np.exp(-r * tau)
+
+    put = call - S0 + K * disc
+    put = np.clip(put, 0.0, K)   # Safeguard
+
+    return put
+
 
 
 
@@ -1028,3 +1169,31 @@ def plot_param_histograms(surface_samples, out_dir="param_histograms"):
     plt.close(fig)
 
     print(f"Saved {len(all_params)} histograms to: {out_dir}")
+
+
+
+import numpy as np
+
+def count_local_minima_1d(arr):
+    """
+    Count strict local minima in a 1D array.
+    A local minimum is an index i such that arr[i] < arr[i-1] and arr[i] < arr[i+1].
+    """
+    if len(arr) < 3:
+        return 0
+
+    return int(np.sum((arr[1:-1] < arr[:-2]) & (arr[1:-1] < arr[2:])))
+
+def surface_has_too_many_minima(surface, max_minima=3):
+    """
+    Returns True if ANY maturity has more than `max_minima` local minima.
+    surface["iv_surface"] is assumed to be shape (nT, nK).
+    """
+    iv = surface["iv_surface"]
+
+    for row in iv:
+        minima_count = count_local_minima_1d(row)
+        if minima_count > max_minima:
+            return True
+
+    return False
