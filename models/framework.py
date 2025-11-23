@@ -1987,9 +1987,6 @@ class MLP(BaseModel):
         # --- Empirical parameter bounds (+1% margin) ---
         lb = np.min(X, axis=0)
         ub = np.max(X, axis=0)
-        margin = 0.01 * (ub - lb)
-        lb -= margin
-        ub += margin
 
         X_scaled = BaseModel._scale_to_m1_p1(X, lb, ub)
 

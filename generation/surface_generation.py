@@ -64,8 +64,8 @@ class SimulationConfig:
     # -----------------------------
     # Heston parameter ranges
     # -----------------------------
-    heston_min_kappa = 1
-    heston_max_kappa = 3.0
+    heston_min_kappa = 0.5
+    heston_max_kappa = 4
 
     heston_min_theta = 0.01
     heston_max_theta = 0.25
@@ -73,8 +73,8 @@ class SimulationConfig:
     heston_min_v0 = 0.01
     heston_max_v0 = 0.25
 
-    heston_min_sigma = 0.3
-    heston_max_sigma = 1
+    heston_min_sigma = 0.5
+    heston_max_sigma = 4
 
     heston_min_rho = -1
     heston_max_rho = -0.1
