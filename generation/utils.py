@@ -1214,3 +1214,44 @@ def surface_has_too_many_minima(surface, max_minima=3):
             return True
 
     return False
+
+import numpy as np
+import random
+import numpy as np
+import random
+
+def sample_uniform_param(surface_list, param_name="v0", n_samples=40000, n_bins=50):
+    param_vals = np.array([s["params"][param_name] for s in surface_list])
+
+    # ---- Safe bins: include max properly ----
+    p_min, p_max = param_vals.min(), param_vals.max()
+    eps = (p_max - p_min) * 1e-9
+    bins = np.linspace(p_min, p_max + eps, n_bins + 1)
+
+    # ---- Digitize ----
+    bin_indices = np.digitize(param_vals, bins) - 1
+    bin_indices = np.clip(bin_indices, 0, n_bins - 1)
+
+    # ---- Build mapping ----
+    bin_to_indices = {b: [] for b in range(n_bins)}
+    for idx, b in enumerate(bin_indices):
+        bin_to_indices[b].append(idx)
+
+    # ---- Target per bin ----
+    samples_per_bin = n_samples // n_bins
+    selected = []
+
+    for b in range(n_bins):
+        indices = bin_to_indices[b]
+        if len(indices) <= samples_per_bin:
+            selected.extend(indices)
+        else:
+            selected.extend(random.sample(indices, samples_per_bin))
+
+    # Fill leftover
+    if len(selected) < n_samples:
+        remaining = n_samples - len(selected)
+        leftovers = list(set(range(len(surface_list))) - set(selected))
+        selected.extend(random.sample(leftovers, remaining))
+    random.shuffle(selected)
+    return [surface_list[i] for i in selected]

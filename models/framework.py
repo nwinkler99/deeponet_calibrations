@@ -875,7 +875,7 @@ class BaseModel(nn.Module):
                 mask_flat=mask_flat,
             )  # (n_valid,) or (nT, nK)
             pred_flat = pred.reshape(-1)
-            diff = pred_flat - torch.as_tensor(true_masked, dtype=torch.float32, device=device)
+            diff = pred_flat[mask_flat] - torch.as_tensor(true_masked, dtype=torch.float32, device=device)
             if weights_masked is not None:
                 w = torch.as_tensor(weights_masked, dtype=torch.float32, device=device)
                 diff = diff * w
@@ -1499,9 +1499,6 @@ class DeepONet(BaseModel):
         # Empirical bounds for branch normalization
         lb = np.min(X_branch, axis=0)
         ub = np.max(X_branch, axis=0)
-        margin = 0.01 * (ub - lb)
-        lb -= margin
-        ub += margin
         Xb_scaled = BaseModel._scale_to_m1_p1(X_branch, lb, ub)
 
         
@@ -2197,31 +2194,22 @@ class MLP(BaseModel):
     # ------------------------------------------------------------------
     def predict_surface(self, params, grid=None, mask_flat=None):
         """
-        Predict surface on model-grid, or interpolate model→market.
+        Predict surface on model-grid OR interpolate model→market.
 
-        Parameters
-        ----------
-
-        
-    
-        grid : dict or None
-            If None:
-                return surface on the model's base grid (self.maturities, self.strikes)
-            If dict:
-                {"strikes": strikes, "maturities": maturities} in the SAME space
-                as self.strikes / self.maturities.
+        Supports masked interpolation:
+            If mask_flat is not None:
+                - only compute values at masked coordinates
+                - return full (nT, nK) with NaNs elsewhere
         """
         import torch
-
         device = self.device
 
         # ---------------------------------------------------------
-        # PARAM → MLP → base model-grid
+        # 1) PARAM → x_scaled
         # ---------------------------------------------------------
         if isinstance(params, dict):
             x_vec = self._params_dict_to_vec_tensor(params)
         else:
-            # assume iterable / tensor
             if isinstance(params, torch.Tensor):
                 x_vec = params.to(device=device, dtype=torch.float32).flatten()
             else:
@@ -2229,48 +2217,86 @@ class MLP(BaseModel):
 
         lb = torch.as_tensor(self.param_bounds[0], dtype=torch.float32, device=device)
         ub = torch.as_tensor(self.param_bounds[1], dtype=torch.float32, device=device)
-
         x_scaled = 2.0 * (x_vec - lb) / (ub - lb) - 1.0
-        pred_scaled = self.forward(x_scaled.unsqueeze(0)).squeeze(0)  # (nT, nK) in scaled space
 
-        # inverse output scaling
-        pred_flat = pred_scaled.view(-1)
+        # Base prediction on model grid (scaled → unscaled)
+        pred_scaled = self.forward(x_scaled.unsqueeze(0)).squeeze(0)  # (nT0, nK0)
+
+        pred_flat  = pred_scaled.reshape(-1)
         mean = torch.as_tensor(self.output_scaler.mean_,  dtype=torch.float32, device=device)
         std  = torch.as_tensor(self.output_scaler.scale_, dtype=torch.float32, device=device)
+        base_surface = (pred_flat * std + mean).reshape(*self.output_shape)  # (nT0, nK0)
 
-        base_surface = (pred_flat * std + mean).view(*self.output_shape)  # (nT, nK), physische IVs
-
-        # --------- MODE "base": direkt Modellgrid zurückgeben ---------
+        # If no interpolation requested → return model base-grid
         if grid is None:
             return base_surface
 
         # ---------------------------------------------------------
-        # Interpolation model-grid → target grid
+        # 2) Interpolation setup
         # ---------------------------------------------------------
-        base_Ts = torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
-        base_Ks = torch.as_tensor(self.strikes, dtype=torch.float32, device=device)
+        base_T = torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
+        base_K = torch.as_tensor(self.strikes,    dtype=torch.float32, device=device)
 
-        tgt_Ts = torch.as_tensor(grid["maturities"], dtype=torch.float32, device=device)
-        tgt_Ks = torch.as_tensor(grid["strikes"], dtype=torch.float32, device=device)
+        tgt_T = torch.as_tensor(grid["maturities"], dtype=torch.float32, device=device)
+        tgt_K = torch.as_tensor(grid["strikes"],    dtype=torch.float32, device=device)
 
-        T_min, T_max = base_Ts.min(), base_Ts.max()
-        K_min, K_max = base_Ks.min(), base_Ks.max()
+        nT, nK = tgt_T.numel(), tgt_K.numel()
 
-        TT, KK = torch.meshgrid(tgt_Ts, tgt_Ks, indexing="ij")
+        # Normalized coordinates for bilinear interpolation
+        T_min, T_max = base_T.min(), base_T.max()
+        K_min, K_max = base_K.min(), base_K.max()
+
+        # normalize target coordinates to [-1,1]
+        TT, KK = torch.meshgrid(tgt_T, tgt_K, indexing="ij")
         TTn = 2.0 * (TT - T_min) / (T_max - T_min) - 1.0
         KKn = 2.0 * (KK - K_min) / (K_max - K_min) - 1.0
 
-        grid_torch = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)    # (1, H, W, 2)
-        img = base_surface.unsqueeze(0).unsqueeze(0)                  # (1, 1, H0, W0)
+        # Full target grid as (nT*nK, 2)
+        coord_full = torch.stack([KKn.reshape(-1), TTn.reshape(-1)], dim=1)  # [K-first, T-second]
 
-        interp = torch.nn.functional.grid_sample(
+        # ---------------------------------------------------------
+        # 3) If mask_flat=None → normal full interpolation
+        # ---------------------------------------------------------
+        if mask_flat is None:
+            grid_torch = torch.stack([KKn, TTn], dim=-1).unsqueeze(0)  # (1, nT, nK, 2)
+            img = base_surface.unsqueeze(0).unsqueeze(0)               # (1, 1, nT0, nK0)
+
+            interp = torch.nn.functional.grid_sample(
+                img,
+                grid_torch,
+                mode="bilinear",
+                padding_mode="reflection",
+                align_corners=True,
+            )
+            return interp.squeeze(0).squeeze(0)  # (nT, nK)
+
+        # ---------------------------------------------------------
+        # 4) Masked interpolation: only compute for masked coords
+        # ---------------------------------------------------------
+        mask_t = torch.as_tensor(mask_flat, dtype=torch.bool, device=device).reshape(-1)
+        masked_coords = coord_full[mask_t]  # (n_masked, 2)
+
+        # Reshape into a grid_sample query (batch=1)
+        grid_masked = masked_coords.unsqueeze(0).unsqueeze(0)  # (1, 1, n_masked, 2)
+
+        img = base_surface.unsqueeze(0).unsqueeze(0)  # (1, 1, H0, W0)
+
+        interp_masked = torch.nn.functional.grid_sample(
             img,
-            grid_torch,
+            grid_masked,
             mode="bilinear",
             padding_mode="reflection",
             align_corners=True,
-        )
-        return interp.squeeze(0).squeeze(0)  # (H, W) = target grid
+        ).squeeze(0).squeeze(0)  # shape (n_masked)
+
+        # ---------------------------------------------------------
+        # 5) Reconstruct full (nT, nK) output with NaNs
+        # ---------------------------------------------------------
+        out = torch.full((nT * nK,), float('nan'), dtype=torch.float32, device=device)
+        out[mask_t] = interp_masked  # fill only masked coords
+
+        return out.reshape(nT, nK)
+
 
 
 
