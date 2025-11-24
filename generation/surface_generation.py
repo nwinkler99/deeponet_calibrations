@@ -68,16 +68,16 @@ class SimulationConfig:
     heston_max_kappa = 4
 
     heston_min_theta = 0.01
-    heston_max_theta = 0.25
+    heston_max_theta = 0.02
 
     heston_min_v0 = 0.01
-    heston_max_v0 = 0.25
+    heston_max_v0 = 0.02
 
     heston_min_sigma = 0.5
-    heston_max_sigma = 4
+    heston_max_sigma = 2
 
     heston_min_rho = -1
-    heston_max_rho = -0.1
+    heston_max_rho = -0.9
 
     # -----------------------------
     # grids
@@ -332,7 +332,6 @@ def generate_surfaces_rbergomi(
                         price_cmc =  cfg.dtype(np.mean(cond_vals))
                         se_price =  cfg.dtype(np.std(cond_vals, ddof=1)) /  cfg.dtype(np.sqrt(cfg.M))
 
-                        inv_t0 = time.perf_counter()
                         try:
                             iv_val = bsinv(float(price_cmc), float(S0), float(K_abs), float(Tm), o=o_flag)
                             iv_surf[mi, ki] =  cfg.dtype(iv_val)
@@ -370,6 +369,43 @@ def generate_surfaces_rbergomi(
 
     return results
 
+import math
+import os
+from numpy.random import default_rng, SeedSequence
+
+import numpy as np
+import QuantLib as ql
+
+
+def _build_heston_engine(S0, r, kappa, theta, v0, sigma, rho):
+    """
+    Helper: baue einen QuantLib-Heston-Engine für gegebene Parameter.
+    Wir arbeiten mit einer flachen Zins- und Dividendenkurve und
+    fixem Evaluation Date, damit T als Year-Fraction ~ tau passt.
+    """
+    day_counter = ql.Actual365Fixed()
+    calendar = ql.NullCalendar()
+
+    # Fixes "today" – wir verwenden nur yearFraction und relative Laufzeiten.
+    today = ql.Date(1, ql.January, 2000)
+    ql.Settings.instance().evaluationDate = today
+
+    spot = ql.QuoteHandle(ql.SimpleQuote(S0))
+    rTS = ql.YieldTermStructureHandle(
+        ql.FlatForward(today, r, day_counter)
+    )
+    qTS = ql.YieldTermStructureHandle(
+        ql.FlatForward(today, 0.0, day_counter)
+    )
+
+    process = ql.HestonProcess(
+        rTS, qTS, spot, v0, kappa, theta, sigma, rho
+    )
+    model = ql.HestonModel(process)
+    engine = ql.AnalyticHestonEngine(model)
+
+    return engine, today, day_counter
+
 
 def generate_heston_surfaces(
     num_sets: int = 1,
@@ -378,11 +414,12 @@ def generate_heston_surfaces(
     randomize_grid: bool = False,
 ):
     """
-    Heston IV-surface generator:
+    Heston IV-surface generator using QuantLib Heston pricing:
         - LHS parameter sampling based on cfg.heston_min_* and cfg.heston_max_*
         - deterministic SeedSequence hierarchy
         - log-grid jitter (same style as rBergomi)
         - identical output structure as rBergomi surfaces
+        - Preise via QuantLib AnalyticHestonEngine, IV via bsinv
     """
     root_seq = SeedSequence(seed)
     rng_params = default_rng(root_seq.spawn(1)[0])
@@ -391,33 +428,42 @@ def generate_heston_surfaces(
     param_sets = sample_param_sets_lhs(
         num_sets,
         rng_params,
-        lower=np.array([
-            cfg.heston_min_kappa,
-            cfg.heston_min_theta,
-            cfg.heston_min_v0,
-            cfg.heston_min_sigma,
-            cfg.heston_min_rho,
-        ]),
-        upper=np.array([
-            cfg.heston_max_kappa,
-            cfg.heston_max_theta,
-            cfg.heston_max_v0,
-            cfg.heston_max_sigma,
-            cfg.heston_max_rho,
-        ]),
+        lower=np.array(
+            [
+                cfg.heston_min_kappa,
+                cfg.heston_min_theta,
+                cfg.heston_min_v0,
+                cfg.heston_min_sigma,
+                cfg.heston_min_rho,
+            ],
+            dtype=float,
+        ),
+        upper=np.array(
+            [
+                cfg.heston_max_kappa,
+                cfg.heston_max_theta,
+                cfg.heston_max_v0,
+                cfg.heston_max_sigma,
+                cfg.heston_max_rho,
+            ],
+            dtype=float,
+        ),
     )
 
     # independent jitter RNGs
     set_seqs = root_seq.spawn(num_sets)
     results = []
 
+    # Zins (falls du irgendwann cfg.r hast, hier einsetzen)
+    r = getattr(cfg, "r", 0.0)
+
     for s, (params, set_seq) in enumerate(zip(param_sets, set_seqs)):
-        kappa, theta, v0, sigma, rho = params
-        kappa = float(kappa)
-        theta = float(theta)
-        v0    = float(v0)
-        sigma = float(sigma)
-        rho   = float(rho)
+        kappa, theta, v0, sigma, rho = [float(x) for x in params]
+
+        # QuantLib-Engine für dieses Parameterset
+        engine, today, day_counter = _build_heston_engine(
+            cfg.S0, r, kappa, theta, v0, sigma, rho
+        )
 
         rng_jit = default_rng(set_seq.spawn(1)[0])
 
@@ -427,16 +473,16 @@ def generate_heston_surfaces(
         base_maturities = cfg.maturities.astype(cfg.dtype)
 
         for g_id in range(cfg.G):
-
+            # ---- ggf. jittered Grid ----
             if randomize_grid and g_id > 0:
                 logstrikes = np.array(
                     lhs_grid(
                         float(base_logstrikes.min()),
                         float(base_logstrikes.max()),
                         len(base_logstrikes),
-                        rng=rng_jit
+                        rng=rng_jit,
                     ),
-                    dtype=cfg.dtype
+                    dtype=cfg.dtype,
                 )
                 strikes = np.exp(logstrikes) * cfg.S0
 
@@ -445,12 +491,11 @@ def generate_heston_surfaces(
                         float(base_logmaturities.min()),
                         float(base_logmaturities.max()),
                         len(base_logmaturities),
-                        rng=rng_jit
+                        rng=rng_jit,
                     ),
-                    dtype=cfg.dtype
+                    dtype=cfg.dtype,
                 )
                 maturities = np.exp(logmaturities).astype(cfg.dtype)
-
             else:
                 logstrikes = base_logstrikes.copy()
                 strikes = base_strikes.copy()
@@ -458,37 +503,57 @@ def generate_heston_surfaces(
                 logmaturities = base_logmaturities.copy()
                 maturities = base_maturities.copy()
 
-            # Create IV surface
+            # ---- IV-Surface Container ----
             nT, nK = len(maturities), len(strikes)
             iv_surf = np.zeros((nT, nK), dtype=cfg.dtype)
 
+            # ---- Loop über Maturities ----
             for ti, T in enumerate(maturities):
                 T_float = float(T)
-                if T_float <= 0:
+                if T_float <= 0.0:
                     iv_surf[ti, :] = np.nan
                     continue
 
-                # lineare Strikes (du hast sie vorher korrekt gebaut)
+                # Mapping tau -> QuantLib-Maturity-Date
+                # (ungefähr T * 365 Tage, nur für Pricing relevant)
+                days = max(1, int(round(T_float * 365)))
+                maturity_date = today + days
+                exercise = ql.EuropeanExercise(maturity_date)
+
+                # lineare Strikes
                 K_lin = strikes.astype(float)
 
                 # Masken
                 mask_call = K_lin >= cfg.S0
-                mask_put  = ~mask_call
+                mask_put = ~mask_call
 
-                # Preise vektorisieren
                 prices = np.empty_like(K_lin, dtype=float)
-                if mask_call.any():
-                    prices[mask_call] = heston_call_price(
-                        cfg.S0, K_lin[mask_call], T_float, params
-                    )
-                if mask_put.any():
-                    prices[mask_put] = heston_put_price(
-                        cfg.S0, K_lin[mask_put], T_float, params
-                    )
 
-                # Jetzt bsinv STRIKE-WEISE (kannst du später auch vektorisieren)
+                # Calls
+                if mask_call.any():
+                    for idx in np.where(mask_call)[0]:
+                        K_float = float(K_lin[idx])
+                        payoff = ql.PlainVanillaPayoff(
+                            ql.Option.Call, K_float
+                        )
+                        option = ql.VanillaOption(payoff, exercise)
+                        option.setPricingEngine(engine)
+                        prices[idx] = option.NPV()
+
+                # Puts
+                if mask_put.any():
+                    for idx in np.where(mask_put)[0]:
+                        K_float = float(K_lin[idx])
+                        payoff = ql.PlainVanillaPayoff(
+                            ql.Option.Put, K_float
+                        )
+                        option = ql.VanillaOption(payoff, exercise)
+                        option.setPricingEngine(engine)
+                        prices[idx] = option.NPV()
+
+                # ---- Implied Vol (weiterhin via bsinv) ----
                 for ki, K_float in enumerate(K_lin):
-                    price = prices[ki]
+                    price = float(prices[ki])
                     try:
                         if mask_call[ki]:
                             iv = bsinv(price, cfg.S0, K_float, T_float, o="call")
@@ -521,6 +586,7 @@ def generate_heston_surfaces(
             )
 
     return results
+
 
 
 

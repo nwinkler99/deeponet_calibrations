@@ -468,7 +468,7 @@ class BaseModel(nn.Module):
             img,
             grid_torch,
             mode="bilinear",
-            padding_mode="reflection",
+            padding_mode="border",
             align_corners=True,
         ).squeeze(0).squeeze(0)
 

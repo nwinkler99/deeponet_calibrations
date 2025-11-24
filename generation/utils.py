@@ -835,22 +835,14 @@ def plot_param_error_ecdfs(
     labels,
     out_dir="calibration_plots",
     kind="relative",
-    cut_quantile=None,          # <-- NEW OPTION
+    cut_quantile=None,
 ):
-    """Compare ECDFs of per-parameter errors and RMSEs across multiple models.
-    
-    Parameters
-    ----------
-    cut_quantile : float or None
-        If given (e.g. 0.99), truncate the plotted ECDF curves at the given
-        percentile of x-values. Useful to hide extreme outliers.
-        Must satisfy 0 < cut_quantile <= 1.
-    """
     os.makedirs(out_dir, exist_ok=True)
 
     if cut_quantile is not None:
-        assert 0 < cut_quantile <= 1, "cut_quantile must be in (0,1]."
+        assert 0 < cut_quantile <= 1
 
+    # -------- collect data --------
     param_sets, rmses_sets = [], []
     for r in results:
         rmses_sets.append(r.get("rmses", []))
@@ -863,90 +855,73 @@ def plot_param_error_ecdfs(
                     break
 
     all_param_names = _extract_param_names_consistent(results)
+    num_params = len(all_param_names)
 
-    ncols = min(4, len(all_param_names))
-    nrows = int(np.ceil(len(all_param_names) / ncols))
+    # -------- layout: parameters + 1 rmse panel --------
+    total_plots = num_params + 1
+    ncols = min(4, num_params)
+    nrows = int(np.ceil(total_plots / ncols))
+
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.2 * nrows), squeeze=False)
 
     def ecdf_cut(x):
-        """Return (xs, ys) with optional quantile cutoff."""
         xs = np.sort(np.asarray(x))
         ys = np.linspace(0, 1, len(xs))
-
         if cut_quantile is not None:
-            # Find index corresponding to quantile cutoff
-            cutoff_idx = int(cut_quantile * len(xs))
-            # Keep only up to cutoff index
-            xs = xs[:cutoff_idx]
-            ys = ys[:cutoff_idx]
-
+            idx = int(cut_quantile * len(xs))
+            xs = xs[:idx]
+            ys = ys[:idx]
         return xs, ys
 
     # --------------------------
-    # Parameter ECDFs
+    #  PARAMETER PANELS
     # --------------------------
     for i, param in enumerate(all_param_names):
         ax = axes[i // ncols, i % ncols]
-# ---------- 1) Normale ECDFs + Cache ---------
-        curves = []      # list of (ys, xs_scaled) or None
+
+        curves = []
         for data, label in zip(param_sets, labels):
             if param not in data:
                 curves.append(None)
                 continue
+
             xs, ys = ecdf_cut(data[param])
             xs_scaled = xs * (100 if kind == "relative" else 1)
+
             curves.append((ys, xs_scaled))
             ax.plot(ys, xs_scaled, label=label)
 
-        # ---------- 2) ECDF-Differenzen auf gleicher Achse ---------
-        reference = curves[0]  # erstes Modell als baseline
-        if reference is not None:
-            ys_ref, xs_ref = reference
-
+        # differences (1st model = baseline)
+        ref = curves[0]
+        if ref is not None:
+            ys_ref, xs_ref = ref
             for (entry, label) in zip(curves, labels):
-                if entry is None or entry is reference:
+                if entry is None or entry is ref:
                     continue
-                ys_i, xs_i = entry
 
-                # Interp XS_i onto reference quantiles
+                ys_i, xs_i = entry
                 xs_i_interp = np.interp(ys_ref, ys_i, xs_i)
                 diff = xs_i_interp - xs_ref
 
-                # Unterschiedskurve plotten (gleiche Achse!)
                 ax.plot(
-                    ys_ref,
-                    diff,
-                    linestyle="--",
-                    linewidth=1.0,
-                    alpha=0.8,
+                    ys_ref, diff,
+                    linestyle="--", linewidth=1.0, alpha=0.8,
                     label=f"{label} – {labels[0]}"
                 )
 
-
-        ax.set_title(param, fontsize=14)
+        ax.set_title(param, fontsize=13)
         ax.set_xlabel("Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else ""))
         ax.set_ylabel(f"{kind.title()} Error" + (" [%]" if kind == "relative" else ""))
+
         if i == 0:
             ax.legend(frameon=True, loc="upper left")
 
-    # empty subplots off
-    for j in range(i + 1, nrows * ncols):
-        axes[j // ncols, j % ncols].axis("off")
-
-    _tight_suptitle(fig, f"Parameter {kind.title()} Error CDFs")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    path_params = os.path.join(out_dir, f"param_error_cdfs_{kind}.png")
-    plt.savefig(path_params, dpi=200)
-    plt.close(fig)
-    print(f"Saved {kind} error ECDF comparison to {path_params}")
-
     # --------------------------
-    # RMSE ECDF + DIFFERENCES
+    #  RMSE PANEL (last cell)
     # --------------------------
-    fig, ax = plt.subplots(figsize=(5, 4))
+    ax_rmse = axes[num_params // ncols, num_params % ncols]
 
-    # ----- 1) normale ECDFs + Cache -----
-    rmse_curves = []   # list of (ys, xs) or None
+    rmse_curves = []
     for rmses, label in zip(rmses_sets, labels):
         if len(rmses) == 0:
             rmse_curves.append(None)
@@ -954,40 +929,45 @@ def plot_param_error_ecdfs(
 
         xs, ys = ecdf_cut(rmses)
         rmse_curves.append((ys, xs))
-        ax.plot(ys, xs, label=label)  # normal ECDF
+        ax_rmse.plot(ys, xs, label=label)
 
-    # ----- 2) DIFFERENCES auf selber Achse -----
-    reference = rmse_curves[0]   # baseline ist erstes Modell
-    if reference is not None:
-        ys_ref, xs_ref = reference
+    # Differences
+    ref = rmse_curves[0]
+    if ref is not None:
+        ys_ref, xs_ref = ref
 
         for (entry, label) in zip(rmse_curves, labels):
-            if entry is None or entry is reference:
+            if entry is None or entry is ref:
                 continue
 
             ys_i, xs_i = entry
             xs_i_interp = np.interp(ys_ref, ys_i, xs_i)
             diff = xs_i_interp - xs_ref
 
-            # Diff-Curve in gleicher Achse
-            ax.plot(
-                ys_ref,
-                diff,
-                linestyle="--",
-                linewidth=1.0,
-                alpha=0.8,
+            ax_rmse.plot(
+                ys_ref, diff,
+                linestyle="--", linewidth=1.0, alpha=0.8,
                 label=f"{label} – {labels[0]}"
             )
 
-    ax.set_xlabel("Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else ""))
-    ax.set_ylabel("RMSE / Δ RMSE")
-    ax.legend(frameon=True, loc="upper left")
+    ax_rmse.set_title("RMSE", fontsize=13)
+    ax_rmse.set_xlabel("Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else ""))
+    ax_rmse.set_ylabel("RMSE / Δ RMSE")
+    ax_rmse.legend(frameon=True, loc="upper left")
 
-    _tight_suptitle(fig, "Calibration RMSE ECDFs")
-    path_rmse = os.path.join(out_dir, "rmse_ecdf.png")
-    plt.savefig(path_rmse, dpi=200)
+    # Turn off possible unused subplots
+    for idx in range(total_plots, nrows * ncols):
+        axes[idx // ncols, idx % ncols].axis("off")
+
+    _tight_suptitle(fig, f"Parameter {kind.title()} Errors + RMSE (ECDFs)")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    out_path = os.path.join(out_dir, f"param_and_rmse_ecdfs_{kind}.png")
+    plt.savefig(out_path, dpi=200)
     plt.close(fig)
-    print(f"Saved RMSE ECDF comparison to {path_rmse}")
+
+    print(f"Saved combined ECDF comparison to {out_path}")
+
 
 
 
@@ -1191,7 +1171,7 @@ def plot_param_histograms(surface_samples, out_dir="param_histograms"):
 
 import numpy as np
 
-def count_local_minima_1d(arr):
+def count_local_maxima_1d(arr):
     """
     Count strict local minima in a 1D array.
     A local minimum is an index i such that arr[i] < arr[i-1] and arr[i] < arr[i+1].
@@ -1199,9 +1179,9 @@ def count_local_minima_1d(arr):
     if len(arr) < 3:
         return 0
 
-    return int(np.sum((arr[1:-1] < arr[:-2]) & (arr[1:-1] < arr[2:])))
+    return int(np.sum((arr[1:-1] > arr[:-2]) & (arr[1:-1] > arr[2:])))
 
-def surface_has_too_many_minima(surface, max_minima=3):
+def surface_has_too_many_maxima(surface, max_minima=3):
     """
     Returns True if ANY maturity has more than `max_minima` local minima.
     surface["iv_surface"] is assumed to be shape (nT, nK).
@@ -1209,7 +1189,7 @@ def surface_has_too_many_minima(surface, max_minima=3):
     iv = surface["iv_surface"]
 
     for row in iv:
-        minima_count = count_local_minima_1d(row)
+        minima_count = count_local_maxima_1d(row)
         if minima_count > max_minima:
             return True
 
@@ -1255,3 +1235,87 @@ def sample_uniform_param(surface_list, param_name="v0", n_samples=40000, n_bins=
         selected.extend(random.sample(leftovers, remaining))
     random.shuffle(selected)
     return [surface_list[i] for i in selected]
+
+
+# Proper names for your params
+PARAM_NAMES = ["eta", "rho", "H"] + [f"xi0_{i}" for i in range(5)]
+
+
+def prepare_df(res_list, name, PARAM_NAMES):
+    df = pd.DataFrame([{
+        "date": r["date"],
+        "rmse": r["rmse"],
+        "runtime_ms": r["runtime_ms"],
+        **{PARAM_NAMES[i]: r["theta_hat"][i] for i in range(len(r["theta_hat"]))}
+    } for r in res_list])
+
+    df["model"] = name
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def plot_param_grid(deeponet_res, mlp_res, PARAM_NAMES):
+
+    # Build dfs
+    df_deep = prepare_df(deeponet_res, "DeepONet",PARAM_NAMES)
+    df_mlp  = prepare_df(mlp_res, "MLP",PARAM_NAMES)
+
+    df = pd.concat([df_deep, df_mlp], ignore_index=True)
+    # IMPORTANT: sort chronologically
+    df = df.sort_values("date")
+
+
+    param_cols = PARAM_NAMES
+    n_params = len(param_cols)
+
+    # Grid size (parameters + 2 rows: RMSE + runtime)
+    rows = math.ceil(n_params / 2) + 1
+    cols = 2
+
+    fig, axes = plt.subplots(rows, cols, figsize=(12, rows * 3))
+    axes = axes.flatten()
+
+    # ---- Parameter Plots ----
+    for idx, p in enumerate(param_cols):
+        ax = axes[idx]
+        for model, sub in df.groupby("model"):
+            ax.plot(sub["date"], sub[p], marker="o", label=model)
+        ax.set_title(p)
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Value")
+        ax.grid(True)
+
+        # Legend nur in erstem Parameter-Plot
+        if idx == 0:
+            ax.legend()
+
+    # ---- RMSE ----
+    rmse_ax = axes[n_params]
+    for model, sub in df.groupby("model"):
+        rmse_ax.plot(sub["date"], sub["rmse"], marker="o", label=model)
+    rmse_ax.set_title("RMSE over Time")
+    rmse_ax.set_xlabel("Date")
+    rmse_ax.set_ylabel("RMSE")
+    rmse_ax.grid(True)
+    #rmse_ax.legend()
+
+    # ---- Runtime ----
+    runtime_ax = axes[n_params + 1]
+    for model, sub in df.groupby("model"):
+        runtime_ax.plot(sub["date"], sub["runtime_ms"], marker="o", label=model)
+    runtime_ax.set_title("Calibration Runtime (ms)")
+    runtime_ax.set_xlabel("Date")
+    runtime_ax.set_ylabel("Runtime [ms]")
+    runtime_ax.grid(True)
+    #runtime_ax.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    # ---- Print average runtimes ----
+    print("\nAverage Calibration Runtime (ms):")
+    print(df.groupby("model")["runtime_ms"].mean())
+
+    # ---- Print average RMSE ----
+    print("\nAverage RMSE:")
+    print(df.groupby("model")["rmse"].mean())
