@@ -18,7 +18,11 @@ from scipy.optimize import minimize, least_squares, differential_evolution
 import sys
 from torch.func import jacrev
 import torch.nn.functional as F
-
+import time
+import numpy as np
+from scipy.optimize import least_squares, differential_evolution, minimize
+import QuantLib as ql
+from generation.rbergomi import bsinv  # Pfad ggf. anpassen
 
 # ============================================================
 # Dataset Wrapper (for DeepONet per-point supervision)
@@ -766,19 +770,22 @@ class BaseModel(nn.Module):
             fig, ax = plt.subplots(figsize=(6,5))
             ax.scatter(x, y, s=12, alpha=0.7)
 
-            # moving average
+            # polynomial fit (2nd degree)
             x = np.asarray(x)
             y = np.asarray(y)
             idx = np.argsort(x)
             xs, ys = x[idx], y[idx]
 
-            window = 100
-            if len(ys) > window:
-                kernel = np.ones(window) / window
-                ma = np.convolve(ys, kernel, mode="valid")
-                pad = (len(xs) - len(ma)) // 2
-                xs_ma = xs[pad: pad + len(ma)]
-                ax.plot(xs_ma, ma, linewidth=2.5, color="red", label=f"MA({window})")
+            if len(xs) > 10:  # safety
+                # Fit: y ≈ a x^2 + b x + c
+                coeffs = np.polyfit(xs, ys, deg=2)
+                poly = np.poly1d(coeffs)
+
+                xs_fit = np.linspace(xs.min(), xs.max(), 300)
+                ys_fit = poly(xs_fit)
+
+                ax.plot(xs_fit, ys_fit, linewidth=2.5, color="red",
+                        label="Quadratic Fit")
 
             ax.set_xlabel(name_x)
             ax.set_ylabel("RMSE")
@@ -822,12 +829,273 @@ class BaseModel(nn.Module):
         }
 
 
-
-
-
     # ============================================================
     # Calibration utilities
     # ============================================================
+
+    @staticmethod
+    def _heston_iv_surface_quantlib(
+        x_phys,
+        Ks_log,
+        Ts_log,
+        S0,
+        r=0.0,
+        q=0.0,
+        mask_2d=None,
+        dtype=np.float32,
+    ):
+        """
+        Erzeuge eine Heston-IV-Surface via QuantLib AnalyticHestonEngine.
+
+        x_phys: [kappa, theta, v0, sigma, rho]
+        Ks_log: 1D array (log(K/S0) oder log(K)-ähnlich)
+        Ts_log: 1D array (log(T))
+        S0:     Spot
+        mask_2d: optional bool-Array (nT, nK) – nur True-Punkte werden bepreist
+        """
+
+        kappa, theta, v0, sigma, rho = [float(v) for v in x_phys]
+
+        day_counter = ql.Actual365Fixed()
+        calendar = ql.NullCalendar()
+
+        today = ql.Date(1, ql.January, 2000)
+        ql.Settings.instance().evaluationDate = today
+
+        spot = ql.QuoteHandle(ql.SimpleQuote(float(S0)))
+        rTS = ql.YieldTermStructureHandle(
+            ql.FlatForward(today, float(r), day_counter)
+        )
+        qTS = ql.YieldTermStructureHandle(
+            ql.FlatForward(today, float(q), day_counter)
+        )
+
+        process = ql.HestonProcess(
+            rTS, qTS, spot, float(v0), float(kappa), float(theta), float(sigma), float(rho)
+        )
+        model = ql.HestonModel(process)
+        engine = ql.AnalyticHestonEngine(model)
+
+        # log -> linear
+        Ks_pricing = np.exp(np.asarray(Ks_log, dtype=np.float64)) * float(S0)
+        Ts_pricing = np.exp(np.asarray(Ts_log, dtype=np.float64))
+
+        nT, nK = len(Ts_pricing), len(Ks_pricing)
+        iv_surf = np.full((nT, nK), np.nan, dtype=dtype)
+
+        if mask_2d is None:
+            mask_2d = np.ones((nT, nK), dtype=bool)
+        else:
+            mask_2d = np.asarray(mask_2d, dtype=bool)
+            assert mask_2d.shape == (nT, nK)
+
+        for ti, T in enumerate(Ts_pricing):
+            # wenn in dieser Zeile kein Punkt gebraucht wird, skip
+            if not mask_2d[ti, :].any():
+                continue
+
+            T_float = float(T)
+            if T_float <= 0.0:
+                continue
+
+            days = max(1, int(round(T_float * 365)))
+            maturity_date = today + days
+            exercise = ql.EuropeanExercise(maturity_date)
+
+            for ki, K in enumerate(Ks_pricing):
+                if not mask_2d[ti, ki]:
+                    continue
+
+                K_float = float(K)
+                payoff_type = ql.Option.Call if K_float >= S0 else ql.Option.Put
+                payoff = ql.PlainVanillaPayoff(payoff_type, K_float)
+                option = ql.VanillaOption(payoff, exercise)
+                option.setPricingEngine(engine)
+
+                price = option.NPV()
+                try:
+                    if payoff_type == ql.Option.Call:
+                        iv = bsinv(price, S0, K_float, T_float, o="call")
+                    else:
+                        iv = bsinv(price, S0, K_float, T_float, o="put")
+                except Exception:
+                    iv = np.nan
+
+                iv_surf[ti, ki] = dtype(iv)
+
+        return iv_surf
+
+    def calibrate_heston_analytic(
+        self,
+        target_surface,
+        optimiser="lm",
+        maxiter=500,
+        verbose=False,
+    ):
+        """
+        Analytische Heston-Kalibrierung via QuantLib (AnalyticHestonEngine).
+
+        Gleiche Output-Form wie self.calibrate:
+            - "theta_hat"
+            - "error_rel_dict"
+            - "rmse"
+            - "runtime_ms"
+            - "optimizer"
+        (plus ggf. zusätzliche Felder, falls du willst)
+        """
+        import time
+        from scipy.optimize import least_squares, differential_evolution, minimize
+
+        assert self.param_bounds is not None, "Call set_param_bounds() first."
+
+        # --- Bounds ---
+        lb, ub = self.param_bounds
+        lb = np.asarray(lb, dtype=np.float64)
+        ub = np.asarray(ub, dtype=np.float64)
+
+        # --- Ziel-Surface + Grid (log-space) ---
+        true_surface = np.asarray(target_surface["iv_surface"], dtype=np.float64)  # (nT, nK)
+        Ks_log = np.asarray(target_surface["grid"]["strikes"], dtype=np.float64)
+        Ts_log = np.asarray(target_surface["grid"]["maturities"], dtype=np.float64)
+
+        nT, nK = true_surface.shape
+
+        S0 = float(getattr(self, "S0", target_surface.get("S0", 1.0)))
+        r = float(getattr(self, "r", target_surface.get("r", 0.0)))
+        q = float(getattr(self, "q", target_surface.get("q", 0.0)))
+
+        true_params = target_surface.get("params", None)
+
+        # --- Mask ---
+        mask_np = np.isfinite(true_surface)  # (nT, nK)
+        mask_flat = mask_np.reshape(-1)
+        true_flat = true_surface.reshape(-1)
+        true_masked = true_flat[mask_flat]
+
+        # --- Weights optional ---
+        weights = target_surface.get("weights", None)
+        if weights is not None:
+            weights_full = np.asarray(weights, dtype=np.float64)
+            weights_flat = weights_full.reshape(-1)
+            weights_masked = weights_flat[mask_flat]
+        else:
+            weights_full = None
+            weights_masked = None
+
+        # --- Startwert ---
+        if true_params is not None:
+            param_names = getattr(self, "param_names", ["kappa", "theta", "v0", "sigma", "rho"])
+            guess_list = []
+            ok = True
+            for name in param_names:
+                if name in true_params:
+                    guess_list.append(float(true_params[name]))
+                else:
+                    ok = False
+                    break
+            if ok and len(guess_list) == len(lb):
+                x0 = np.array(guess_list, dtype=np.float64)
+            else:
+                x0 = 0.5 * (lb + ub)
+        else:
+            x0 = 0.5 * (lb + ub)
+
+        # --- Residuals ---
+        def residuals(x_phys):
+            iv_pred = self._heston_iv_surface_quantlib(
+                x_phys,
+                Ks_log=Ks_log,
+                Ts_log=Ts_log,
+                S0=S0,
+                r=r,
+                q=q,
+                mask_2d=mask_np,  # nur relevante Punkte berechnen
+                dtype=np.float64,
+            )
+            pred_flat = iv_pred.reshape(-1)
+            diff = pred_flat[mask_flat] - true_masked
+            if weights_masked is not None:
+                diff = diff * weights_masked
+            diff = np.where(np.isfinite(diff), diff, 0.0)
+            return diff
+
+        def rmse_objective(x_phys):
+            res = residuals(x_phys)
+            val = np.sqrt(np.mean(res**2))
+            if not np.isfinite(val):
+                return 1e6
+            return val
+
+        t0 = time.perf_counter()
+        opt_lower = optimiser.lower()
+
+        # --- Optimizer Auswahl ---
+        if opt_lower in ["differential evolution", "de"]:
+            res = differential_evolution(
+                rmse_objective,
+                bounds=list(zip(lb, ub)),
+                maxiter=maxiter,
+                disp=verbose
+            )
+
+        elif opt_lower in ["levenberg-marquardt", "lm", "trf", "dogbox"]:
+            # least_squares – ohne expliziten Jacobian
+            method = "trf" if opt_lower in ["levenberg-marquardt", "lm"] else opt_lower
+            res = least_squares(
+                residuals,
+                x0,
+                method=method,
+                bounds=(lb, ub),
+                max_nfev=maxiter,
+                verbose=2 if verbose else 0
+            )
+
+        else:
+            res = minimize(
+                rmse_objective,
+                x0,
+                method=optimiser,
+                bounds=list(zip(lb, ub)),
+                options={"maxiter": maxiter, "disp": verbose}
+            )
+
+        t1 = time.perf_counter()
+
+        theta_hat = res.x
+        runtime_ms = (t1 - t0) * 1000.0
+        rmse = rmse_objective(theta_hat)
+
+        # --- Fehlerauswertung wie in calibrate ---
+        if self.param_names is not None:
+            param_names = list(self.param_names)
+        else:
+            param_names = [f"theta_{i}" for i in range(len(theta_hat))]
+
+        if true_params is not None:
+            true_vec = self._params_dict_to_vec_np(true_params)
+            abs_err = np.abs(theta_hat - true_vec)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rel_err = np.where(true_vec != 0, abs_err / np.abs(true_vec), np.nan)
+            error_rel_dict = {
+                name: float(err) for name, err in zip(param_names, rel_err)
+            }
+        else:
+            error_rel_dict = None
+
+        if verbose:
+            print("Heston analytic calibration finished.")
+            print("theta_hat:", theta_hat)
+            print("RMSE:", rmse)
+            print("runtime_ms:", runtime_ms)
+
+        return {
+            "theta_hat":      theta_hat,
+            "error_rel_dict": error_rel_dict,
+            "rmse":           float(rmse),
+            "runtime_ms":     float(runtime_ms),
+            "optimizer":      optimiser,
+        }
+
 
 
     def residuals_autograd(
@@ -1064,7 +1332,7 @@ class BaseModel(nn.Module):
         optimiser="lm",
         maxiter=500,
         verbose=False,
-        interp_mode="model_to_market"
+        analytic=False
     ):
         print(f"\nEvaluating calibration using {optimiser} on {len(surfaces)} surfaces...")
 
@@ -1080,34 +1348,15 @@ class BaseModel(nn.Module):
             param_names = [f"theta_{j}" for j in range(len(surfaces[0]["params"]))]
 
         for i, s in enumerate(surfaces, start=1):
-
-            # -------------------------------------------------------------
-            # MARKET → MODEL preprocessing
-            # -------------------------------------------------------------
-            if interp_mode == "market_to_model":
-                iv_on_model = self._interpolate_market_to_model(
-                    market_surface=s["iv_surface"],
-                    Ks_market=s["grid"]["strikes"],
-                    Ts_market=s["grid"]["maturities"],
-                )
-
-                s_proc = {
-                    "params": s["params"],
-                    "grid": {
-                        "strikes": self.strikes,
-                        "maturities": self.maturities,
-                    },
-                    "iv_surface": iv_on_model,
-                }
-
-                r = self.calibrate(s_proc, optimiser=optimiser, maxiter=maxiter, verbose=verbose)
-
-            # -------------------------------------------------------------
-            # MODEL → MARKET (normal academic pipeline)
-            # -------------------------------------------------------------
+            if analytic:
+                r = self.calibrate_heston_analytic(
+                    s,
+                    optimiser=optimiser,
+                    maxiter=maxiter,
+                    verbose=verbose,
+            )            
             else:
                 r = self.calibrate(s, optimiser=optimiser, maxiter=maxiter, verbose=verbose)
-
             # -------------------------------------------------------------
             # Store results
             # -------------------------------------------------------------

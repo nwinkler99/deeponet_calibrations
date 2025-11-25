@@ -18,7 +18,7 @@ parser.add_argument("--model", type=str, default="rbergomi",
                     help="Choose between rbergomi or heston")
 parser.add_argument("--startbatch", type=int, default=0,
                     help="Index of first batch to start from")
-parser.add_argument("--numbatches", type=int, default=10000,
+parser.add_argument("--numbatches", type=int, default=1000,
                     help="Total number of batches to run")
 parser.add_argument("--batchsize", type=int, default=60,
                     help="Number of parameter sets per batch")

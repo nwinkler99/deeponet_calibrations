@@ -837,27 +837,35 @@ def plot_param_error_ecdfs(
     kind="relative",
     cut_quantile=None,
 ):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import os
+
     os.makedirs(out_dir, exist_ok=True)
 
     if cut_quantile is not None:
         assert 0 < cut_quantile <= 1
 
+    n_models = len(results)
+    add_diff = (n_models == 2)
+
     # -------- collect data --------
     param_sets, rmses_sets = [], []
     for r in results:
         rmses_sets.append(r.get("rmses", []))
+
         if kind == "absolute":
             param_sets.append(r["per_param_abs_errors"])
         else:
-            for key in ["per_param_rel_errors", "per_param_errors"]:
-                if key in r:
-                    param_sets.append(r[key])
-                    break
+            if "per_param_rel_errors" in r:
+                param_sets.append(r["per_param_rel_errors"])
+            else:
+                param_sets.append(r["per_param_errors"])
 
     all_param_names = _extract_param_names_consistent(results)
     num_params = len(all_param_names)
 
-    # -------- layout: parameters + 1 rmse panel --------
+    # -------- layout: parameters + RMSE panel --------
     total_plots = num_params + 1
     ncols = min(4, num_params)
     nrows = int(np.ceil(total_plots / ncols))
@@ -879,7 +887,7 @@ def plot_param_error_ecdfs(
     for i, param in enumerate(all_param_names):
         ax = axes[i // ncols, i % ncols]
 
-        curves = []
+        curves = []  # store (ys, xs_scaled)
         for data, label in zip(param_sets, labels):
             if param not in data:
                 curves.append(None)
@@ -891,33 +899,41 @@ def plot_param_error_ecdfs(
             curves.append((ys, xs_scaled))
             ax.plot(ys, xs_scaled, label=label)
 
-        # differences (1st model = baseline)
-        ref = curves[0]
-        if ref is not None:
-            ys_ref, xs_ref = ref
-            for (entry, label) in zip(curves, labels):
-                if entry is None or entry is ref:
-                    continue
+        # ----- optional: difference curve -----
+        if add_diff:
+            ref = curves[0]
+            other = curves[1]
 
-                ys_i, xs_i = entry
+            if ref is not None and other is not None:
+                ys_ref, xs_ref = ref
+                ys_i, xs_i = other
+
+                # Interpolate other onto ref-ys grid
                 xs_i_interp = np.interp(ys_ref, ys_i, xs_i)
                 diff = xs_i_interp - xs_ref
 
                 ax.plot(
-                    ys_ref, diff,
-                    linestyle="--", linewidth=1.0, alpha=0.8,
-                    label=f"{label} – {labels[0]}"
+                    ys_ref,
+                    diff,
+                    linestyle="--",
+                    linewidth=1.0,
+                    alpha=0.8,
+                    label=f"{labels[1]} – {labels[0]} (Δ)"
                 )
 
         ax.set_title(param, fontsize=13)
-        ax.set_xlabel("Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else ""))
-        ax.set_ylabel(f"{kind.title()} Error" + (" [%]" if kind == "relative" else ""))
+        ax.set_xlabel(
+            "Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else "")
+        )
+        ax.set_ylabel(
+            f"{kind.title()} Error" + (" [%]" if kind == "relative" else "")
+        )
 
         if i == 0:
             ax.legend(frameon=True, loc="upper left")
 
     # --------------------------
-    #  RMSE PANEL (last cell)
+    #  RMSE PANEL
     # --------------------------
     ax_rmse = axes[num_params // ncols, num_params % ncols]
 
@@ -931,34 +947,36 @@ def plot_param_error_ecdfs(
         rmse_curves.append((ys, xs))
         ax_rmse.plot(ys, xs, label=label)
 
-    # Differences
-    ref = rmse_curves[0]
-    if ref is not None:
-        ys_ref, xs_ref = ref
-
-        for (entry, label) in zip(rmse_curves, labels):
-            if entry is None or entry is ref:
-                continue
-
-            ys_i, xs_i = entry
+    # optional difference curve
+    if add_diff:
+        ref = rmse_curves[0]
+        other = rmse_curves[1]
+        if ref is not None and other is not None:
+            ys_ref, xs_ref = ref
+            ys_i, xs_i = other
             xs_i_interp = np.interp(ys_ref, ys_i, xs_i)
             diff = xs_i_interp - xs_ref
 
             ax_rmse.plot(
-                ys_ref, diff,
-                linestyle="--", linewidth=1.0, alpha=0.8,
-                label=f"{label} – {labels[0]}"
+                ys_ref,
+                diff,
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.8,
+                label=f"{labels[1]} – {labels[0]} (Δ)"
             )
 
     ax_rmse.set_title("RMSE", fontsize=13)
-    ax_rmse.set_xlabel("Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else ""))
-    ax_rmse.set_ylabel("RMSE / Δ RMSE")
-    ax_rmse.legend(frameon=True, loc="upper left")
+    ax_rmse.set_xlabel(
+        "Quantiles" + (f" (cut @ {cut_quantile:.2%})" if cut_quantile else "")
+    )
+    ax_rmse.set_ylabel("RMSE")
 
-    # Turn off possible unused subplots
+    # Turn off unused subplots
     for idx in range(total_plots, nrows * ncols):
         axes[idx // ncols, idx % ncols].axis("off")
 
+    # Title
     _tight_suptitle(fig, f"Parameter {kind.title()} Errors + RMSE (ECDFs)")
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
@@ -972,109 +990,9 @@ def plot_param_error_ecdfs(
 
 
 
+
+
 import os, numpy as np, matplotlib.pyplot as plt, copy
-
-def apply_structured_noise(iv_surface, sigma=0.01, mode="both"):
-    """Apply structured multiplicative noise (row/col/both) to an IV surface."""
-    noisy = iv_surface.copy()
-    nT, nK = iv_surface.shape
-    if mode in ["row", "both"]:
-        row_factors = 1 + np.random.normal(0, sigma, size=nT)
-        noisy *= row_factors[:, None]
-    if mode in ["col", "both"]:
-        col_factors = 1 + np.random.normal(0, sigma, size=nK)
-        noisy *= col_factors[None, :]
-    return noisy
-
-
-def compare_model_robustness(
-    models,
-    model_labels,
-    surfaces,
-    noise_levels=(0.001, 0.002, 0.005, 0.01, 0.02),
-    n_real=10,
-    out_dir="robustness_comparison",
-    mode="both",
-):
-    """Compare robustness of multiple models under structured IV perturbations."""
-    os.makedirs(out_dir, exist_ok=True)
-    eps = 1e-8
-    colors = plt.cm.tab10.colors
-
-    n_knots = len(surfaces[0]["params"]["xi0_knots"])
-    param_names = ["eta", "rho", "H"] + [f"xi0_{i+1}" for i in range(n_knots)]
-
-    # sort using same rule as ECDFs
-    param_names = sorted(
-        param_names,
-        key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", s)],
-    )
-
-    stats = []
-    for model, label in zip(models, model_labels):
-        mean_err = {p: [] for p in param_names}
-        low_q = {p: [] for p in param_names}
-        high_q = {p: [] for p in param_names}
-
-        for sigma in noise_levels:
-            rel_errs_lvl = {p: [] for p in param_names}
-            for s in surfaces:
-                base = model.calibrate(s, optimiser="levenberg-marquardt")["theta_hat"]
-                for _ in range(n_real):
-                    s_noisy = copy.deepcopy(s)
-                    if sigma > 0:
-                        s_noisy["iv_surface"] = apply_structured_noise(s["iv_surface"], sigma, mode)
-                    noisy = model.calibrate(s_noisy, optimiser="levenberg-marquardt")["theta_hat"]
-                    for i, p in enumerate(param_names):
-                        rel = abs(noisy[i] - base[i]) / (abs(base[i]) + eps)
-                        rel_errs_lvl[p].append(rel)
-
-            for p in param_names:
-                errs = np.array(rel_errs_lvl[p])
-                mean_err[p].append(np.mean(errs))
-                low_q[p].append(np.quantile(errs, 0.05))
-                high_q[p].append(np.quantile(errs, 0.95))
-
-        stats.append({"label": label, "mean": mean_err, "low": low_q, "high": high_q})
-
-    # Plot layout
-    n_params = len(param_names)
-    ncols = min(4, n_params)
-    nrows = int(np.ceil(n_params / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows), squeeze=False)
-
-    for i, pname in enumerate(param_names):
-        ax = axes[i // ncols, i % ncols]
-        for mi, s in enumerate(stats):
-            mean = np.array(s["mean"][pname])
-            lo = np.array(s["low"][pname])
-            hi = np.array(s["high"][pname])
-            c = colors[mi % len(colors)]
-            ax.plot(noise_levels, mean, color=c, lw=2, label=s["label"])
-            ax.plot(noise_levels, lo, color=c, ls="--", lw=1)
-            ax.plot(noise_levels, hi, color=c, ls="--", lw=1)
-        #ax.set_xscale("symlog", linthresh=1e-4)
-        ax.set_xlabel("Noise Std")
-        ax.set_ylabel(f"Rel |Δ{pname}|")
-        ax.set_title(pname)
-        if i == 0:
-            ax.legend(frameon=True, loc="upper left")
-
-    for j in range(i + 1, nrows * ncols):
-        axes[j // ncols, j % ncols].axis("off")
-    # X-Ticks styling
-    for ax in axes.flat:
-        ax.set_xticks(noise_levels)
-        ax.set_xticklabels([f"{x:.3g}" for x in noise_levels], rotation=45, ha="right")
-
-    _tight_suptitle(fig, "Model Robustness Comparison under IV Perturbations")
-    path = os.path.join(out_dir, "robustness_comparison.png")
-    plt.savefig(path, dpi=200)
-    plt.close(fig)
-    print(f"Saved comparison plot to {path}")
-
-    return stats
-
 import numpy as np
 import matplotlib.pyplot as plt
 import os
@@ -1254,68 +1172,115 @@ def prepare_df(res_list, name, PARAM_NAMES):
     return df
 
 
-def plot_param_grid(deeponet_res, mlp_res, PARAM_NAMES):
+def plot_param_grid(results, labels, PARAM_NAMES, out_dir=None):
+    """
+    Plot time-series of parameter estimates, RMSE, and runtime
+    for ANY number of models.
 
-    # Build dfs
-    df_deep = prepare_df(deeponet_res, "DeepONet",PARAM_NAMES)
-    df_mlp  = prepare_df(mlp_res, "MLP",PARAM_NAMES)
+    results: list of result dicts (each like output from evaluate_calibrate)
+    labels:  list of model names, same length as results
+    PARAM_NAMES: list of param names in correct order
+    """
 
-    df = pd.concat([df_deep, df_mlp], ignore_index=True)
-    # IMPORTANT: sort chronologically
+    # ---------- Build DataFrame ----------
+    dfs = []
+    for res, name in zip(results, labels):
+        df_sub = prepare_df(res, name, PARAM_NAMES)
+        dfs.append(df_sub)
+
+    df = pd.concat(dfs, ignore_index=True)
     df = df.sort_values("date")
 
+    # ---------- Model list ----------
+    model_names = df["model"].unique().tolist()
 
+    # ---------- Layout ----------
     param_cols = PARAM_NAMES
     n_params = len(param_cols)
 
-    # Grid size (parameters + 2 rows: RMSE + runtime)
-    rows = math.ceil(n_params / 2) + 1
+    # Grid: 2 columns for parameters
     cols = 2
+    rows = math.ceil(n_params / cols) + 1  # +1 for RMSE & Runtime panel
 
-    fig, axes = plt.subplots(rows, cols, figsize=(12, rows * 3))
+    fig, axes = plt.subplots(rows, cols, figsize=(12, rows * 3), squeeze=False)
     axes = axes.flatten()
 
-    # ---- Parameter Plots ----
+    # Colors per model
+    color_cycle = plt.cm.tab10.colors
+    model_to_color = {m: color_cycle[i % len(color_cycle)] for i, m in enumerate(model_names)}
+
+    # ---------- Parameter plots ----------
     for idx, p in enumerate(param_cols):
         ax = axes[idx]
-        for model, sub in df.groupby("model"):
-            ax.plot(sub["date"], sub[p], marker="o", label=model)
+
+        for model in model_names:
+            sub = df[df["model"] == model]
+            if p in sub.columns:
+                ax.plot(
+                    sub["date"], sub[p],
+                    marker="o",
+                    label=model if idx == 0 else None,
+                    color=model_to_color[model]
+                )
+
         ax.set_title(p)
         ax.set_xlabel("Date")
         ax.set_ylabel("Value")
         ax.grid(True)
 
-        # Legend nur in erstem Parameter-Plot
-        if idx == 0:
-            ax.legend()
+    # Add legend only once
+    axes[0].legend(frameon=True)
 
-    # ---- RMSE ----
+    # ---------- RMSE ----------
     rmse_ax = axes[n_params]
-    for model, sub in df.groupby("model"):
-        rmse_ax.plot(sub["date"], sub["rmse"], marker="o", label=model)
+    for model in model_names:
+        sub = df[df["model"] == model]
+        rmse_ax.plot(
+            sub["date"], sub["rmse"],
+            marker="o",
+            color=model_to_color[model],
+            label=model
+        )
+
     rmse_ax.set_title("RMSE over Time")
     rmse_ax.set_xlabel("Date")
     rmse_ax.set_ylabel("RMSE")
     rmse_ax.grid(True)
-    #rmse_ax.legend()
 
-    # ---- Runtime ----
+    # ---------- Runtime ----------
     runtime_ax = axes[n_params + 1]
-    for model, sub in df.groupby("model"):
-        runtime_ax.plot(sub["date"], sub["runtime_ms"], marker="o", label=model)
+    for model in model_names:
+        sub = df[df["model"] == model]
+        runtime_ax.plot(
+            sub["date"], sub["runtime_ms"],
+            marker="o",
+            color=model_to_color[model],
+            label=model
+        )
+
     runtime_ax.set_title("Calibration Runtime (ms)")
     runtime_ax.set_xlabel("Date")
     runtime_ax.set_ylabel("Runtime [ms]")
+    runtime_ax.set_yscale("log")
     runtime_ax.grid(True)
-    #runtime_ax.legend()
+
+    # ---------- Turn off unused axes ----------
+    for j in range(n_params + 2, len(axes)):
+        axes[j].axis("off")
 
     plt.tight_layout()
-    plt.show()
 
-    # ---- Print average runtimes ----
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "param_grid_plot.png")
+        plt.savefig(path, dpi=200)
+        print(f"Saved plot to {path}")
+    else:
+        plt.show()
+
+    # ---------- Print summaries ----------
     print("\nAverage Calibration Runtime (ms):")
     print(df.groupby("model")["runtime_ms"].mean())
 
-    # ---- Print average RMSE ----
     print("\nAverage RMSE:")
     print(df.groupby("model")["rmse"].mean())
