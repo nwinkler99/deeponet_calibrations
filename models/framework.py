@@ -1020,10 +1020,29 @@ class BaseModel(nn.Module):
             return diff
 
         def rmse_objective(x_phys):
-            res = residuals(x_phys)
-            val = np.sqrt(np.mean(res**2))
+            iv_pred = self._heston_iv_surface_quantlib(
+                x_phys,
+                Ks_log=Ks_log,
+                Ts_log=Ts_log,
+                S0=S0,
+                r=r,
+                q=q,
+                mask_2d=mask_np,
+                dtype=np.float64,
+            )
+
+            pred_flat = iv_pred.reshape(-1)
+            diff = pred_flat[mask_flat] - true_masked
+
+            if weights_masked is not None:
+                w = weights_masked ** 2     # <- hier brauchst du das echte w, NICHT sqrt(w)
+                sq = w * (diff ** 2)
+                val = np.sqrt(np.sum(sq) / np.sum(w))
+            else:
+                val = np.sqrt(np.mean(diff**2))
             if not np.isfinite(val):
                 return 1e6
+
             return val
 
         t0 = time.perf_counter()
@@ -1167,7 +1186,7 @@ class BaseModel(nn.Module):
         a masked (optionally weighted) L2-error (RMSE up to normalization).
 
         - Ignores NaNs in `iv_surface`.
-        - Supports optional `weights` on the same grid (e.g. sqrt(volume+1)).
+        - Supports optional root-`weights` on the same grid (e.g. sqrt(volume+1)).
         """
         import time
         import numpy as np
@@ -1220,7 +1239,12 @@ class BaseModel(nn.Module):
             pred_flat = pred.reshape(-1)
             diff = pred_flat[mask_flat] - true_masked
 
-            val = np.sqrt(np.mean(diff**2))
+            if weights_masked is not None:
+                w = weights_masked ** 2     # <- hier brauchst du das echte w, NICHT sqrt(w)
+                sq = w * (diff ** 2)
+                val = np.sqrt(np.sum(sq) / np.sum(w))
+            else:
+                val = np.sqrt(np.mean(diff**2))
             if not np.isfinite(val):
                 return 1e6
             return val

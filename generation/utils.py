@@ -518,7 +518,7 @@ def build_market_surfaces(df):
         log_strikes = strikes.astype(np.float32)
 
         # volume weights (NaNs preserved!)
-        weights = np.sqrt(vol_surface).astype(np.float32)
+        weights = np.sqrt(np.log(vol_surface+1)).astype(np.float32)
 
         output.append({
             "symbol": symbol,
@@ -1242,7 +1242,7 @@ def plot_param_grid(results, labels, PARAM_NAMES, out_dir=None):
             label=model
         )
 
-    rmse_ax.set_title("RMSE over Time")
+    rmse_ax.set_title("Weighted RMSE over Time")
     rmse_ax.set_xlabel("Date")
     rmse_ax.set_ylabel("RMSE")
     rmse_ax.grid(True)
