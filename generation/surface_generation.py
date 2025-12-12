@@ -25,11 +25,8 @@ from .utils import (
     bs_call_vec_pathwise,
     bs_put_vec_pathwise,
     sample_param_sets_lhs,
-    lhs_grid,
-    heston_call_price,
-    heston_put_price
+    lhs_grid
 )
-
 
 # -------------------------------------------------------------
 # Parameter structures
@@ -151,13 +148,15 @@ def generate_surfaces_rbergomi(
     randomize_grid: bool = False
 ) -> List[Dict]:
     """
-    Deterministic generation of implied-volatility surfaces from rBergomi model.
+    Deterministic generation of implied-volatility surfaces from the rBergomi model
+    in money-market-deflated units.
 
-    Every stochastic element (param LHS, xi0, rBergomi paths, jitter grids)
-    is driven by explicitly controlled RNGs derived from one SeedSequence.
+    Important:
+    - All simulated prices S are deflated (discounted) prices 𝑆̃.
+    - All strikes K are interpreted as deflated strikes 𝑲̃.
+    - No interest rate r or discount factor appears anywhere in the simulation or pricing.
+    - Any nominal-to-deflated mapping (K → K/F₀(T)) must be performed outside this function.
     """
-    from generation.rbergomi import rBergomi, bs_call_vec_pathwise, bsinv, bs_vega  # adjust paths if needed
-
     results: List[Dict] = []
 
     # --- 1️⃣ Central deterministic seed hierarchy ---
@@ -314,7 +313,10 @@ def generate_surfaces_rbergomi(
                         I1 = I1_cum[:, t_idx - 1]
                         I2 = I2_cum[:, t_idx - 1]
 
-                    F_path = S0 * np.exp(cfg.dtype(rho) * I1 - cfg.dtype(0.5) * (cfg.dtype(rho) ** 2) * I2)
+                    S_def_T_path = S0 * np.exp(
+                        cfg.dtype(rho) * I1
+                        - cfg.dtype(0.5) * (cfg.dtype(rho) ** 2) * I2
+                    )
                     sigma_path = np.sqrt(
                         np.maximum((cfg.dtype(1.0) - cfg.dtype(rho) ** 2) * I2 / Tm, cfg.dtype(1e-16))
                     )
@@ -323,10 +325,10 @@ def generate_surfaces_rbergomi(
                         K_abs = K_ * S0
                         is_call = K_abs >= float(S0)
                         if is_call:
-                            cond_vals = bs_call_vec_pathwise(F_path, K_abs, T_float, sigma_path).astype( cfg.dtype)
+                            cond_vals = bs_call_vec_pathwise(S_def_T_path, K_abs, T_float, sigma_path).astype( cfg.dtype)
                             o_flag = "call"
                         else:
-                            cond_vals = bs_put_vec_pathwise(F_path, K_abs, T_float, sigma_path).astype( cfg.dtype)
+                            cond_vals = bs_put_vec_pathwise(S_def_T_path, K_abs, T_float, sigma_path).astype( cfg.dtype)
                             o_flag = "put"
 
                         price_cmc =  cfg.dtype(np.mean(cond_vals))

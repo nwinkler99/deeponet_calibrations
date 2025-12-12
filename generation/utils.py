@@ -71,7 +71,23 @@ def cov(a: float, n: int) -> np.ndarray:
 
 def bs(F: float, K: float, V: float, o: str = "call") -> float:
     """
-    Returns the Black call/put/otm price for given forward F, strike K, and integrated variance V.
+    Black option price in money-market-deflated (discounted) units.
+
+    Parameters
+    ----------
+    F : float
+        Deflated underlying value 𝑆̃ (often normalized, e.g. S̃₀ = 1).
+    K : float
+        Deflated strike 𝑲̃.
+    V : float
+        Integrated variance ∫₀ᵀ σ_t² dt.
+    o : str, optional
+        Option type: "call", "put", or "otm".
+
+    Notes
+    -----
+    - All quantities are interpreted in deflated (discounted) units.
+    - No interest rate or discount factor appears in this pricing formula.
     """
     # Set appropriate weight for option token o
     w = 1
@@ -88,8 +104,26 @@ def bs(F: float, K: float, V: float, o: str = "call") -> float:
 
 def bsinv(P: float, F: float, K: float, t: float, o: str = "call") -> float:
     """
-    Robust implied Black volatility from price P, forward F, strike K, maturity t.
-    Handles call/put/otm options; safe for MC-generated prices.
+    Robust implied Black volatility inversion in deflated units.
+
+    Parameters
+    ----------
+    P : float
+        Deflated option price.
+    F : float
+        Deflated underlying value 𝑆̃.
+    K : float
+        Deflated strike 𝑲̃.
+    t : float
+        Maturity in years.
+    o : str, optional
+        Option type: "call", "put", or "otm".
+
+    Notes
+    -----
+    - The inversion is performed entirely in money-market-deflated units.
+    - No interest rate or discount factor enters the inversion.
+    - Safe for Monte Carlo generated prices.
     """
     if t <= 1e-10:
         return 1e-8  # degenerate maturity
@@ -114,7 +148,25 @@ def bsinv(P: float, F: float, K: float, t: float, o: str = "call") -> float:
 
 
 def bs_vega(F: float, K: float, T: float, sigma: float) -> float:
-    """Black–Scholes vega (∂Price/∂Vol) with forward F, strike K, maturity T."""
+    """
+    Black vega (∂Price/∂Vol) in deflated units.
+
+    Parameters
+    ----------
+    F : float
+        Deflated underlying value 𝑆̃.
+    K : float
+        Deflated strike 𝑲̃.
+    T : float
+        Maturity in years.
+    sigma : float
+        Volatility level.
+
+    Notes
+    -----
+    - Vega is computed for the deflated Black pricing formula.
+    - No interest rate or discount factor is involved.
+    """
     if sigma <= 0 or T <= 0 or not np.isfinite(sigma) or F <= 0 or K <= 0:
         return np.nan
     d1 = (np.log(F / K) + 0.5 * sigma * sigma * T) / (sigma * np.sqrt(T))
@@ -122,13 +174,33 @@ def bs_vega(F: float, K: float, T: float, sigma: float) -> float:
 
 
 # --------------------------------------------------------------------------------------------------------
-# Pathwise Black–Scholes pricing for Monte Carlo
+# Pathwise Black pricing for Monte Carlo (deflated units)
 # --------------------------------------------------------------------------------------------------------
 
 def bs_call_vec_pathwise(F_path: np.ndarray, K_abs: float, T: float, sigma_path: np.ndarray) -> np.ndarray:
     """
-    Pathwise Black–Scholes call price with forward F_path (M,), strike K_abs (scalar),
-    maturity T, and per-path vol sigma_path (M,). Returns (M,).
+    Pathwise Black call price in money-market-deflated units.
+
+    Parameters
+    ----------
+    F_path : np.ndarray
+        Deflated terminal underlying values 𝑆̃_T along Monte Carlo paths.
+    K_abs : float
+        Deflated strike 𝑲̃.
+    T : float
+        Maturity in years.
+    sigma_path : np.ndarray
+        Pathwise conditional volatility.
+
+    Returns
+    -------
+    np.ndarray
+        Deflated call prices along each Monte Carlo path.
+
+    Notes
+    -----
+    - All inputs are interpreted in deflated (discounted) units.
+    - No interest rate or discount factor appears in the pricing.
     """
     eps = 1e-12
     Fp = np.maximum(F_path, eps)
@@ -139,7 +211,30 @@ def bs_call_vec_pathwise(F_path: np.ndarray, K_abs: float, T: float, sigma_path:
 
 
 def bs_put_vec_pathwise(F_path: np.ndarray, K_abs: float, T: float, sigma_path: np.ndarray) -> np.ndarray:
-    """Pathwise Black–Scholes put price under the forward measure."""
+    """
+    Pathwise Black put price in money-market-deflated units.
+
+    Parameters
+    ----------
+    F_path : np.ndarray
+        Deflated terminal underlying values 𝑆̃_T along Monte Carlo paths.
+    K_abs : float
+        Deflated strike 𝑲̃.
+    T : float
+        Maturity in years.
+    sigma_path : np.ndarray
+        Pathwise conditional volatility.
+
+    Returns
+    -------
+    np.ndarray
+        Deflated put prices along each Monte Carlo path.
+
+    Notes
+    -----
+    - All inputs are interpreted in deflated (discounted) units.
+    - No interest rate or discount factor appears in the pricing.
+    """
     eps = 1e-12
     Fp = np.maximum(F_path, eps)
     sig = np.maximum(sigma_path, eps)
@@ -171,209 +266,11 @@ def sample_param_sets_lhs(num_sets, rng, lower, upper):
     return scaled
 
 
-# ============================================================
-# HESTON PRICING (semi-close form, Gauss-Laguerre)
-# ============================================================
 
-# ----------------------------------------------------------
-# 1) Characteristic function (same as yours, but vectorized)
-# ----------------------------------------------------------
-# def heston_cf(u, tau, kappa, theta, sigma, rho, v0, r=0.0):
-#     """
-#     Vektorisierte CF: u kann array sein!
-#     """
-#     iu = 1j * u
-
-#     alpha = kappa - rho * sigma * iu
-#     beta  = sigma * sigma
-#     d = np.sqrt(alpha * alpha + beta * (u * u + iu))
-#     d = np.where(np.real(d) < 0, -d, d)
-#     g = (alpha - d) / (alpha + d)
-#     g = g / (1 + 1e-12)
-
-#     exp_dt = np.exp(-d * tau)
-#     one_minus_gexp = 1 - g * exp_dt
-
-#     C = (kappa * theta / beta) * ((alpha - d) * tau - 2 * np.log(one_minus_gexp / (1 - g)))
-#     D = ((alpha - d) / beta) * ((1 - exp_dt) / one_minus_gexp)
-
-#     return np.exp(C + D * v0 + iu * 0)   # Forward measure drift 0
-
-# LAGUERRE_X, LAGUERRE_W = np.polynomial.laguerre.laggauss(64)
-
-# def _fourier_probabilities(S0, K, tau, kappa, theta, v0, sigma, rho):
-#     """
-#     Vektorisierte Berechnung von P1 und P2.
-#     """
-#     x = LAGUERRE_X
-#     w = LAGUERRE_W
-
-#     phi = x          # Gauss-Laguerre-Knoten
-#     exp_x = np.exp(x)
-
-#     logS0 = np.log(S0)
-#     logK  = np.log(K)
-
-#     # -------- P1: u = phi - i ----------
-#     u1 = phi - 1j
-#     cf1 = heston_cf(u1, tau, kappa, theta, sigma, rho, v0)
-
-#     integrand1 = np.real(
-#         np.exp(1j * phi * (logS0 - logK)) * cf1 / (1j * phi)
-#     )
-#     P1 = 0.5 + (1/np.pi) * np.sum(w * exp_x * integrand1)
-
-#     # -------- P2: u = phi ----------
-#     u2 = phi
-#     cf2 = heston_cf(u2, tau, kappa, theta, sigma, rho, v0)
-
-#     integrand2 = np.real(
-#         np.exp(1j * phi * (logS0 - logK)) * cf2 / (1j * phi)
-#     )
-#     P2 = 0.5 + (1/np.pi) * np.sum(w * exp_x * integrand2)
-#     P1 = np.clip(P1, 0.0, 1.0)
-#     P2 = np.clip(P2, 0.0, 1.0)
-#     return P1, P2
-
-# def heston_call_price(S0, K, tau, params, r=0.0):
-#     kappa, theta, v0, sigma, rho = params
-
-#     if tau <= 0:
-#         return max(S0 - K, 0.0)
-
-#     P1, P2 = _fourier_probabilities(S0, K, tau, kappa, theta, v0, sigma, rho)
-
-#     call = S0 * P1 - K * np.exp(-r * tau) * P2
-
-#     # Preislogik
-#     call = np.clip(call, max(S0-K,0), S0)
-#     return call
-
-
-# def heston_put_price(S0, K, tau, params, r=0.0):
-#     kappa, theta, v0, sigma, rho = params
-
-#     if tau <= 0:
-#         return max(K - S0, 0.0)
-
-#     P1, P2 = _fourier_probabilities(S0, K, tau, kappa, theta, v0, sigma, rho)
-
-#     # Put-Formel (klassisch)
-#     put = K * np.exp(-r * tau) * (1 - P2) - S0 * (1 - P1)
-
-#     put = np.clip(put, max(K-S0, 0), K)
-#     return put
 
 
 import numpy as np
 import math
-
-def heston_cf(u, tau, kappa, theta, sigma, rho, v0, r=0.0):
-    """
-    Standard-Heston-Charfunktion unter Forward/RN-Maß (drift = r - q, hier r).
-    u: array oder scalar (Reell, aber komplexe Auswertung)
-    """
-    u = np.asarray(u, dtype=complex)
-
-    alpha = kappa - rho * sigma * 1j * u
-    beta  = sigma**2
-
-    d = np.sqrt(alpha**2 + beta * (u**2 + 1j*u))
-    g = (alpha - d) / (alpha + d)
-
-    exp_dt = np.exp(-d * tau)
-    num = 1 - g * exp_dt
-    den = 1 - g
-
-    # Numerik-Safeguards
-    num = np.where(num == 0, 1e-16 + 0j, num)
-    den = np.where(den == 0, 1e-16 + 0j, den)
-
-    C = (kappa * theta / sigma**2) * ((alpha - d) * tau - 2 * np.log(num / den))
-    D = (alpha - d) / sigma**2 * ((1 - exp_dt) / num)
-
-    return np.exp(C + D * v0 + 1j * u * 0.0)  # forward measure: drift ~ 0
-
-# Globale Laguerre-Knoten/Gewichte (64 reicht idR.)
-LAG_N = 64
-LAG_X, LAG_W = np.polynomial.laguerre.laggauss(LAG_N)
-
-def heston_call_price(S0, K, tau, params, r=0.0,
-                          x=LAG_X, w=LAG_W):
-    """
-    Vektorisierter Heston-Callpreis für EIN fixes tau, beliebig viele K.
-
-    S0: float
-    K:  float oder 1D-Array
-    tau: float (Maturity)
-    params: (kappa, theta, v0, sigma, rho)
-    """
-    kappa, theta, v0, sigma, rho = params
-
-    K = np.asarray(K, dtype=float)  # shape (m,)
-    tau = float(tau)
-
-    logS0 = math.log(S0)
-    logK  = np.log(K)               # (m,)
-
-    u = x                           # (n,)
-    weight = w * np.exp(x)          # (n,), Gauss–Laguerre-Korrektur
-
-    # ---------- P1 ----------
-    u1 = u - 1j
-    cf1 = heston_cf(u1, tau, kappa, theta, sigma, rho, v0, r)  # (n,)
-
-    # broadcast: (m,1) × (1,n)
-    u_col     = u[None, :]         # (1,n)
-    logK_col  = logK[:, None]      # (m,1)
-
-    f1 = np.real(
-        np.exp(1j * u_col * (logS0 - logK_col)) *
-        cf1[None, :] / (1j * u_col)
-    )                               # (m,n)
-
-    P1 = 0.5 + (weight * f1).sum(axis=1) / math.pi  # (m,)
-
-    # ---------- P2 ----------
-    u2  = u
-    cf2 = heston_cf(u2, tau, kappa, theta, sigma, rho, v0, r)  # (n,)
-
-    f2 = np.real(
-        np.exp(1j * u_col * (logS0 - logK_col)) *
-        cf2[None, :] / (1j * u_col)
-    )                               # (m,n)
-
-    P2 = 0.5 + (weight * f2).sum(axis=1) / math.pi  # (m,)
-
-    # ---------- Callpreis ----------
-    disc = math.exp(-r * tau)
-    call = S0 * P1 - K * disc * P2
-
-    # Numerische Safeguards
-    call = np.clip(call, 0.0, S0)
-
-    return call
-
-def heston_put_price(S0, K, tau, params, r=0.0,
-                         x=LAG_X, w=LAG_W):
-    """
-    Getrennte Put-Funktion, aber basierend auf Call via Put-Call-Parität.
-    """
-    K = np.asarray(K, dtype=float)
-    tau = float(tau)
-
-    call = heston_call_price(S0, K, tau, params, r, x, w)
-    disc = np.exp(-r * tau)
-
-    put = call - S0 + K * disc
-    put = np.clip(put, 0.0, K)   # Safeguard
-
-    return put
-
-
-
-
-
 
 from scipy.stats import qmc
 import numpy as np
