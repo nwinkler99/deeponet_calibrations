@@ -1,16 +1,15 @@
-- calculate jacobian sensitivity
+(feller condition for heston:  nicht mit reingenommen, nicht unbedingt nötig)
 
-Later:
-- build FNO
-- calibrate real data
+hybrid scheme genauer erklären
+
+kapitel 4 verbessern: woher kommt deeponet, wieso der gating layer?
+
+zinssätze laden, strikes diskontieren im real calibration teil
 
 
-fixed grid: 
-training time and accuracy on test data across K,T. 
 
-variable grid: 
-training time and accuracy on test data across irregular grids, but binned. 
-also inference speed on full and small grids in the numpy and pytorch variant
+
+
 
 
 

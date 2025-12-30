@@ -73,7 +73,7 @@ class SimulationConfig:
     heston_min_sigma = 0.5
     heston_max_sigma = 4
 
-    heston_min_rho = -1
+    heston_min_rho = -0.9999
     heston_max_rho = -0.1
 
     # -----------------------------
@@ -193,7 +193,8 @@ def generate_surfaces_rbergomi(
         dt = np.diff(t_grid, prepend=cfg.dtype(0.0)).astype(cfg.dtype)
 
         dW1, dW2 = rb.dW1(), rb.dW2()
-        dB, Y = rb.dB(dW1, dW2, rho=rho), rb.Y(dW1)
+        #dB= rb.dB(dW1, dW2, rho=rho), 
+        Y = rb.Y(dW1)
         dW_vol = dW1[..., 0] if dW1.ndim == 3 else dW1
         dW_vol = dW_vol.astype(cfg.dtype, copy=False)
         del dW1, dW2
@@ -236,7 +237,7 @@ def generate_surfaces_rbergomi(
 
             # simulate volatility & price paths
             V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=eta).astype(cfg.dtype)
-            S = rb.S(V, dB, S0=cfg.S0).astype(cfg.dtype)
+            #S = rb.S(V, dB, S0=cfg.S0).astype(cfg.dtype)
 
             # precompute cumulative integrals for conditional MC
             V_left = V[:, :-1].astype(cfg.dtype, copy=False)
@@ -299,7 +300,7 @@ def generate_surfaces_rbergomi(
 
                 for mi, Tm in enumerate(maturities_shifted):
                     t_idx = np.searchsorted(t_grid.astype(float), float(Tm), side="right") - 1
-                    t_idx = int(np.clip(t_idx, 0, S.shape[1] - 1))
+                    t_idx = int(np.clip(t_idx, 0, V.shape[1] - 1))
                     T_float = float(Tm)
                     if T_float <= 0:
                         iv_surf[mi, :], iv_relerr[mi, :] = np.nan, np.nan
@@ -461,6 +462,7 @@ def generate_heston_surfaces(
 
     for s, (params, set_seq) in enumerate(zip(param_sets, set_seqs)):
         kappa, theta, v0, sigma, rho = [float(x) for x in params]
+
 
         # QuantLib-Engine für dieses Parameterset
         engine, today, day_counter = _build_heston_engine(
@@ -636,12 +638,12 @@ def generate_fixed_surface(
     # --- 3. Draw Brownian motions ---
     t0 = time.perf_counter()
     dW1 = rb.dW1()
-    dW2 = rb.dW2()
+    #dW2 = rb.dW2()
     t_brown_time = time.perf_counter() - t0
 
     # --- 4. Correlated driver dB ---
     t0 = time.perf_counter()
-    dB = rb.dB(dW1, dW2, rho=float(rho))
+    #dB = rb.dB(dW1, dW2, rho=float(rho))
     t_dB_time = time.perf_counter() - t0
 
     # --- 5. fBM kernel convolution / Y computation ---
@@ -678,7 +680,7 @@ def generate_fixed_surface(
     # ----------------- 3. Path simulation (V, S) -----------------
     t0 = time.perf_counter()
     V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=float(eta)).astype(dtype)
-    S = rb.S(V, dB, S0=dtype(cfg.S0)).astype(dtype)
+    #S = rb.S(V, dB, S0=dtype(cfg.S0)).astype(dtype)
     sim_paths_time = time.perf_counter() - t0
 
     # ----------------- 4. Conditional MC setup -----------------
@@ -702,10 +704,9 @@ def generate_fixed_surface(
 
     inv_time_total = 0.0
     for mi, Tm in enumerate(maturities):
-        t_m_start = time.perf_counter()
 
         t_idx = np.searchsorted(t_grid, float(Tm), side="right") - 1
-        t_idx = int(np.clip(t_idx, 0, S.shape[1] - 1))
+        t_idx = int(np.clip(t_idx, 0, V.shape[1] - 1))
         T_float = float(Tm)
         if T_float <= 0:
             continue

@@ -317,48 +317,93 @@ def lhs_grid(start, end, n, rng, min_spacing=0.02):
     return grid
 
 
-def preprocess_and_filter_otm(df):
-    # --- Datum parsen
+import numpy as np
+import pandas as pd
+
+
+def load_effr_rates_csv(path: str) -> pd.DataFrame:
+    """
+    Reads a CSV with columns: observation_date,EFFR
+    EFFR is in percent (e.g. 1.55), may contain missing values (e.g. holidays).
+    Returns DataFrame with columns: date, effr (decimal).
+    """
+    rates = pd.read_csv(path)
+    rates.columns = rates.columns.str.strip()
+
+    rates["date"] = pd.to_datetime(rates["observation_date"])
+    rates["effr"] = pd.to_numeric(rates["EFFR"], errors="coerce") / 100.0  # percent -> decimal
+    rates = rates.sort_values("date")
+
+    # forward fill missing rates (e.g., holidays) using last available business day
+    rates["effr"] = rates["effr"].ffill()
+
+    return rates[["date", "effr"]]
+
+
+def preprocess_and_filter_otm(df: pd.DataFrame,
+                                       rates: pd.DataFrame,
+                                       q: float = 0.016) -> pd.DataFrame:
+    """
+    Uses EFFR as r(t) and a constant dividend yield q to approximate
+    F(T) = S0 * exp((r - q) * T). Then builds log-forward-moneyness.
+    """
+
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+
+    # Parse dates
     df["date"] = pd.to_datetime(df["date"])
     df["expiration"] = pd.to_datetime(df["expiration"])
 
-    # --- Maturity in Jahren
+    # Maturity in years
     df["maturity"] = (df["expiration"] - df["date"]).dt.days / 365.0
 
-    # --- Spot, der für die IV verwendet wurde
-    df["S0"] = df["stock price for iv"].astype(float)
+    # Numerics
+    df["S0"] = pd.to_numeric(df["stock price for iv"], errors="coerce")
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df["iv"] = pd.to_numeric(df["iv"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
 
-    # --- Strike als float
-    df["strike"] = df["strike"].astype(float)
+    # Clean early
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["S0", "strike", "iv", "maturity"])
+    df = df[(df["iv"] > 0) & (df["maturity"] > 0)]  # your file uses iv=-1 for missing
 
-    # --- IV als float
-    df["iv"] = df["iv"].astype(float)
+    # Join rates (last available <= date)
+    df = df.sort_values("date")
+    rates = rates.sort_values("date")
+    df = pd.merge_asof(df, rates, on="date", direction="backward")
 
-    # --------------------------------------------------
-    # --- OTM FILTER
-    # --------------------------------------------------
-    # OTM Call: strike > S0  AND call/put == "C"
-    otm_calls = (df["call/put"] == "C") & (df["strike"] > df["S0"])
+    # If some early dates precede first rate row, you can backfill once
+    df["effr"] = df["effr"].bfill()
 
-    # OTM Put: strike < S0  AND call/put == "P"
-    otm_puts = (df["call/put"] == "P") & (df["strike"] < df["S0"])
+    # Forward approximation
+    df["F"] = df["S0"] * np.exp((df["effr"] - q) * df["maturity"])
 
+    # OTM relative to forward
+    otm_calls = (df["call/put"] == "C") & (df["strike"] > df["F"])
+    otm_puts  = (df["call/put"] == "P") & (df["strike"] < df["F"])
     df = df[otm_calls | otm_puts].copy()
 
-    # --------------------------------------------------
-    # --- Log-Moneyness
-    # --------------------------------------------------
-    df["log_moneyness"] = np.log(df["strike"] / df["S0"])
-    df["log_maturity"] = np.log(df["maturity"] )
-    # --------------------------------------------------
-    # --- Ungültige Werte entfernen
-    # --------------------------------------------------
-    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["iv", "maturity", "log_moneyness"])
-    df = df[(df["volume"]>100) & (df["maturity"]>25/365) & (df["maturity"]<2)&(df["log_moneyness"]>-0.4)&(df["log_moneyness"]<0.4)]
-    # --------------------------------------------------
-    # --- Output
-    # --------------------------------------------------
-    return df[["symbol","exchange","date","expiration","iv", "maturity","log_maturity", "log_moneyness", "volume", "strike", "S0"]]
+    # Log coordinates
+    df["log_moneyness"] = np.log(df["strike"] / df["F"])
+    df["log_maturity"] = np.log(df["maturity"])
+
+    # Final clean + your filters
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["iv", "maturity", "log_moneyness", "log_maturity"])
+    df = df[
+        (df["volume"] > 100)
+        & (df["maturity"] > 25 / 365)
+        & (df["maturity"] < 2)
+        & (df["log_moneyness"] > -0.4)
+        & (df["log_moneyness"] < 0.4)
+    ]
+
+    return df[[
+        "symbol", "exchange", "date", "expiration", "iv",
+        "maturity", "log_maturity", "log_moneyness",
+        "volume", "strike", "S0", "F", "effr"
+    ]]
+
 
 
 def build_market_surfaces(df):
@@ -874,7 +919,7 @@ def plot_param_error_ecdfs(
         axes[idx // ncols, idx % ncols].axis("off")
 
     # Title
-    _tight_suptitle(fig, f"Parameter {kind.title()} Errors + RMSE (ECDFs)")
+    #_tight_suptitle(fig, f"Parameter {kind.title()} Errors + RMSE (ECDFs)")
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     out_path = os.path.join(out_dir, f"param_and_rmse_ecdfs_{kind}.png")
@@ -884,6 +929,127 @@ def plot_param_error_ecdfs(
     print(f"Saved combined ECDF comparison to {out_path}")
 
 
+def plot_grid_median_comparison(
+    cal_evals,
+    labels,
+    out_dir,
+    strikes,
+    maturities,
+    field="pred_rel",
+    stat="median",
+    fname=None,
+    unit="%",
+):
+    """
+    Compare two models' grid statistics (typically median errors) in a 1x3 plot:
+      col1: model 1
+      col2: model 2
+      col3: difference (model1 - model2)
+
+    Parameters
+    ----------
+    cal_evals : list
+        List with exactly two evaluation dicts, e.g. [deeponet_cal_eval, mlp_cal_eval].
+        Each dict must contain cal_eval[field][stat] as a 2D array of shape (nT, nK).
+    labels : list
+        Two labels for the models, e.g. ["DeepONet", "MLP (bil. interp.)"].
+    out_dir : str
+        Output directory where the figure is saved.
+    strikes : array-like
+        Strike grid (x-axis), e.g. deeponet_loaded.strikes.
+    maturities : array-like
+        Maturity grid (y-axis), e.g. deeponet_loaded.maturities.
+    field : str
+        Key under which the binned stats are stored (default: "pred_rel").
+    stat : str
+        Statistic name to plot (default: "median").
+    fname : str or None
+        Output filename. If None, a default is created from field/stat.
+    unit : str
+        Colorbar label unit (default: "%").
+    """
+    if not isinstance(cal_evals, (list, tuple)) or len(cal_evals) != 2:
+        raise ValueError("cal_evals must be a list/tuple of length 2.")
+    if not isinstance(labels, (list, tuple)) or len(labels) != 2:
+        raise ValueError("labels must be a list/tuple of length 2.")
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Extract grids
+    e1, e2 = cal_evals
+    try:
+        A = np.asarray(e1[field][stat], dtype=np.float32)
+        B = np.asarray(e2[field][stat], dtype=np.float32)
+    except Exception as exc:
+        raise KeyError(
+            f"Expected eval dict structure eval[field][stat], got field='{field}', stat='{stat}'."
+        ) from exc
+
+    if A.shape != B.shape:
+        raise ValueError(f"Grid shapes differ: {A.shape} vs {B.shape}")
+
+    strikes = np.asarray(strikes, dtype=np.float32)
+    maturities = np.asarray(maturities, dtype=np.float32)
+
+    if A.shape != (len(maturities), len(strikes)):
+        raise ValueError(
+            f"Grid shape {A.shape} does not match (len(maturities), len(strikes))="
+            f"({len(maturities)}, {len(strikes)})"
+        )
+
+    D = A - B  # difference of medians
+
+    # Mesh
+    Ks_mesh, Ts_mesh = np.meshgrid(strikes, maturities, indexing="xy")
+
+    # Use shared limits for fair comparison in col1/col2
+    vmin = float(np.nanmin([np.nanmin(A), np.nanmin(B)]))
+    vmax = float(np.nanmax([np.nanmax(A), np.nanmax(B)]))
+
+    # Symmetric limits for diff
+    dmax = float(np.nanmax(np.abs(D)))
+    if not np.isfinite(dmax) or dmax == 0.0:
+        dmax = 1.0
+    dvmin, dvmax = -dmax, dmax
+
+    if fname is None:
+        fname = f"{field}_{stat}_comparison.png"
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # Col 1: Model 1
+    im0 = axes[0].pcolormesh(Ks_mesh, Ts_mesh, A, shading="auto", cmap="magma", vmin=vmin, vmax=vmax)
+    axes[0].set_title(labels[0])
+    axes[0].set_xlabel("Strike (K)")
+    axes[0].set_ylabel("Maturity (T)")
+    axes[0].invert_yaxis()
+    fig.colorbar(im0, ax=axes[0], label=unit)
+
+    # Col 2: Model 2
+    im1 = axes[1].pcolormesh(Ks_mesh, Ts_mesh, B, shading="auto", cmap="magma", vmin=vmin, vmax=vmax)
+    axes[1].set_title(labels[1])
+    axes[1].set_xlabel("Strike (K)")
+    axes[1].set_ylabel("Maturity (T)")
+    axes[1].invert_yaxis()
+    fig.colorbar(im1, ax=axes[1], label=unit)
+
+    # Col 3: Difference
+    im2 = axes[2].pcolormesh(Ks_mesh, Ts_mesh, D, shading="auto", cmap="RdBu_r", vmin=dvmin, vmax=dvmax)
+    axes[2].set_title(f"Difference ({labels[0]} - {labels[1]})")
+    axes[2].set_xlabel("Strike (K)")
+    axes[2].set_ylabel("Maturity (T)")
+    axes[2].invert_yaxis()
+    fig.colorbar(im2, ax=axes[2], label=unit)
+
+    title = (
+    f"Median Relative IV Error across Strike–Maturity Grid\n"
+    f"{labels[0]} vs. {labels[1]} (and Difference)"
+    )
+    #fig.suptitle(title, fontsize=14, y=1.05)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(os.path.join(out_dir, fname), dpi=200)
+    plt.close(fig)
 
 
 
