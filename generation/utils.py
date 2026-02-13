@@ -391,11 +391,30 @@ def preprocess_and_filter_otm(df: pd.DataFrame,
     # Final clean + your filters
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["iv", "maturity", "log_moneyness", "log_maturity"])
     df = df[
-        (df["volume"] > 100)
-        & (df["maturity"] > 25 / 365)
-        & (df["maturity"] < 2)
-        & (df["log_moneyness"] > -0.4)
-        & (df["log_moneyness"] < 0.4)
+    # --- Maturity window ---
+    (df["maturity"] > 25 / 365)
+    & (df["maturity"] < 2.0)
+
+    # --- Moneyness window ---
+    & (df["log_moneyness"] > -0.4)
+    & (df["log_moneyness"] < 0.4)
+
+    # --- Liquidity ---
+    & ((df["volume"] > 100) | (df["open interest"] > 1000))
+
+    # --- Valid quotes ---
+    & (df["bid"] > 0)
+    & (df["ask"] > 0)
+    & (df["ask"] >= df["bid"])
+
+    # --- Spread control ---
+    & ((df["ask"] - df["bid"]) / df["price"] < 0.05)
+
+    # --- Price sanity ---
+
+    # --- IV sanity ---
+    & (df["iv"] > 0.01)
+    & (df["iv"] < 3.0)
     ]
 
     return df[[

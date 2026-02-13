@@ -1,10 +1,10 @@
-(feller condition for heston:  nicht mit reingenommen, nicht unbedingt nötig)
 
-hybrid scheme genauer erklären
 
 kapitel 4 verbessern: woher kommt deeponet, wieso der gating layer?
 
-zinssätze laden, strikes diskontieren im real calibration teil
+MLP genauer erklären
+
+Heston Pricing erklären
 
 
 
@@ -13,157 +13,33 @@ zinssätze laden, strikes diskontieren im real calibration teil
 
 
 
-FILTER DEEPONET MODEL:
+
+
+
+
+
+
+
+
+
+
+
 
 # ============================================================
 # Usage Notes (example)
 # ============================================================
 #DeepONet (with internal scaling):
-deeponet_model, train_loader, val_loader, Ks, Ts = DeepONet.from_surfaces(deeponet_training, mask_type="contextual",
-    batch_size=8*11*11, val_split=0.2, latent_dim=64, branch_hidden_dims=(64, 64), trunk_hidden_dims=(64,64), ref_strikes = np.array([0.5, 0.6, 0.7, 0.8, 0.9, 1. , 1.1, 1.2, 1.3, 1.4, 1.5]), ref_maturities= np.array([0.1, 0.3, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1]))
-deeponet_model.train_model(train_loader, val_loader, epochs=30, lr_schedule=[(0,0.001),(20,0.0001), (25, 0.00001)])
+deeponet_model, train_loader, val_loader = DeepONet.from_surfaces(
+    deeponet_training, mask_type="contextual", shuffle_training_batches=False,
+    batch_size=8*15*15, val_split=0.1, latent_dim=64, branch_hidden_dims=(64, 64),
+    trunk_hidden_dims=(64,64), ref_strikes = mlp_training[0]["grid"]["strikes"], ref_maturities= mlp_training[0]["grid"]["maturities"])
 print("DeepONet Model param counts: ",deeponet_model.count_parameters())
-# fig = model.plot_evaluation(test_surfaces[0])
-deeponet_eval = deeponet_model.evaluate(test_data, out_dir="deeponet_eval")
 
-Epoch 035 | train_rmse=0.027766, val_rmse=0.026923, lr=1.0e-04, time=114.21s, ETA=9.67 min
-→ Adjusted learning rate to 1.00e-05 at epoch 35
-                                                               
-Epoch 036 | train_rmse=0.027291, val_rmse=0.026287, lr=1.0e-05, time=110.83s, ETA=7.73 min
-                                                               
-Epoch 037 | train_rmse=0.027262, val_rmse=0.026279, lr=1.0e-05, time=111.62s, ETA=5.79 min
-                                                               
-Epoch 038 | train_rmse=0.027254, val_rmse=0.026274, lr=1.0e-05, time=109.83s, ETA=3.85 min
-                                                               
-Epoch 039 | train_rmse=0.027249, val_rmse=0.026271, lr=1.0e-05, time=111.74s, ETA=1.93 min
-                                                               
-Epoch 040 | train_rmse=0.027245, val_rmse=0.026269, lr=1.0e-05, time=109.98s, ETA=0.00 min
+deeponet_model.train_model(train_loader, val_loader, epochs=20, lr_schedule=[(0,0.001),(13,0.0001), (18, 0.00001)])
 
-✅ Training completed in 76.92 min (avg 115.38s per epoch)
-Model exported to exports\deeponet_final.json
-DeepONet Model param counts:  30208
-
-→ Final avg time: 140.4 ms, mean RMSE=0.00111
-
-Relative Errors per Parameter:
-   eta      | mean=1.634% | median=0.951% | std=2.543%
-   rho      | mean=1.820% | median=1.093% | std=2.335%
-   H        | mean=6.218% | median=3.318% | std=10.122%
-   xi0_0    | mean=3.722% | median=1.327% | std=6.813%
-   xi0_1    | mean=5.702% | median=2.688% | std=9.618%
-   xi0_2    | mean=11.671% | median=4.273% | std=27.483%
-   xi0_3    | mean=15.498% | median=6.010% | std=32.373%
-   xi0_4    | mean=19.746% | median=7.777% | std=40.329%
-   xi0_5    | mean=25.165% | median=10.250% | std=52.835%
-   xi0_6    | mean=30.372% | median=14.318% | std=60.475%
-   xi0_7    | mean=39.335% | median=22.606% | std=61.081%
-   xi0_8    | mean=52.830% | median=32.989% | std=75.420%
-   xi0_9    | mean=64.913% | median=46.328% | std=83.559%
-   xi0_10   | mean=64.028% | median=43.869% | std=91.222%
-
-
-
-
-NO FILTER DEEPONET MODEL
-
-# ============================================================
-# Usage Notes (example)
-# ============================================================
-#DeepONet (with internal scaling):
-deeponet_model, train_loader, val_loader, Ks, Ts = DeepONet.from_surfaces(deeponet_training, mask_type="none",
-    batch_size=8*11*11, val_split=0.2, latent_dim=96, branch_hidden_dims=(64, 64, 64), trunk_hidden_dims=(64, 64, 64), ref_strikes = np.array([0.5, 0.6, 0.7, 0.8, 0.9, 1. , 1.1, 1.2, 1.3, 1.4, 1.5]), ref_maturities= np.array([0.1, 0.3, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1]))
-deeponet_model.train_model(train_loader, val_loader, epochs=40, lr_schedule=[(0,0.001),(25,0.0001), (35, 0.00001)])
-print("DeepONet Model param counts: ",deeponet_model.count_parameters())
-# fig = model.plot_evaluation(test_surfaces[0])
-deeponet_eval = deeponet_model.evaluate(test_data, out_dir="deeponet_eval")
-
-Epoch 035 | train_rmse=0.029780, val_rmse=0.029915, lr=1.0e-04, time=105.20s, ETA=8.99 min
-→ Adjusted learning rate to 1.00e-05 at epoch 35
-                                                              
-Epoch 036 | train_rmse=0.029210, val_rmse=0.029300, lr=1.0e-05, time=106.94s, ETA=7.19 min
-                                                              
-Epoch 037 | train_rmse=0.029173, val_rmse=0.029254, lr=1.0e-05, time=105.70s, ETA=5.39 min
-                                                              
-Epoch 038 | train_rmse=0.029169, val_rmse=0.029260, lr=1.0e-05, time=106.71s, ETA=3.59 min
-                                                              
-Epoch 039 | train_rmse=0.029162, val_rmse=0.029271, lr=1.0e-05, time=106.67s, ETA=1.80 min
-                                                              
-Epoch 040 | train_rmse=0.029156, val_rmse=0.029260, lr=1.0e-05, time=104.63s, ETA=0.00 min
-
-✅ Training completed in 71.79 min (avg 107.68s per epoch)
-Model exported to exports\deeponet_final.json
-DeepONet Model param counts:  30272
-
-→ Final avg time: 139.7 ms, mean RMSE=0.00129
-Mean relative errors per parameter:
-   eta      | mean=1.939% | median=1.082% | std=3.778%
-   rho      | mean=2.298% | median=1.314% | std=3.509%
-   H        | mean=7.477% | median=3.550% | std=24.849%
-   xi0_0    | mean=5.275% | median=1.560% | std=14.069%
-   xi0_1    | mean=6.226% | median=2.659% | std=18.556%
-   xi0_2    | mean=10.857% | median=4.704% | std=20.561%
-   xi0_3    | mean=15.835% | median=6.453% | std=32.507%
-   xi0_4    | mean=20.002% | median=10.032% | std=30.994%
-   xi0_5    | mean=34.274% | median=19.079% | std=57.984%
-   xi0_6    | mean=52.196% | median=33.190% | std=69.839%
-   xi0_7    | mean=75.488% | median=45.839% | std=127.839%
-   xi0_8    | mean=75.448% | median=46.602% | std=119.097%
-   xi0_9    | mean=72.692% | median=52.365% | std=99.767%
-   xi0_10   | mean=86.363% | median=65.917% | std=111.830%
-
-
-
-
-MLP MODEL:
-
-# MLP (with internal scaling):
-mlp_model, train_loader, val_loader, Ks, Ts = MLP.from_surfaces(mlp_training,
-    batch_size=8, val_split=0.2, hidden_dims=(80,80,80,80))
-mlp_model.train_model(train_loader, val_loader, epochs=40, lr_schedule=[(0,0.001),(25,0.0001), (35, 0.00001)])
-print("MLP Model param counts: ",mlp_model.count_parameters())
-#fig = model.plot_evaluation(test_surfaces[0])
-mlp_eval = mlp_model.evaluate(test_data, out_dir="mlp_eval")
-
-Epoch 035 | train_rmse=0.034623, val_rmse=0.034946, lr=1.0e-04, time=15.02s, ETA=1.21 min
-→ Adjusted learning rate to 1.00e-05 at epoch 35
-                                                              
-Epoch 036 | train_rmse=0.033727, val_rmse=0.034048, lr=1.0e-05, time=15.06s, ETA=0.97 min
-                                                              
-Epoch 037 | train_rmse=0.033675, val_rmse=0.033977, lr=1.0e-05, time=14.54s, ETA=0.73 min
-                                                              
-Epoch 038 | train_rmse=0.033668, val_rmse=0.033971, lr=1.0e-05, time=14.85s, ETA=0.49 min
-                                                              
-Epoch 039 | train_rmse=0.033658, val_rmse=0.033957, lr=1.0e-05, time=15.03s, ETA=0.24 min
-                                                              
-Epoch 040 | train_rmse=0.033657, val_rmse=0.033956, lr=1.0e-05, time=14.87s, ETA=0.00 min
-
-✅ Training completed in 9.73 min (avg 14.59s per epoch)
-Model exported to exports\mlp_final.json
-MLP Model param counts:  30441
-
-→ Final avg time: 109.0 ms, mean RMSE=0.00127
-Mean relative errors per parameter:
-   eta      | mean=2.164% | median=1.188% | std=3.780%
-   rho      | mean=2.297% | median=1.348% | std=2.897%
-   H        | mean=8.295% | median=4.616% | std=21.409%
-   xi0_0    | mean=12.793% | median=2.507% | std=35.357%
-   xi0_1    | mean=15.155% | median=7.059% | std=27.393%
-   xi0_2    | mean=21.156% | median=10.048% | std=34.665%
-   xi0_3    | mean=28.283% | median=12.708% | std=55.950%
-   xi0_4    | mean=27.341% | median=13.295% | std=39.793%
-   xi0_5    | mean=33.184% | median=15.809% | std=66.266%
-   xi0_6    | mean=35.600% | median=14.896% | std=74.243%
-   xi0_7    | mean=37.793% | median=16.668% | std=67.702%
-   xi0_8    | mean=37.635% | median=16.504% | std=81.325%
-   xi0_9    | mean=39.414% | median=19.812% | std=76.140%
-   xi0_10   | mean=50.788% | median=23.641% | std=84.292%
-
-
-
-
-
-
-
+eval_dir = os.path.join("deeponet_eval", vol_name+"/"+grid)
+os.makedirs(eval_dir, exist_ok=True)
+deeponet_eval = deeponet_model.evaluate(test_data, out_dir=eval_dir)
 
 
 

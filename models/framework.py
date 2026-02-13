@@ -593,6 +593,7 @@ class BaseModel(nn.Module):
         - MC error heatmaps (if provided)
         - RMSE ECDF
         - RMSE vs parameter scatterplots (for ALL param_names)
+        - Prediction latency stats (avg/median/p95)
         """
         assert self.strikes is not None and self.maturities is not None, \
             "Model grid (strikes/maturities) not set; call set_grid first."
@@ -600,19 +601,13 @@ class BaseModel(nn.Module):
 
         nT, nK = len(self.maturities), len(self.strikes)
 
-        # ---------------------------------------
-        # Parameter-Name-Liste (modell-agnostisch)
-        # ---------------------------------------
         if self.param_names is not None:
             param_names = list(self.param_names)
         else:
-            # fallback, sollte aber nie vorkommen
             param_names = [f"theta_{i}" for i in range(len(surface_samples[0]["params"]))]
 
-        # Speichere Parameterwerte je Name
         param_values = {name: [] for name in param_names}
 
-        # Bins
         bin_errs_rel = [[[] for _ in range(nK)] for _ in range(nT)]
         bin_errs_abs = [[[] for _ in range(nK)] for _ in range(nT)]
         bin_errs_mc  = [[[] for _ in range(nK)] for _ in range(nT)]
@@ -620,13 +615,25 @@ class BaseModel(nn.Module):
 
         rmses = []
 
+        # -------------------------
+        # Prediction timing tracking
+        # -------------------------
+        pred_times_ms = []  # per-surface prediction latency in milliseconds
+
+        # Helper: sync for accurate GPU timings
+        def _sync_if_cuda():
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+
         # ==========================================================
         # Loop über alle Surfaces
         # ==========================================================
         for s in surface_samples:
             params = s["params"]
 
-            # parameter mapping (modellagnostisch)
             true_vec = self._params_dict_to_vec_np(params)
             for name, val in zip(param_names, true_vec):
                 param_values[name].append(float(val))
@@ -637,22 +644,27 @@ class BaseModel(nn.Module):
             Ks = np.asarray(grid["strikes"], dtype=np.float32)
             Ts = np.asarray(grid["maturities"], dtype=np.float32)
 
-            # PRED
-            pred_surface = self.predict_surface(params, grid=grid)
+            # PRED (timed)
+            _sync_if_cuda()
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                pred_surface = self.predict_surface(params, grid=grid)
+            _sync_if_cuda()
+            t1 = time.perf_counter()
+
+            pred_times_ms.append((t1 - t0) * 1e3)
+
             pred_surface = pred_surface.detach().cpu().numpy()
 
-            # Errors
             rel_err = np.abs(true_surface - pred_surface) / np.clip(true_surface, 1e-6, None) * 100.0
             abs_err = np.abs(true_surface - pred_surface)
-            sq_err  = (true_surface - pred_surface)**2
+            sq_err  = (true_surface - pred_surface) ** 2
 
             rmses.append(float(np.sqrt(np.mean(sq_err))))
 
-            # MC-Pseudo-Error
             mc_rel_err = np.array(s.get("iv_rel_error", np.zeros_like(true_surface)), dtype=np.float32) * 100.0
             mc_rel_err = np.nan_to_num(mc_rel_err, nan=0.0)
 
-            # Mapping market-grid Punkte → Modell-grid Indizes
             for ti, T in enumerate(Ts):
                 t_idx = np.argmin(np.abs(self.maturities - T))
                 for ki, K in enumerate(Ks):
@@ -664,6 +676,20 @@ class BaseModel(nn.Module):
                     bin_sqerr[t_idx][k_idx].append(sq_err[ti, ki])
 
         rmses = np.array(rmses, dtype=np.float32)
+        pred_times_ms = np.array(pred_times_ms, dtype=np.float64)
+
+        # -------------------------
+        # Prediction timing summary
+        # -------------------------
+        pred_time_mean_ms = float(np.mean(pred_times_ms)) if len(pred_times_ms) else float("nan")
+        pred_time_median_ms = float(np.median(pred_times_ms)) if len(pred_times_ms) else float("nan")
+        pred_time_p95_ms = float(np.percentile(pred_times_ms, 95)) if len(pred_times_ms) else float("nan")
+        pred_time_min_ms = float(np.min(pred_times_ms)) if len(pred_times_ms) else float("nan")
+        pred_time_max_ms = float(np.max(pred_times_ms)) if len(pred_times_ms) else float("nan")
+
+        print("\nPrediction latency (ms) per surface:")
+        print(f"  mean={pred_time_mean_ms:.3f}, median={pred_time_median_ms:.3f}, p95={pred_time_p95_ms:.3f}, "
+            f"min={pred_time_min_ms:.3f}, max={pred_time_max_ms:.3f}")
 
         # ===============================
         # Aggregation helper
@@ -801,6 +827,14 @@ class BaseModel(nn.Module):
         for name in param_names:
             scatter(param_values[name], rmses, name, f"rmse_vs_{name}.png")
 
+
+        mean_rmse_surface = float(np.mean(rmses))
+        median_rmse_surface = float(np.median(rmses))
+
+        print("\nRMSE summary over surfaces:")
+        print(f"  Mean RMSE   = {mean_rmse_surface:.6f}")
+        print(f"  Median RMSE = {median_rmse_surface:.6f}")
+
         # ===============================
         # Worst 10 Surfaces
         # ===============================
@@ -820,6 +854,14 @@ class BaseModel(nn.Module):
             "rmses": rmses,
             "worst_indices": worst_idx.tolist(),
             "parameters": param_values,
+            "prediction_time_ms": {
+                "per_surface": pred_times_ms,   # numpy array
+                "mean": pred_time_mean_ms,
+                "median": pred_time_median_ms,
+                "p95": pred_time_p95_ms,
+                "min": pred_time_min_ms,
+                "max": pred_time_max_ms,
+            },
             "global_mean": {
                 "pred_rel": float(global_mean_rel),
                 "pred_abs": float(global_mean_abs),
@@ -827,7 +869,6 @@ class BaseModel(nn.Module):
                 "rmse":     float(global_mean_rmse),
             }
         }
-
 
     # ============================================================
     # Calibration utilities
@@ -1534,7 +1575,6 @@ class SparseMask(nn.Module):
     def forward(self, x):
         m = torch.sigmoid(self.mask_net(x))
         if self.training:
-            # Regularisierung nur im Trainingsmodus berechnen
             ent = - (m * torch.log(m + 1e-8) + (1 - m) * torch.log(1 - m + 1e-8))
             self.loss_reg = (
                 self.l1_lambda * m.abs().mean() +
@@ -1812,32 +1852,20 @@ class DeepONet(BaseModel):
         """
         Evaluate and optionally visualize individual latent mask channels
         for a fixed branch vector across a grid of (K,T) coordinates.
-
-        Parameters
-        ----------
-        xb_sample : array-like
-            Parameter vector (eta, rho, H, xi0_knots...).
-        xt_grid : np.ndarray of shape [N, 2]
-            Grid of (K, T) coordinates.
-        visualize : bool, default=True
-            If True, plots selected mask channels as 2D heatmaps.
-        channels : list[int], optional
-            Specific channel indices to visualize (e.g. [0, 3, 7]).
-            If None, visualizes all latent channels.
-
-        Returns
-        -------
-        mask_np : np.ndarray
-            Full mask array of shape [N, latent_dim].
         """
-        import torch, numpy as np, matplotlib.pyplot as plt
+        import torch
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import math
 
         self.eval()
         if getattr(self, "mask_net", None) is None:
             print("No mask network defined (mask_type='none').")
             return None
 
+        # ----------------------------------------------------------
         # Prepare input tensors
+        # ----------------------------------------------------------
         xb_sample = torch.tensor(xb_sample, dtype=torch.float32, device=self.device)
         xb_sample = xb_sample.unsqueeze(0).repeat(len(xt_grid), 1)
         xt = torch.tensor(xt_grid, dtype=torch.float32, device=self.device)
@@ -1846,9 +1874,7 @@ class DeepONet(BaseModel):
             b = self.branch(xb_sample)
             t = self.trunk(xt)
 
-            if self.mask_type == "spatial":
-                mask = self.mask_net(xt)
-            elif self.mask_type == "channel":
+            if self.mask_type in {"spatial", "channel"}:
                 mask = self.mask_net(xt)
             elif self.mask_type == "contextual":
                 mask_input = torch.cat([b, t], dim=1)
@@ -1857,36 +1883,75 @@ class DeepONet(BaseModel):
                 mask = torch.ones(len(xt), self.latent_dim, device=self.device)
 
         mask_np = mask.detach().cpu().numpy()  # [N, latent_dim]
-        nK = len(np.unique(xt_grid[:, 0]))
-        nT = len(np.unique(xt_grid[:, 1]))
+
+        # ----------------------------------------------------------
+        # Grid reconstruction
+        # ----------------------------------------------------------
+        K_vals = np.unique(xt_grid[:, 0])
+        T_vals = np.unique(xt_grid[:, 1])
+
+        nK = len(K_vals)
+        nT = len(T_vals)
         latent_dim = mask_np.shape[1]
 
         # ----------------------------------------------------------
         # Visualization
         # ----------------------------------------------------------
         if visualize:
+            # Clip mask values explicitly to [0, 1]
+            mask_np = np.clip(mask_np, 0.0, 1.0)
+
             if channels is None:
                 channels = list(range(latent_dim))
             else:
                 channels = [c for c in channels if c < latent_dim]
 
             n_show = len(channels)
-            fig, axes = plt.subplots(1, n_show, figsize=(3.5 * n_show, 4))
+            n_cols = 4
+            n_rows = math.ceil(n_show / n_cols)
 
-            for idx, c in enumerate(channels):
-                ax = axes[idx] if n_show > 1 else axes
+            fig, axes = plt.subplots(
+                n_rows, n_cols,
+                figsize=(3.6 * n_cols, 3.2 * n_rows),
+                squeeze=False
+            )
+
+            for i, c in enumerate(channels):
+                r, col = divmod(i, n_cols)
+                ax = axes[r, col]
+
                 mask_c = mask_np[:, c].reshape(nT, nK)
-                im = ax.imshow(mask_c, origin="lower", aspect="auto", cmap="magma")
-                ax.set_title(f"Channel {c}")
-                ax.set_xlabel("Strike (K)")
-                ax.set_ylabel("Maturity (T)")
+
+                im = ax.imshow(
+                    mask_c,
+                    origin="lower",
+                    aspect="auto",
+                    cmap="magma",
+                    vmin=0.0,
+                    vmax=1.0,
+                    extent=[
+                        K_vals.min(), K_vals.max(),
+                        T_vals.min(), T_vals.max()
+                    ]
+                )
+
+                ax.set_title(f"Channel {c}", fontsize=10)
+                ax.set_xlabel("Strike $K$")
+                ax.set_ylabel("Maturity $T$")
+                ax.invert_yaxis()
+
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-            plt.suptitle(f"Mask Channels ({self.mask_type})", fontsize=13)
-            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            # Turn off unused axes
+            for j in range(n_show, n_rows * n_cols):
+                r, col = divmod(j, n_cols)
+                axes[r, col].axis("off")
+
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
             plt.show()
 
         return mask_np
+
 
     # --------------------------------------------------------
     def train_model(
