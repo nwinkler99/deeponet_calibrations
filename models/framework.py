@@ -1,6 +1,6 @@
-# ======================================================================
-# Unified Framework for DeepONet and MLP-IVSurface (self-contained)
-# ======================================================================
+# ====
+# Unified framework for DeepONet and MLP IV surface models
+# ====
 
 import os
 import json
@@ -22,17 +22,14 @@ import time
 import numpy as np
 from scipy.optimize import least_squares, differential_evolution, minimize
 import QuantLib as ql
-from generation.rbergomi import bsinv  # Pfad ggf. anpassen
+from generation.rbergomi import bsinv
 
-# ============================================================
-# Dataset Wrapper (for DeepONet per-point supervision)
-# ============================================================
+# ====
+# Dataset wrapper for DeepONet point-wise supervision
+# ====
 
 class IVSurfaceDataset(Dataset):
-    """
-    Holds per-point supervision for DeepONet:
-      (branch_vector, trunk_coord) -> IV value
-    """
+    """IV surface data for DeepONet with (branch, trunk, target) pairs."""
     def __init__(self, X_branch, X_trunk, Y):
         assert len(X_branch) == len(X_trunk) == len(Y)
         self.Xb = torch.tensor(X_branch, dtype=torch.float32)
@@ -46,9 +43,9 @@ class IVSurfaceDataset(Dataset):
         return self.Xb[idx], self.Xt[idx], self.Y[idx]
 
 
-# ============================================================
-# Base Model with shared eval + persistence + scaling utilities
-# ============================================================
+# ====
+# Base model with shared save/load and utilities for MLP and DeepONet
+# ====
 
 class BaseModel(nn.Module):
     def __init__(self):
@@ -92,22 +89,20 @@ class BaseModel(nn.Module):
         self._last_true = None
         self._last_params = None
 
-    # ============================================================
-    #   UNIVERSAL SAVE / LOAD FOR MLP + DEEPONET
-    # ============================================================
+    # ====
+    # Save and load methods
+    # ====
 
     def save(self, path):
-        """
-        Save model architecture + weights + scaler + grid + bounds.
+        """Save model state, architecture, scaler, and grid to checkpoint.
+        
         Automatically detects whether model is MLP or DeepONet.
         """
         import torch
         from sklearn.preprocessing import StandardScaler
         from models.framework import DeepONet, MLP
 
-        # --------------------------
-        # 1) Detect model type
-        # --------------------------
+        # Detect model type
         if isinstance(self, DeepONet):
             init_kwargs = {
                 "branch_in_dim": self.branch_in_dim,
@@ -134,9 +129,7 @@ class BaseModel(nn.Module):
         else:
             raise ValueError(f"Unsupported model type for saving: {self.__class__.__name__}")
 
-        # --------------------------
-        # 2) Build checkpoint dict
-        # --------------------------
+        # Build checkpoint dictionary
         payload = {
             "class_name": class_name,
             "state_dict": self.state_dict(),
@@ -156,17 +149,13 @@ class BaseModel(nn.Module):
             "scaler_scale": None if self.output_scaler is None else self.output_scaler.scale_,
         }
 
-        # --------------------------
-        # 3) SAVE
-        # --------------------------
+        # Save checkpoint
         torch.save(payload, path)
         print(f"Model saved to {path}")
 
     @classmethod
     def load(cls, path):
-        """
-        Auto-loads either DeepONet or MLP based on checkpoint metadata.
-        """
+        """Load model from checkpoint, auto-detecting MLP or DeepONet type."""
         import torch
         from sklearn.preprocessing import StandardScaler
         from models.framework import DeepONet, MLP
@@ -177,9 +166,7 @@ class BaseModel(nn.Module):
         class_name = checkpoint["class_name"]
         init_kwargs = checkpoint["init_kwargs"]
 
-        # --------------------------------------------------
-        # Instantiate correct class
-        # --------------------------------------------------
+        # Instantiate model
         if class_name == "DeepONet":
             model = DeepONet(**init_kwargs)
         elif class_name == "MLP":
@@ -192,27 +179,20 @@ class BaseModel(nn.Module):
         # --------------------------------------------------
         model.load_state_dict(checkpoint["state_dict"])
 
-        # --------------------------------------------------
-        # Restore grid + param bounds
-        # --------------------------------------------------
+        # Restore grid and parameter bounds
         model.set_grid(checkpoint["strikes"], checkpoint["maturities"])
 
         if checkpoint["param_bounds"] is not None:
             lb, ub = checkpoint["param_bounds"]
             model.set_param_bounds(lb, ub)
 
-        # --------------------------------------------------
-        # Restore parameter layout (if present)
-        # --------------------------------------------------
+        # Restore parameter structure if present
         param_names  = checkpoint.get("param_names", None)
         param_slices = checkpoint.get("param_slices", None)
         if param_names is not None and param_slices is not None:
             model.set_param_structure(param_names, param_slices)
 
-
-        # --------------------------------------------------
-        # Restore scaler (if present)
-        # --------------------------------------------------
+        # Restore output scaler if present
         if checkpoint["scaler_mean"] is not None:
             scaler = StandardScaler()
             scaler.mean_  = checkpoint["scaler_mean"]
@@ -302,15 +282,13 @@ class BaseModel(nn.Module):
         return vec
 
     def params_dict_to_vec(self, p):
-        """Komfort-Wrapper auf _params_dict_to_vec_np."""
+        """Convert parameter dict to numpy array."""
         return self._params_dict_to_vec_np(p)
 
     def params_vec_to_dict(self, vec):
-        """
-        Inverse Mapping: Vektor -> dict mit denselben Keys wie self.param_slices.
-        """
+        """Convert parameter vector back to dict with same keys."""
         import numpy as np
-        assert self.param_slices is not None, "param_slices nicht gesetzt."
+        assert self.param_slices is not None, "param_slices not set"
         vec = np.asarray(vec, dtype=np.float32)
         out = {}
         for key, sl in self.param_slices.items():
@@ -323,34 +301,27 @@ class BaseModel(nn.Module):
     
     @staticmethod
     def infer_param_structure_from_surfaces(surfaces):
-        """
-        Detects full parameter structure from surfaces[0]["params"].
-        Produces:
-            param_names: list of flattened parameter names in order
-            param_slices: dict mapping key -> slice or index
-        Works with:
-        - any number of scalar params
-        - any number of vector params
-        - any shapes of vectors (flattened)
+        """Infer parameter structure from surface metadata.
+        
+        Detects scalar and vector parameters and returns names and slices
+        for vector/dict conversion.
         """
         import numpy as np
 
         first = surfaces[0]["params"]
-
         param_names = []
         param_slices = {}
-
         pos = 0
+
         for key, val in first.items():
-            # vector parameter (list/np array/tuple)
+            # Handle vector parameters
             if isinstance(val, (list, tuple, np.ndarray)):
                 length = len(val)
                 param_slices[key] = slice(pos, pos + length)
                 for i in range(length):
                     param_names.append(f"{key}_{i}")
                 pos += length
-
-            # scalar parameter
+            # Handle scalar parameters
             else:
                 param_slices[key] = pos
                 param_names.append(key)
@@ -363,48 +334,53 @@ class BaseModel(nn.Module):
 
 
     def compute_loss(self, y_pred, y_true):
+        """Compute MSE loss."""
         return nn.MSELoss()(y_pred, y_true)
 
-    # -------------------- Param scaling: bounds → [-1, 1] --------------------
+    # ====
+    # Parameter and output scaling
+    # ====
 
     @staticmethod
     def _scale_to_m1_p1(x, lb, ub):
-        # (x - mid) * 2 / (ub - lb), where mid = (ub+lb)/2
+        """Scale from [lb, ub] to [-1, 1]."""
         mid = (ub + lb) * 0.5
         return (x - mid) * (2.0 / (ub - lb))
 
     @staticmethod
     def _inverse_from_m1_p1(x_scaled, lb, ub):
-        # x_scaled*(ub - lb)/2 + mid
+        """Inverse scale from [-1, 1] to [lb, ub]."""
         mid = (ub + lb) * 0.5
         return x_scaled * (0.5 * (ub - lb)) + mid
 
     def set_param_bounds(self, lb, ub):
-        """Attach explicit (lb, ub) arrays to the model for param scaling."""
+        """Set parameter bounds for scaling to [-1, 1]."""
         lb = np.asarray(lb, dtype=np.float32)
         ub = np.asarray(ub, dtype=np.float32)
         assert lb.shape == ub.shape, "lb and ub must have the same shape"
         self.param_bounds = (lb, ub)
 
     def scale_params(self, param_vec):
-        """Scale [eta, rho, H, xi0_knots...] to [-1, 1] using self.param_bounds."""
+        """Scale parameters to [-1, 1] using bounds."""
         assert self.param_bounds is not None, "param_bounds not set"
         lb, ub = self.param_bounds
         x = np.asarray(param_vec, dtype=np.float32)
         return BaseModel._scale_to_m1_p1(x, lb, ub)
 
     def inverse_scale_params(self, x_scaled):
-        """Inverse of scale_params."""
+        """Inverse scale from [-1, 1] to [lb, ub]."""
         assert self.param_bounds is not None, "param_bounds not set"
         lb, ub = self.param_bounds
         x_scaled = np.asarray(x_scaled, dtype=np.float32)
         return BaseModel._inverse_from_m1_p1(x_scaled, lb, ub)
 
-    # -------------------- Output (IV) scaling: StandardScaler --------------------
     def fit_output_scaler(self, Y_train):
-        """
-        Fit StandardScaler on IV outputs (train only, leakage-safe).
-        Y_train: (N, nT, nK) or (N, 1) or (N, nPts, 1) for DeepONet flattened
+        """Fit StandardScaler on IV outputs.
+        
+        Parameters
+        ----------
+        Y_train : np.ndarray
+            Training output values, flattened if needed.
         """
         from sklearn.preprocessing import StandardScaler
         self.output_scaler = StandardScaler()
@@ -439,13 +415,13 @@ class BaseModel(nn.Module):
         return inv.reshape(nT, nK)
     
     def _interpolate_market_to_model(self, market_surface, Ks_market, Ts_market):
-        """
-        Bilinear interpolation: market IVs -> model-grid IVs.
-        Everything stays in torch (differentiable but no gradients needed here).
+        """Bilinear interpolation of market IVs to model grid.
+        
+        All operations stay in torch for differentiability.
         """
         device = self.device
 
-        # model grid (log-space)
+        # Model grid (log-space)
         base_Ts = torch.exp(
             torch.as_tensor(self.maturities, dtype=torch.float32, device=device)
         )
@@ -453,7 +429,7 @@ class BaseModel(nn.Module):
             torch.as_tensor(self.strikes, dtype=torch.float32, device=device)
         )
 
-        # market grid
+        # Market grid
         mTs = torch.exp(torch.as_tensor(Ts_market, dtype=torch.float32, device=device))
         mKs = torch.exp(torch.as_tensor(Ks_market, dtype=torch.float32, device=device))
         mIV = torch.as_tensor(market_surface, dtype=torch.float32, device=device)
@@ -478,19 +454,14 @@ class BaseModel(nn.Module):
 
         return interp.detach().cpu().numpy()   # calibration needs NumPy
 
-    # -------------------- Abstract API ----------------------
-    # Each child model must implement:
-    #   predict_surface(self, params_dict, store_last: bool = True) -> np.ndarray (nT, nK)
-
-    # ====================================================
-    # Shared evaluation utilities (no extra args needed)
-    # ====================================================
+    # ====
+    # Abstract API: each model must implement predict_surface()
+    # ====
 
     def plot_evaluation(self, surface_data, figsize=(15, 5), levels=30, interp_method="spline"):
-        """
-        Compare true vs predicted IV surfaces using contour plots.
-        If the sample grid differs from the model grid, interpolate true_surface
-        to match the model's grid for consistent visualization.
+        """Compare true vs predicted IV surfaces with contour plots.
+        
+        Interpolates true surface to model grid if needed for consistent comparison.
         """
         assert self.strikes is not None and self.maturities is not None, \
             "Model grid (strikes/maturities) not set; call set_grid or train/prepare first."

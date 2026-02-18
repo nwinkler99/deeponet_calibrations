@@ -1,13 +1,6 @@
-# --------------------------------------------------------------------------------------------------------
-# Utility functions for Rough Bergomi model simulation and visualization
-# --------------------------------------------------------------------------------------------------------
-# Includes:
-# - TBSS kernel and discretization helpers
-# - Black–Scholes pricing and implied volatility inversion
-# - Vectorized pathwise pricing for Monte Carlo
-# - Latin Hypercube parameter sampling and randomized grids
-# - Plotting helper for IV surfaces
-# --------------------------------------------------------------------------------------------------------
+# ====
+# Utility functions for Rough Bergomi model and IV surface operations
+# ====
 
 import numpy as np
 from scipy.stats import norm, qmc
@@ -36,27 +29,26 @@ plt.rcParams.update({
 })
 
 def _tight_suptitle(fig, title, fontsize=17):
-    """Add a large, bold suptitle closer to subplots."""
+    """Add a large suptitle closer to subplots."""
     fig.suptitle(title, fontsize=fontsize, weight="bold", y=0.97)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-# --------------------------------------------------------------------------------------------------------
-# TBSS / rBergomi helper functions
-# --------------------------------------------------------------------------------------------------------
+
+# ====
+# TBSS and rBergomi helpers
+# ====
 
 def g(x: float, a: float) -> float:
-    """TBSS kernel applicable to the rBergomi variance process."""
+    """TBSS kernel for rBergomi variance process."""
     return x ** a
 
 
 def b(k: int, a: float) -> float:
-    """Optimal discretisation of TBSS process for minimising hybrid scheme error."""
+    """Optimal discretization of TBSS process."""
     return ((k ** (a + 1) - (k - 1) ** (a + 1)) / (a + 1)) ** (1 / a)
 
 
 def cov(a: float, n: int) -> np.ndarray:
-    """
-    Covariance matrix for given alpha and n, assuming kappa = 1 for tractability.
-    """
+    """Covariance matrix for TBSS with alpha=a and n discretization steps."""
     C = np.zeros((2, 2))
     C[0, 0] = 1.0 / n
     C[0, 1] = 1.0 / ((a + 1.0) * n ** (a + 1))
@@ -103,27 +95,20 @@ def bs(F: float, K: float, V: float, o: str = "call") -> float:
 
 
 def bsinv(P: float, F: float, K: float, t: float, o: str = "call") -> float:
-    """
-    Robust implied Black volatility inversion in deflated units.
-
+    """Robust implied Black volatility inversion in deflated units.
+    
     Parameters
     ----------
     P : float
         Deflated option price.
     F : float
-        Deflated underlying value 𝑆̃.
+        Deflated underlying value.
     K : float
-        Deflated strike 𝑲̃.
+        Deflated strike.
     t : float
         Maturity in years.
-    o : str, optional
-        Option type: "call", "put", or "otm".
-
-    Notes
-    -----
-    - The inversion is performed entirely in money-market-deflated units.
-    - No interest rate or discount factor enters the inversion.
-    - Safe for Monte Carlo generated prices.
+    o : str
+        Option type: 'call', 'put', or 'otm'.
     """
     if t <= 1e-10:
         return 1e-8  # degenerate maturity
@@ -148,24 +133,18 @@ def bsinv(P: float, F: float, K: float, t: float, o: str = "call") -> float:
 
 
 def bs_vega(F: float, K: float, T: float, sigma: float) -> float:
-    """
-    Black vega (∂Price/∂Vol) in deflated units.
-
+    """Black vega (price sensitivity to volatility) in deflated units.
+    
     Parameters
     ----------
     F : float
-        Deflated underlying value 𝑆̃.
+        Deflated underlying value.
     K : float
-        Deflated strike 𝑲̃.
+        Deflated strike.
     T : float
         Maturity in years.
     sigma : float
         Volatility level.
-
-    Notes
-    -----
-    - Vega is computed for the deflated Black pricing formula.
-    - No interest rate or discount factor is involved.
     """
     if sigma <= 0 or T <= 0 or not np.isfinite(sigma) or F <= 0 or K <= 0:
         return np.nan
@@ -173,34 +152,28 @@ def bs_vega(F: float, K: float, T: float, sigma: float) -> float:
     return F * norm.pdf(d1) * np.sqrt(T)
 
 
-# --------------------------------------------------------------------------------------------------------
-# Pathwise Black pricing for Monte Carlo (deflated units)
-# --------------------------------------------------------------------------------------------------------
+# ====
+# Pathwise Black pricing for Monte Carlo
+# ====
 
 def bs_call_vec_pathwise(F_path: np.ndarray, K_abs: float, T: float, sigma_path: np.ndarray) -> np.ndarray:
-    """
-    Pathwise Black call price in money-market-deflated units.
-
+    """Pathwise Black call prices in deflated units.
+    
     Parameters
     ----------
     F_path : np.ndarray
-        Deflated terminal underlying values 𝑆̃_T along Monte Carlo paths.
+        Deflated terminal underlying values along paths.
     K_abs : float
-        Deflated strike 𝑲̃.
+        Deflated strike.
     T : float
         Maturity in years.
     sigma_path : np.ndarray
         Pathwise conditional volatility.
-
+    
     Returns
     -------
     np.ndarray
-        Deflated call prices along each Monte Carlo path.
-
-    Notes
-    -----
-    - All inputs are interpreted in deflated (discounted) units.
-    - No interest rate or discount factor appears in the pricing.
+        Call prices along each Monte Carlo path.
     """
     eps = 1e-12
     Fp = np.maximum(F_path, eps)
@@ -211,29 +184,23 @@ def bs_call_vec_pathwise(F_path: np.ndarray, K_abs: float, T: float, sigma_path:
 
 
 def bs_put_vec_pathwise(F_path: np.ndarray, K_abs: float, T: float, sigma_path: np.ndarray) -> np.ndarray:
-    """
-    Pathwise Black put price in money-market-deflated units.
-
+    """Pathwise Black put prices in deflated units.
+    
     Parameters
     ----------
     F_path : np.ndarray
-        Deflated terminal underlying values 𝑆̃_T along Monte Carlo paths.
+        Deflated terminal underlying values along paths.
     K_abs : float
-        Deflated strike 𝑲̃.
+        Deflated strike.
     T : float
         Maturity in years.
     sigma_path : np.ndarray
         Pathwise conditional volatility.
-
+    
     Returns
     -------
     np.ndarray
-        Deflated put prices along each Monte Carlo path.
-
-    Notes
-    -----
-    - All inputs are interpreted in deflated (discounted) units.
-    - No interest rate or discount factor appears in the pricing.
+        Put prices along each Monte Carlo path.
     """
     eps = 1e-12
     Fp = np.maximum(F_path, eps)
@@ -243,9 +210,9 @@ def bs_put_vec_pathwise(F_path: np.ndarray, K_abs: float, T: float, sigma_path: 
     return K_abs * norm.cdf(-d2) - Fp * norm.cdf(-d1)
 
 
-# --------------------------------------------------------------------------------------------------------
+# ====
 # Sampling utilities
-# --------------------------------------------------------------------------------------------------------
+# ====
 
 @dataclass
 class RBergomiParams:
@@ -276,14 +243,20 @@ from scipy.stats import qmc
 import numpy as np
 
 def lhs_grid(start, end, n, rng, min_spacing=0.02):
-    """
-    Generate a sorted 1D grid in [start, end] with:
-    - first point fixed at start
-    - last point fixed at end
-    - (n-2) internal points sampled via LHS
-    - minimal spacing between adjacent points enforced
-
-    Works in log-space (recommended) and is monotone + deterministic.
+    """Generate sorted 1D grid with LHS sampling and minimal spacing.
+    
+    Parameters
+    ----------
+    start : float
+        Grid start point.
+    end : float
+        Grid end point.
+    n : int
+        Number of grid points.
+    rng : np.random.Generator
+        Random number generator.
+    min_spacing : float
+        Minimal spacing between adjacent points.
     """
     start = float(start)
     end = float(end)
@@ -322,10 +295,9 @@ import pandas as pd
 
 
 def load_effr_rates_csv(path: str) -> pd.DataFrame:
-    """
-    Reads a CSV with columns: observation_date,EFFR
-    EFFR is in percent (e.g. 1.55), may contain missing values (e.g. holidays).
-    Returns DataFrame with columns: date, effr (decimal).
+    """Load EFFR rates from CSV with observation_date and EFFR columns.
+    
+    Converts EFFR from percent to decimal and forward-fills holidays.
     """
     rates = pd.read_csv(path)
     rates.columns = rates.columns.str.strip()
@@ -343,9 +315,10 @@ def load_effr_rates_csv(path: str) -> pd.DataFrame:
 def preprocess_and_filter_otm(df: pd.DataFrame,
                                        rates: pd.DataFrame,
                                        q: float = 0.016) -> pd.DataFrame:
-    """
-    Uses EFFR as r(t) and a constant dividend yield q to approximate
-    F(T) = S0 * exp((r - q) * T). Then builds log-forward-moneyness.
+    """Preprocess market data and filter for OTM options.
+    
+    Uses EFFR as interest rate and constant dividend yield to compute
+    forward prices. Filters for OTM strikes and valid maturity/moneyness ranges.
     """
 
     df = df.copy()
@@ -426,33 +399,19 @@ def preprocess_and_filter_otm(df: pd.DataFrame,
 
 
 def build_market_surfaces(df):
-    """
-    Create one IV surface per (symbol, expiration) pair.
-
-    Each output element has:
-    {
-        "symbol": str,
-        "expiration": pd.Timestamp,
-        "grid": {
-            "strikes": np.array(... log-moneyness ...)
-            "maturities": np.array(... log-maturities ...)
-        },
-        "iv_surface": 2D array (nT x nK),
-        "volume": 2D array (nT x nK),
-        "weights": 2D array (nT x nK)
-    }
+    """Build IV surfaces from market data grouped by symbol and date.
+    
+    Returns list of dicts with keys: symbol, date, grid, iv_surface, volume, weights.
     """
 
     output = []
 
-    # -----------------------------------------
-    # GROUP DATA BY (symbol, expiration)
-    # -----------------------------------------
+    # Group data by (symbol, date)
     grouped = df.groupby(["symbol", "date"])
 
     for (symbol, date), g in grouped:
 
-        # sort maturities + log-moneyness
+        # Sort maturities and moneyness
         maturities = np.sort(g["maturity"].unique())
         strikes = np.sort(g["log_moneyness"].unique())
 
@@ -498,9 +457,9 @@ def build_market_surfaces(df):
 
 
 
-# --------------------------------------------------------------------------------------------------------
+# ====
 # Plotting utilities
-# --------------------------------------------------------------------------------------------------------
+# ====
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple
@@ -514,13 +473,24 @@ def plot_iv_surface_scatter(
     title: str = "IV Surface (Scatter Only)",
     log_maturity: bool = True,
 ):
-    """
-    Scatter-Plot einer IV-Surface.
-
-    Erwartete Konvention:
-    - iv_surface.shape == (len(maturities), len(strikes))
-    - Erste Zeile: kürzeste Maturity
-    - Spalten: von kleinem Strike (log-moneyness) zu großem
+    """Scatter plot of IV surface.
+    
+    Parameters
+    ----------
+    iv_surface : np.ndarray
+        2D array of shape (nT, nK).
+    strikes : np.ndarray
+        Strike grid (log-moneyness).
+    maturities : np.ndarray
+        Maturity grid.
+    cmap : str
+        Colormap name.
+    figsize : tuple
+        Figure size.
+    title : str
+        Plot title.
+    log_maturity : bool
+        Whether to use log scale for maturity axis.
     """
     iv_surface = np.asarray(iv_surface, float)
     strikes = np.asarray(strikes, float)
@@ -531,10 +501,10 @@ def plot_iv_surface_scatter(
         f"(nT={len(maturities)}, nK={len(strikes)})"
     )
 
-    # Grid der Punkte bauen (gleiche Indizierung wie iv_surface!)
+    # Create grid
     Kgrid, Tgrid = np.meshgrid(strikes, maturities, indexing="xy")
 
-    # Nur valide Punkte plotten (keine NaNs)
+    # Plot only finite points
     mask = np.isfinite(iv_surface)
     K_plot = Kgrid[mask]
     T_plot = Tgrid[mask]
@@ -570,9 +540,30 @@ def plot_iv_surface(
     title: str = "Implied Volatility Surface",
     log_maturity: bool = True,
 ):
-    """
-    Plot an implied volatility surface (contour or heatmap),
-    optionally overlaying the piecewise-constant forward variance ξ₀(t).
+    """Plot IV surface as contour or heatmap with optional xi0 overlay.
+    
+    Parameters
+    ----------
+    iv_surface : np.ndarray
+        2D array of IV values.
+    strikes : np.ndarray
+        Strike grid.
+    maturities : np.ndarray
+        Maturity grid.
+    xi0_knots : np.ndarray, optional
+        Forward variance values for overlay.
+    xi0_bin_edges : np.ndarray, optional
+        Bin edges for xi0 piecewise constant.
+    kind : str
+        'contour' or 'heatmap'.
+    cmap : str
+        Colormap name.
+    figsize : tuple
+        Figure size.
+    title : str
+        Plot title.
+    log_maturity : bool
+        Use log scale for maturity axis.
     """
     maturities = np.asarray(maturities, float)
     strikes = np.asarray(strikes, float)
@@ -606,10 +597,11 @@ def plot_iv_surface(
         edges = np.asarray(xi0_bin_edges, float)
         assert len(edges) == len(xi0_knots) + 1, "xi0_bin_edges must have length K+1."
 
-        # Skip first bin [0, maturities[0]) → not visible
+        # Skip first bin [0, maturities[0]) - not visible
         first_vis_i = np.searchsorted(edges, maturities[0], side="left")
         first_vis_i = max(1, min(first_vis_i, len(xi0_knots) - 1))
 
+        # Build piecewise constant overlay
         T_step, X_step = [], []
         for i in range(first_vis_i, len(xi0_knots)):
             t0, t1 = edges[i], edges[i + 1]
@@ -620,7 +612,7 @@ def plot_iv_surface(
         T_step = np.asarray(T_step)
         X_step = np.asarray(X_step)
 
-        # Normalize overlay to appear near strike ≈ 1
+        # Normalize overlay to strike scale
         xnorm = (X_step - X_step.min()) / (X_step.max() - X_step.min() + 1e-12)
         xnorm = xnorm * (strikes.max() - strikes.min()) * 0.2
         xplot = 1.0 + xnorm

@@ -1,10 +1,7 @@
 
+5–8 strategische Zitate ergänzen
 
-kapitel 4 verbessern: woher kommt deeponet, wieso der gating layer?
-
-MLP genauer erklären
-
-Heston Pricing erklären
+Appendix sauber aufsetzen
 
 
 

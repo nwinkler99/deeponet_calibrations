@@ -1,12 +1,6 @@
-# Rough Bergomi IV surfaces via rDonsker fBm — Stable IV Extraction + OTM Options
-# --------------------------------------------------------------------------------------------------------
-# Features:
-# - Constant time grid (consistent discretization)
-# - Randomized Maturities (±15%)
-# - OTM pricing (Calls for K>=S0, Puts for K<S0)
-# - Stable implied vol inversion (clipping + NaN handling)
-# - Piecewise constant xi0, Antithetic variates, batch seeding
-# --------------------------------------------------------------------------------------------------------
+# ====
+# Rough Bergomi IV surface generation with stable implied volatility extraction
+# ====
 import gc
 import os
 import pickle
@@ -28,15 +22,13 @@ from .utils import (
     lhs_grid
 )
 
-# -------------------------------------------------------------
-# Parameter structures
-# -------------------------------------------------------------
+# ====
+# Configuration and parameter structures
+# ====
 
 @dataclass
 class SimulationConfig:
-    # -----------------------------
-    # global simulation settings
-    # -----------------------------
+    # Global simulation settings
     M: int = 20000
     n: int = 1200
     T_min: float = 25/365
@@ -46,9 +38,7 @@ class SimulationConfig:
     G: int = 10
     dtype: np.dtype = np.float32
 
-    # -----------------------------
-    # RBergomi parameter ranges
-    # -----------------------------
+    # rBergomi parameter ranges
     min_xi0 : float = 0.01
     max_xi0 : float = 0.25
     min_eta : float = 0.5
@@ -58,9 +48,7 @@ class SimulationConfig:
     min_H   : float = 0.025
     max_H   : float = 0.5
 
-    # -----------------------------
     # Heston parameter ranges
-    # -----------------------------
     heston_min_kappa = 0.5
     heston_max_kappa = 4
 
@@ -76,9 +64,7 @@ class SimulationConfig:
     heston_min_rho = -0.9999
     heston_max_rho = -0.1
 
-    # -----------------------------
-    # grids
-    # -----------------------------
+    # Strike and maturity grids
     strikes: np.ndarray = None
     maturities: np.ndarray = None
 
@@ -95,18 +81,15 @@ class SimulationConfig:
 
 
 
-# --------------------------------------------------------------------------------------------------------
-# Surface generation (batch)
-# --------------------------------------------------------------------------------------------------------
+# ====
+# Batch surface generation
+# ====
 
 import gc
 import numpy as np
 from numpy.random import SeedSequence, default_rng
 from typing import List, Dict
 
-# ============================================================
-#  Main generator: fully reproducible
-# ============================================================
 def generate_surfaces(
     num_sets: int = 1,
     forward_curves_per_set: int = 1,
@@ -115,7 +98,7 @@ def generate_surfaces(
     randomize_grid: bool = False,
     model: str = "rbergomi"
 ):
-    model = model.lower()
+    """Generate IV surfaces for given model (rbergomi or heston)."""
 
     if model == "rbergomi":
         # --- dein bestehender Generator ---
@@ -147,19 +130,13 @@ def generate_surfaces_rbergomi(
     seed: int = 42,
     randomize_grid: bool = False
 ) -> List[Dict]:
-    """
-    Deterministic generation of implied-volatility surfaces from the rBergomi model
-    in money-market-deflated units.
-
-    Important:
-    - All simulated prices S are deflated (discounted) prices 𝑆̃.
-    - All strikes K are interpreted as deflated strikes 𝑲̃.
-    - No interest rate r or discount factor appears anywhere in the simulation or pricing.
-    - Any nominal-to-deflated mapping (K → K/F₀(T)) must be performed outside this function.
+    """Generate rBergomi IV surfaces with deterministic seed hierarchy.
+    
+    All prices and strikes are in deflated (discounted) units.
     """
     results: List[Dict] = []
 
-    # --- 1️⃣ Central deterministic seed hierarchy ---
+    # Initialize deterministic seed hierarchy
     root_seq = SeedSequence(seed)
     rng_params = default_rng(root_seq.spawn(1)[0])
     param_sets = sample_param_sets_lhs(
@@ -173,57 +150,41 @@ def generate_surfaces_rbergomi(
 
     n, T_max = cfg.n, cfg.T_max
 
-    # --- 2️⃣ Generate per param set ---
+    # Generate surfaces for each parameter set
     for s, (params, set_seq) in enumerate(zip(param_sets, set_seqs)):
-        eta, rho, H = params   # <— Vektor unpacken
+        eta, rho, H = params
         eta = float(eta)
         rho = float(rho)
         H   = float(H)
         subseqs = set_seq.spawn(3)
-        rng_rb = default_rng(subseqs[0])     # for Brownian increments (rBergomi)
-        rng_xi = default_rng(subseqs[1])     # for xi0 knots
-        rng_jit = default_rng(subseqs[2])    # for jitter grids
+        rng_rb = default_rng(subseqs[0])
+        rng_xi = default_rng(subseqs[1])
+        rng_jit = default_rng(subseqs[2])
 
         a = H - 0.5
 
-        # --- 3️⃣ rBergomi simulation (deterministic via rng_rb) ---
-        np.random.seed(rng_rb.integers(0, 2**31 - 1))  # if rBergomi uses np.random internally
+        # Simulate rBergomi paths
+        np.random.seed(rng_rb.integers(0, 2**31 - 1))
         rb = rBergomi(n=n, N=cfg.M, T=T_max, a=a)
         t_grid = rb.t.flatten().astype(cfg.dtype)
         dt = np.diff(t_grid, prepend=cfg.dtype(0.0)).astype(cfg.dtype)
 
         dW1, dW2 = rb.dW1(), rb.dW2()
-        #dB= rb.dB(dW1, dW2, rho=rho), 
         Y = rb.Y(dW1)
         dW_vol = dW1[..., 0] if dW1.ndim == 3 else dW1
         dW_vol = dW_vol.astype(cfg.dtype, copy=False)
         del dW1, dW2
         gc.collect()
 
-        # --- 4️⃣ Forward variance curve generation ---
+        # Generate forward variance curves
         for j in range(forward_curves_per_set):
-
-            # --------------------------------------------------------------
-            # Forward variance knots derived from log-maturity grid
-            # Guaranteed to include T_max
-            # --------------------------------------------------------------
-
-            # 1) jedes zweite log-T nehmen
+            # Extract forward variance knot points from log-maturity grid
             log_forward_points = cfg.logmaturities[::3].copy()
-
-            # 2) sicherstellen, dass T_max (als log(T_max)) enthalten ist
             log_T_max = np.log(cfg.T_max)
-
             if not np.isclose(log_forward_points[-1], log_T_max):
                 log_forward_points[-1] = log_T_max
-
-            # 3) Aufräumen: sortieren & Duplikate entfernen
             log_forward_points = np.unique(np.sort(log_forward_points))
-
-            # 4) zurück zu physischer Zeit
             forward_points = np.exp(log_forward_points)
-
-            # 5) xi0-Knoten generieren
             xi0_knots = rng_xi.uniform(cfg.min_xi0, cfg.max_xi0, size=len(forward_points)).astype(cfg.dtype)
 
 
@@ -235,32 +196,26 @@ def generate_surfaces_rbergomi(
             idx = np.clip(idx, 0, len(xi0_knots) - 1)
             xi_t = xi0_knots[idx]
 
-            # simulate volatility & price paths
+            # Simulate volatility paths
             V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=eta).astype(cfg.dtype)
-            #S = rb.S(V, dB, S0=cfg.S0).astype(cfg.dtype)
 
-            # precompute cumulative integrals for conditional MC
+            # Precompute integrals for conditional Monte Carlo
             V_left = V[:, :-1].astype(cfg.dtype, copy=False)
             dt_incr = dt[1:]
             sqrtV_left = np.sqrt(np.maximum(V_left, cfg.dtype(0.0)))
             I1_cum = np.cumsum(sqrtV_left * dW_vol, axis=1, dtype=cfg.dtype)
             I2_cum = np.cumsum(V_left * dt_incr[None, :], axis=1, dtype=cfg.dtype)
 
-            # --- 5️⃣ Grid generation & IV computation ---
+            # Grid generation and IV computation
             for g_id in range(cfg.G):
-
-                # --- Base grids (linear + log) ---
+                # Load base grids
                 strikes_base        = cfg.strikes.astype(cfg.dtype)
                 logstrikes_base     = cfg.logstrikes.astype(cfg.dtype)
-
                 maturities_base     = cfg.maturities.astype(cfg.dtype)
                 logmaturities_base  = cfg.logmaturities.astype(cfg.dtype)
 
-                # ----------------------------------------------------------
-                # Apply jitter (log-space) or use base grid
-                # ----------------------------------------------------------
+                # Apply jitter to grids or use base grids
                 if randomize_grid and g_id > 0:
-                    # --- log-strikes jitter ---
                     logstrikes_shifted = np.array(
                         lhs_grid(
                             start=logstrikes_base.min(),
@@ -271,11 +226,9 @@ def generate_surfaces_rbergomi(
                         dtype=cfg.dtype,
                     )
                     strikes_shifted = np.exp(logstrikes_shifted) * cfg.S0
-
-                    # --- log-maturities jitter ---
                     logmaturities_shifted = np.array(
                         lhs_grid(
-                             start=logmaturities_base.min(),
+                            start=logmaturities_base.min(),
                             end=logmaturities_base.max(),    
                             n=len(logmaturities_base),                 
                             rng=rng_jit
@@ -283,12 +236,9 @@ def generate_surfaces_rbergomi(
                         dtype=cfg.dtype,
                     )
                     maturities_shifted = np.exp(logmaturities_shifted).astype(cfg.dtype)
-
                 else:
-                    # No jitter → use base grids
                     logstrikes_shifted     = logstrikes_base.copy()
                     strikes_shifted        = strikes_base.copy()
-
                     logmaturities_shifted  = logmaturities_base.copy()
                     maturities_shifted     = maturities_base.copy()
                 
@@ -381,11 +331,7 @@ import QuantLib as ql
 
 
 def _build_heston_engine(S0, r, kappa, theta, v0, sigma, rho):
-    """
-    Helper: baue einen QuantLib-Heston-Engine für gegebene Parameter.
-    Wir arbeiten mit einer flachen Zins- und Dividendenkurve und
-    fixem Evaluation Date, damit T als Year-Fraction ~ tau passt.
-    """
+    """Build a QuantLib Heston engine with flat rate and dividend curves."""
     day_counter = ql.Actual365Fixed()
     calendar = ql.NullCalendar()
 
@@ -416,18 +362,11 @@ def generate_heston_surfaces(
     seed: int = 42,
     randomize_grid: bool = False,
 ):
-    """
-    Heston IV-surface generator using QuantLib Heston pricing:
-        - LHS parameter sampling based on cfg.heston_min_* and cfg.heston_max_*
-        - deterministic SeedSequence hierarchy
-        - log-grid jitter (same style as rBergomi)
-        - identical output structure as rBergomi surfaces
-        - Preise via QuantLib AnalyticHestonEngine, IV via bsinv
-    """
+    """Generate Heston IV surfaces using QuantLib with deterministic seed hierarchy."""
     root_seq = SeedSequence(seed)
     rng_params = default_rng(root_seq.spawn(1)[0])
 
-    # LHS sampling
+    # Sample parameters via Latin Hypercube
     param_sets = sample_param_sets_lhs(
         num_sets,
         rng_params,
@@ -453,18 +392,15 @@ def generate_heston_surfaces(
         ),
     )
 
-    # independent jitter RNGs
     set_seqs = root_seq.spawn(num_sets)
     results = []
-
-    # Zins (falls du irgendwann cfg.r hast, hier einsetzen)
     r = getattr(cfg, "r", 0.0)
 
     for s, (params, set_seq) in enumerate(zip(param_sets, set_seqs)):
         kappa, theta, v0, sigma, rho = [float(x) for x in params]
 
 
-        # QuantLib-Engine für dieses Parameterset
+        # Build Heston pricing engine for this parameter set
         engine, today, day_counter = _build_heston_engine(
             cfg.S0, r, kappa, theta, v0, sigma, rho
         )
@@ -477,7 +413,7 @@ def generate_heston_surfaces(
         base_maturities = cfg.maturities.astype(cfg.dtype)
 
         for g_id in range(cfg.G):
-            # ---- ggf. jittered Grid ----
+            # Apply grid jitter if requested
             if randomize_grid and g_id > 0:
                 logstrikes = np.array(
                     lhs_grid(
@@ -507,33 +443,27 @@ def generate_heston_surfaces(
                 logmaturities = base_logmaturities.copy()
                 maturities = base_maturities.copy()
 
-            # ---- IV-Surface Container ----
+            # Initialize IV surface
             nT, nK = len(maturities), len(strikes)
             iv_surf = np.zeros((nT, nK), dtype=cfg.dtype)
 
-            # ---- Loop über Maturities ----
+            # Compute IV for each maturity
             for ti, T in enumerate(maturities):
                 T_float = float(T)
                 if T_float <= 0.0:
                     iv_surf[ti, :] = np.nan
                     continue
 
-                # Mapping tau -> QuantLib-Maturity-Date
-                # (ungefähr T * 365 Tage, nur für Pricing relevant)
                 days = max(1, int(round(T_float * 365)))
                 maturity_date = today + days
                 exercise = ql.EuropeanExercise(maturity_date)
 
-                # lineare Strikes
                 K_lin = strikes.astype(float)
-
-                # Masken
                 mask_call = K_lin >= cfg.S0
                 mask_put = ~mask_call
-
                 prices = np.empty_like(K_lin, dtype=float)
 
-                # Calls
+                # Price calls
                 if mask_call.any():
                     for idx in np.where(mask_call)[0]:
                         K_float = float(K_lin[idx])
@@ -544,7 +474,7 @@ def generate_heston_surfaces(
                         option.setPricingEngine(engine)
                         prices[idx] = option.NPV()
 
-                # Puts
+                # Price puts
                 if mask_put.any():
                     for idx in np.where(mask_put)[0]:
                         K_float = float(K_lin[idx])
@@ -555,7 +485,7 @@ def generate_heston_surfaces(
                         option.setPricingEngine(engine)
                         prices[idx] = option.NPV()
 
-                # ---- Implied Vol (weiterhin via bsinv) ----
+                # Extract implied volatilities
                 for ki, K_float in enumerate(K_lin):
                     price = float(prices[ki])
                     try:
@@ -595,9 +525,9 @@ def generate_heston_surfaces(
 
 
 
-# --------------------------------------------------------------------------------------------------------
-# Single fixed-surface generator
-# --------------------------------------------------------------------------------------------------------
+# ====
+# Single surface generator with diagnostics
+# ====
 
 import time
 
@@ -609,10 +539,7 @@ def generate_fixed_surface(
     cfg: SimulationConfig,
     seed: int = 123,
 ) -> Dict:
-    """
-    Generate one IV surface for fixed parameters and a fixed (K, T) grid.
-    Includes detailed runtime diagnostics for profiling.
-    """
+    """Generate a single IV surface with runtime diagnostics."""
     dtype = cfg.dtype
     eta = dtype(param_set["eta"])
     rho = dtype(param_set["rho"])
@@ -621,48 +548,30 @@ def generate_fixed_surface(
 
     t0_global = time.perf_counter()
 
-        # ----------------- 1. Simulator setup -----------------
+    # Setup simulator
     t0_total = time.perf_counter()
 
-    # --- 1. rBergomi object creation ---
     t0 = time.perf_counter()
     rb = rBergomi(n=cfg.n, N=cfg.M, T=float(maturities[-1]), a=float(a))
     t_obj = time.perf_counter() - t0
 
-    # --- 2. Time grid construction ---
     t0 = time.perf_counter()
     t_grid = rb.t.flatten().astype(dtype)
     dt = np.diff(t_grid, prepend=dtype(0.0))
     t_grid_time = time.perf_counter() - t0
 
-    # --- 3. Draw Brownian motions ---
     t0 = time.perf_counter()
     dW1 = rb.dW1()
-    #dW2 = rb.dW2()
     t_brown_time = time.perf_counter() - t0
 
-    # --- 4. Correlated driver dB ---
-    t0 = time.perf_counter()
-    #dB = rb.dB(dW1, dW2, rho=float(rho))
-    t_dB_time = time.perf_counter() - t0
-
-    # --- 5. fBM kernel convolution / Y computation ---
     t0 = time.perf_counter()
     Y = rb.Y(dW1)
     t_Y_time = time.perf_counter() - t0
 
     t_total = time.perf_counter() - t0_total
-
-    print(f"\n=== Simulator setup breakdown ===")
-    print(f"rBergomi object init : {t_obj:7.3f} s")
-    print(f"t-grid + dt setup    : {t_grid_time:7.3f} s")
-    print(f"Brownian draws (W1,W2): {t_brown_time:7.3f} s")
-    print(f"dB computation        : {t_dB_time:7.3f} s")
-    print(f"Y computation (fBM)   : {t_Y_time:7.3f} s")
-    print(f"TOTAL setup           : {t_total:7.3f} s")
     sim_time = time.perf_counter() - t0_global
 
-    # ----------------- 2. Forward variance mapping -----------------
+    # Forward variance mapping
     t0 = time.perf_counter()
     Kk = len(xi0_knots)
     if Kk <= len(maturities):
@@ -677,13 +586,12 @@ def generate_fixed_surface(
     xi_t = np.array(xi0_knots, dtype=dtype)[idx]
     map_time = time.perf_counter() - t0
 
-    # ----------------- 3. Path simulation (V, S) -----------------
+    # Path simulation
     t0 = time.perf_counter()
     V = rb.V(Y, xi=xi_t[np.newaxis, :], eta=float(eta)).astype(dtype)
-    #S = rb.S(V, dB, S0=dtype(cfg.S0)).astype(dtype)
     sim_paths_time = time.perf_counter() - t0
 
-    # ----------------- 4. Conditional MC setup -----------------
+    # Conditional MC setup
     t0 = time.perf_counter()
     dW_vol = dW1[..., 0] if dW1.ndim == 3 else dW1
     dW_vol = dW_vol.astype(dtype, copy=False)
@@ -694,7 +602,7 @@ def generate_fixed_surface(
     I2_cum = np.cumsum(V_left * dt_incr[None, :], axis=1, dtype=dtype)
     cmc_setup_time = time.perf_counter() - t0
 
-    # ----------------- 5. IV extraction -----------------
+    # IV extraction
     t0 = time.perf_counter()
     nT, nK = len(maturities), len(strikes)
     price_surf = np.zeros((nT, nK), dtype=dtype)
@@ -704,7 +612,6 @@ def generate_fixed_surface(
 
     inv_time_total = 0.0
     for mi, Tm in enumerate(maturities):
-
         t_idx = np.searchsorted(t_grid, float(Tm), side="right") - 1
         t_idx = int(np.clip(t_idx, 0, V.shape[1] - 1))
         T_float = float(Tm)
@@ -751,19 +658,7 @@ def generate_fixed_surface(
     iv_extraction_time = time.perf_counter() - t0
     total_time = time.perf_counter() - t0_global
 
-    # ----------------- Diagnostics summary -----------------
-    print(
-        f"\n=== Diagnostics for seed {seed} ===\n"
-        f"Simulator setup:     {sim_time:7.3f} s\n"
-        f"Xi0 mapping:         {map_time:7.3f} s\n"
-        f"Path generation:     {sim_paths_time:7.3f} s\n"
-        f"CMC integrals:       {cmc_setup_time:7.3f} s\n"
-        f"IV extraction total: {iv_extraction_time:7.3f} s "
-        f"(of which Brent inversions ≈ {inv_time_total:7.3f} s)\n"
-        f"TOTAL runtime:       {total_time:7.3f} s"
-    )
-
-    # ----------------- Optional postprocessing -----------------
+    # Save diagnostics if NaNs detected
     if np.isnan(iv_surf).any() or np.isinf(iv_surf).any():
         bad_dir = os.path.join("data", "debug_nans")
         os.makedirs(bad_dir, exist_ok=True)
@@ -776,12 +671,18 @@ def generate_fixed_surface(
             params=np.array([eta, rho, H], dtype=dtype),
             xi0_knots=xi0_knots,
         )
-        print("NaN/Inf detected in fixed surface; saved debug npz.")
 
     return {
-        "params": {"eta": float(eta), "rho": float(rho), "H": float(H),
-                   "xi0_knots": xi0_knots.astype(dtype).tolist()},
-        "grid": {"strikes": strikes.astype(dtype), "maturities": maturities.astype(dtype)},
+        "params": {
+            "eta": float(eta), 
+            "rho": float(rho), 
+            "H": float(H),
+            "xi0_knots": xi0_knots.astype(dtype).tolist()
+        },
+        "grid": {
+            "strikes": strikes.astype(dtype), 
+            "maturities": maturities.astype(dtype)
+        },
         "iv_surface": iv_surf,
         "iv_rel_error": iv_relerr,
     }
