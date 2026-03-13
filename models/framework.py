@@ -219,25 +219,17 @@ class BaseModel(nn.Module):
 
 
     # -----------------------------------------------------------
-    # Parameter-Layout / Mapping (modellagnostisch)
+    # Parameter-Layout 
     # -----------------------------------------------------------
     def set_param_structure(self, param_names, param_slices):
-        """
-        Speichert die vollständige Param-Layout-Struktur am Modell.
-        param_names : list[str] – geflattete Namen (für Plots etc.)
-        param_slices: dict[str, slice|int] – Mapping von originalen Keys zu Positionen.
-        """
+
         self.param_names = list(param_names)
         self.param_slices = dict(param_slices)
 
     def _params_dict_to_vec_np(self, params_dict):
-        """
-        Mappe params_dict -> np.float32 Vektor gemäß self.param_names / self.param_slices.
-        Erwartet, dass self.param_slices alle Keys aus params_dict abdeckt, die wir benutzen.
-        """
         import numpy as np
         assert self.param_names is not None and self.param_slices is not None, \
-            "param_names / param_slices nicht gesetzt. Ruf infer_param_structure_from_surfaces + set_param_structure auf."
+            "param_names / param_slices not set."
 
         vec = np.zeros(len(self.param_names), dtype=np.float32)
 
@@ -254,11 +246,11 @@ class BaseModel(nn.Module):
 
     def _params_dict_to_vec_tensor(self, params_dict, requires_grad=False):
         """
-        Wie _params_dict_to_vec_np, aber als 1D torch.Tensor auf self.device.
+        Like  _params_dict_to_vec_np, nut as 1D torch.Tensor on self.device.
         """
         import torch
         assert self.param_names is not None and self.param_slices is not None, \
-            "param_names / param_slices nicht gesetzt. Ruf infer_param_structure_from_surfaces + set_param_structure auf."
+            "param_names / param_slices not set."
 
         device = self.device
         vec = torch.zeros(len(self.param_names), dtype=torch.float32, device=device)
@@ -531,7 +523,6 @@ class BaseModel(nn.Module):
                         except Exception:
                             pass
 
-            # Optional: nur ein paar Parameter anzeigen, sonst wird Titel zu lang
             if len(parts) > 6:
                 parts = parts[:6] + ["..."]
 
@@ -761,7 +752,7 @@ class BaseModel(nn.Module):
         plt.close(fig)
 
         # ===============================
-        # RMSE vs parameter (für alle!)
+        # RMSE vs parameter 
         # ===============================
         def scatter(x, y, name_x, fname):
             fig, ax = plt.subplots(figsize=(6,5))
@@ -815,7 +806,7 @@ class BaseModel(nn.Module):
             print(f"{rank:2d}. index={idx}, RMSE={rmses[idx]:.6f}")
 
         # ===============================
-        # Rückgabe
+        # Return
         # ===============================
         return {
             "pred_rel": {"mean": mean_rel, "median": median_rel, "max": max_rel},
@@ -857,7 +848,6 @@ class BaseModel(nn.Module):
         dtype=np.float32,
     ):
         """
-        Erzeuge eine Heston-IV-Surface via QuantLib AnalyticHestonEngine.
 
         x_phys: [kappa, theta, v0, sigma, rho]
         Ks_log: 1D array (log(K/S0) oder log(K)-ähnlich)
@@ -945,9 +935,7 @@ class BaseModel(nn.Module):
         verbose=False,
     ):
         """
-        Analytische Heston-Kalibrierung via QuantLib (AnalyticHestonEngine).
 
-        Gleiche Output-Form wie self.calibrate:
             - "theta_hat"
             - "error_rel_dict"
             - "rmse"
@@ -965,7 +953,7 @@ class BaseModel(nn.Module):
         lb = np.asarray(lb, dtype=np.float64)
         ub = np.asarray(ub, dtype=np.float64)
 
-        # --- Ziel-Surface + Grid (log-space) ---
+        # --- Target-Surface + Grid (log-space) ---
         true_surface = np.asarray(target_surface["iv_surface"], dtype=np.float64)  # (nT, nK)
         Ks_log = np.asarray(target_surface["grid"]["strikes"], dtype=np.float64)
         Ts_log = np.asarray(target_surface["grid"]["maturities"], dtype=np.float64)
@@ -1021,7 +1009,7 @@ class BaseModel(nn.Module):
                 S0=S0,
                 r=r,
                 q=q,
-                mask_2d=mask_np,  # nur relevante Punkte berechnen
+                mask_2d=mask_np, 
                 dtype=np.float64,
             )
             pred_flat = iv_pred.reshape(-1)
@@ -1047,7 +1035,7 @@ class BaseModel(nn.Module):
             diff = pred_flat[mask_flat] - true_masked
 
             if weights_masked is not None:
-                w = weights_masked ** 2     # <- hier brauchst du das echte w, NICHT sqrt(w)
+                w = weights_masked ** 2    
                 sq = w * (diff ** 2)
                 val = np.sqrt(np.sum(sq) / np.sum(w))
             else:
@@ -1096,7 +1084,6 @@ class BaseModel(nn.Module):
         runtime_ms = (t1 - t0) * 1000.0
         rmse = rmse_objective(theta_hat)
 
-        # --- Fehlerauswertung wie in calibrate ---
         if self.param_names is not None:
             param_names = list(self.param_names)
         else:
@@ -1252,7 +1239,7 @@ class BaseModel(nn.Module):
             diff = pred_flat[mask_flat] - true_masked
 
             if weights_masked is not None:
-                w = weights_masked ** 2     # <- hier brauchst du das echte w, NICHT sqrt(w)
+                w = weights_masked ** 2    
                 sq = w * (diff ** 2)
                 val = np.sqrt(np.sum(sq) / np.sum(w))
             else:
@@ -1334,7 +1321,6 @@ class BaseModel(nn.Module):
         else:
             param_names = [f"theta_{i}" for i in range(len(theta_hat))]
 
-        # Optionale Fehlerauswertung vs true_params (falls vorhanden)
         true_params = target_surface.get("params", None)
         if true_params is not None:
             true_vec = self._params_dict_to_vec_np(true_params)
@@ -1376,7 +1362,6 @@ class BaseModel(nn.Module):
         per_param_rel_errors, per_param_abs_errors = {}, {}
         true_params_all, est_params_all = [], []
 
-        # globale Param-Reihenfolge des Modells
         if self.param_names is not None:
             param_names = list(self.param_names)
         else:
@@ -1401,7 +1386,7 @@ class BaseModel(nn.Module):
             theta_hat = np.asarray(r["theta_hat"], dtype=np.float32)
             est_params_all.append(theta_hat)
 
-            # ---- true phys. Parameter-Vektor (modellagnostisch)
+ 
             tp = s.get("params", None)
             if tp is not None:
                 true_vec = self._params_dict_to_vec_np(tp)
@@ -1686,9 +1671,7 @@ class DeepONet(BaseModel):
     ):
         """
         Flatten surfaces using param_names/param_slices.
-        Dies ist die finale, model-agnostische Parameter-Flattung.
 
-        Rückgabe:
             X_branch : (N, d)
             X_trunk  : (N, 2)
             Y        : (N,)
@@ -2152,10 +2135,6 @@ class MLP(BaseModel):
     Simple MLP mapping parameter vector -> implied volatility surface.
     Output is the full (nT, nK) surface predicted in one shot.
 
-    interp_mode:
-        "base"            -> keine Interpolation, immer Modellgrid zurückgeben
-        "model_to_market" -> MLP auf Modellgrid, dann Modell->Market Grid Interpolation
-        "market_to_model" -> Market-IVs auf Modellgrid interpolieren (für Daten/Analyse)
     """
 
     def __init__(
@@ -2495,9 +2474,7 @@ class MLP(BaseModel):
     # ------------------------------------------------------------------
     # predict_surface with interpolation modes
     # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # predict_surface with interpolation modes (modellagnostisch)
-    # ------------------------------------------------------------------
+
     def predict_surface(self, params, grid=None, mask_flat=None):
         """
         Predict surface on model-grid OR interpolate model→market.
@@ -2603,32 +2580,3 @@ class MLP(BaseModel):
 
         return out.reshape(nT, nK)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ============================================================
-# Usage Notes (example)
-# ============================================================
-# DeepONet (with internal scaling):
-#   model, train_loader, val_loader, Ks, Ts = DeepONet.from_surfaces(train_surfaces,
-#       batch_size=256, val_split=0.2, eta=(0.5,4.0), rho=(0.0,1.0), H=(0.025,0.5), knot=(0.01,0.16))
-#   model.train_model(train_loader, val_loader, epochs=100)
-#   fig = model.plot_evaluation(test_surfaces[0])
-#   model.evaluate(test_surfaces, out_dir="deeponet_eval")
-#
-# MLP (with internal scaling):
-#   model, train_loader, val_loader, Ks, Ts = MLP.from_surfaces(train_surfaces,
-#       batch_size=32, val_split=0.2, hidden_dims=(256,256,256), eta=(0.5,4.0), rho=(0.0,1.0), H=(0.025,0.5), knot=(0.01,0.16))
-#   model.train_model(train_loader, val_loader, epochs=100)
-#   fig = model.plot_evaluation(test_surfaces[0])
-#   model.evaluate(test_surfaces, out_dir="mlp_eval")
