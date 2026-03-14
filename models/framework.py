@@ -941,7 +941,6 @@ class BaseModel(nn.Module):
             - "rmse"
             - "runtime_ms"
             - "optimizer"
-        (plus ggf. zusätzliche Felder, falls du willst)
         """
         import time
         from scipy.optimize import least_squares, differential_evolution, minimize
@@ -1742,9 +1741,7 @@ class DeepONet(BaseModel):
     # ------------------------------------------------------------
     # 0) AUTO-INFER PARAMETER STRUCTURE IF NOT PROVIDED
     # ------------------------------------------------------------
-        # ------------------------------------------------------------
-        # 0) PARAM-STRUKTUR AUTOMATISCH AUS ERSTEM SURFACE INFERIEREN
-        # ------------------------------------------------------------
+
         param_names, param_slices = BaseModel.infer_param_structure_from_surfaces(surfaces)
 
         # ------------------------------------------------------------
