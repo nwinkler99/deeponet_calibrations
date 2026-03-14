@@ -1,5 +1,6 @@
 # ====
-# Utility functions for Rough Bergomi model and IV surface operations, work based on https://github.com/svenhsia/Calibrating-Rough-Volatility-Models-with-Deep-Learning/tree/master
+# Utility functions for Rough Bergomi model and IV surface operations from https://github.com/ryanmccrickerd/rough_bergomi, adapted and extended for this project.
+
 # ====
 
 import numpy as np
