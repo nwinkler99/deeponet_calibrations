@@ -591,7 +591,7 @@ class BaseModel(nn.Module):
                 pass
 
         # ==========================================================
-        # Loop über alle Surfaces
+        # Loop over all surfaces
         # ==========================================================
         for s in surface_samples:
             params = s["params"]
